@@ -1,13 +1,13 @@
 # Operating protocol
 
-Use this protocol when running, resuming, or auditing a long-running model optimization.
+Use this protocol when running, resuming, or auditing a long-running metric-driven optimization.
 
 ## Restore the frontier
 
 Confirm these facts before choosing work:
 
 - frozen primary metric, baseline, target or stopping rule, and minimum meaningful delta;
-- evaluation command, dataset/grader version, seed policy, and holdout rule;
+- evaluation command, input/data/workload and evaluator versions, repetition policy, and holdout rule where applicable;
 - current best verified candidate, not merely the latest workspace state;
 - guardrail status;
 - remaining token, wall-clock, compute, and experiment budgets where applicable;
@@ -75,7 +75,7 @@ Update `STATE.md` by replacement, not accumulation. Append one concise fact row 
 ## Decide and stop
 
 - `CONTINUE`: the current mechanism has valid positive evidence and the next test remains bounded.
-- `REPLICATE`: a positive signal needs another seed, trial, or independent check.
+- `REPLICATE`: a positive signal needs another repetition, trial, seed, or independent check.
 - `SWITCH`: evidence rejects or exhausts the current mechanism, or a clearly stronger candidate exists.
 - `ROLLBACK`: no verified gain, a guardrail failed, evaluation was invalid, or complexity increased without benefit.
 - `PAUSE_REQUIRED`: the contract is incomplete, evaluation is untrusted, scope or budget must change, no candidate passes admission, or human tradeoff is required.
@@ -88,7 +88,7 @@ Never equate budget exhaustion, process completion, or lack of ideas with succes
 Adapt only the bracketed values:
 
 ```text
-/goal Follow optimization/GOAL.md to optimize [MODEL OR SYSTEM].
+/goal Follow optimization/GOAL.md to optimize [TARGET, SYSTEM, OR PROCESS].
 
 Before each experiment, restore optimization/STATE.md and admit only a minimal,
 reversible, attributable test with a causal path to the primary metric. Record

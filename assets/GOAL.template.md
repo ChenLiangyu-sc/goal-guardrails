@@ -1,8 +1,8 @@
-# Model Optimization Contract
+# Optimization Contract
 
 ## Objective
 
-- Model or system: `TODO`
+- Target, system, or process: `TODO`
 - Primary metric: `TODO`
 - Direction: `TODO: maximize | minimize`
 - Baseline: `TODO`
@@ -15,13 +15,13 @@ The primary metric, target, and evaluation definition may change only through an
 ## Evaluation contract
 
 - Evaluation command: `TODO`
-- Dataset snapshot/version: `TODO`
-- Grader/judge version: `TODO`
-- Seeds/trials: `TODO`
+- Input/data/workload snapshot: `TODO`
+- Evaluator/grader version: `TODO`
+- Repetitions/trials/seeds: `TODO`
 - Machine-readable result artifact: `TODO`
-- Final holdout rule: `TODO`
+- Independent validation / reserved holdout rule: `TODO: define or mark not applicable`
 
-Do not tune repeatedly on the final holdout, change the evaluator to create an improvement, discard unfavorable seeds selectively, or compare results produced under incompatible conditions.
+Where applicable, do not tune repeatedly on reserved validation, change the evaluator to create an improvement, discard unfavorable repetitions selectively, or compare results produced under incompatible conditions.
 
 ## Guardrails
 
@@ -41,17 +41,17 @@ Excluded unless the user revises this contract:
 
 - general repository cleanup or redesign;
 - non-blocking warnings, formatting, documentation, and tooling;
-- evaluator, dataset, holdout, metric, or success-criterion changes;
+- evaluator, frozen input/workload, reserved-validation, metric, or success-criterion changes;
 - new platforms, dashboards, schedulers, or abstraction layers.
 
 ## Budgets
 
 - Goal token budget: `TODO`
 - Wall-clock budget: `TODO`
-- Compute/GPU budget: `TODO`
-- Maximum valid experiments: `TODO`
+- Resource/cost/compute budget: `TODO`
+- Maximum valid experiments or iterations: `TODO`
 - Non-core work limit: `10%` of the applicable active budget
-- Final replication/holdout reserve: `15%` of compute budget
+- Final independent-validation reserve: `TODO: for example 15% of the applicable budget, or not applicable`
 
 Budget exhaustion is not completion.
 
@@ -84,4 +84,4 @@ Every experiment ends with exactly one decision:
 
 Return `PAUSE_REQUIRED` instead of starting new work when evaluation is untrusted, scope or budget must change, no candidate passes admission, an unresolved metric tradeoff needs the user, or remaining work is only low contribution.
 
-Return `COMPLETE` only when the target is reached, the gain exceeds the meaningful-delta rule, all hard guardrails pass, required replications and final holdout pass, and the result is reproducible from frozen code, configuration, data, and seeds.
+Return `COMPLETE` only when the target is reached, the gain exceeds the meaningful-delta rule, all hard guardrails pass, and every replication, independent-validation, and reproducibility condition declared as applicable in this contract passes. Reproducibility evidence may include frozen code, configuration, inputs/data/workload, environment, and repetitions as appropriate to the optimization.

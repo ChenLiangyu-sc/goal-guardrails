@@ -61,6 +61,18 @@ class InitProjectTests(unittest.TestCase):
             init_project.apply_project(self.root, dry_run=False)
         self.assertFalse((self.root / "optimization").exists())
 
+    def test_legacy_agents_marker_is_not_duplicated(self) -> None:
+        agents = self.root / "AGENTS.md"
+        agents.write_text(
+            init_project.LEGACY_START_MARKER + "\nlegacy rules\n" + init_project.LEGACY_END_MARKER + "\n",
+            encoding="utf-8",
+        )
+        messages = init_project.apply_project(self.root, dry_run=False)
+        self.assertTrue(messages[-1].startswith("skip-marked"))
+        updated = agents.read_text(encoding="utf-8")
+        self.assertNotIn(init_project.START_MARKER, updated)
+        self.assertEqual(1, updated.count(init_project.LEGACY_START_MARKER))
+
     def test_main_handles_multiple_projects(self) -> None:
         second = self.root / "second"
         second.mkdir()

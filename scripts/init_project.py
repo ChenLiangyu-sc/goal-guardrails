@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely scaffold lightweight model-optimization guardrails in repositories."""
+"""Safely scaffold lightweight goal guardrails in repositories."""
 
 from __future__ import annotations
 
@@ -21,8 +21,14 @@ TARGETS = {
     "BACKLOG.template.md": Path("optimization/BACKLOG.md"),
 }
 AGENTS_FRAGMENT = ASSET_DIR / "AGENTS.fragment.md"
-START_MARKER = "<!-- codex-model-optimization-guardrails:start -->"
-END_MARKER = "<!-- codex-model-optimization-guardrails:end -->"
+START_MARKER = "<!-- goal-guardrails:start -->"
+END_MARKER = "<!-- goal-guardrails:end -->"
+LEGACY_START_MARKER = "<!-- codex-model-optimization-guardrails:start -->"
+LEGACY_END_MARKER = "<!-- codex-model-optimization-guardrails:end -->"
+MARKER_PAIRS = (
+    (START_MARKER, END_MARKER),
+    (LEGACY_START_MARKER, LEGACY_END_MARKER),
+)
 
 
 class InitError(RuntimeError):
@@ -91,13 +97,14 @@ def plan_project(project: Path) -> list[Action]:
     if agents.exists() and not agents.is_file():
         raise InitError(f"AGENTS.md is not a regular file: {agents}")
     existing = agents.read_bytes() if agents.exists() else b""
-    start_marker = START_MARKER.encode("utf-8")
-    end_marker = END_MARKER.encode("utf-8")
-    has_start = start_marker in existing
-    has_end = end_marker in existing
-    if has_start != has_end:
-        raise InitError(f"AGENTS.md contains an incomplete guardrails marker block: {agents}")
-    if has_start:
+    complete_marker_found = False
+    for start_text, end_text in MARKER_PAIRS:
+        has_start = start_text.encode("utf-8") in existing
+        has_end = end_text.encode("utf-8") in existing
+        if has_start != has_end:
+            raise InitError(f"AGENTS.md contains an incomplete guardrails marker block: {agents}")
+        complete_marker_found = complete_marker_found or has_start
+    if complete_marker_found:
         actions.append(("skip-marked", agents, None))
     else:
         newline = b"\r\n" if b"\r\n" in existing else b"\n"

@@ -1,6 +1,8 @@
-# Codex Model Optimization Guardrails
+# Goal Guardrails
 
-A lightweight Codex skill that keeps long-running model training, prompt optimization, and evaluation-driven research focused on measurable gains instead of low-contribution cleanup and infrastructure work.
+A lightweight Codex skill that keeps long-running, metric-driven optimization focused on measurable gains instead of low-contribution cleanup and infrastructure work.
+
+It applies beyond model training: prompt and model quality, performance, latency, cost, reliability, search and recommendation, conversion, data pipelines, and other iterative optimization with a measurable objective, evidence loop, budget, and stopping rule.
 
 It installs a small project-local protocol:
 
@@ -13,39 +15,39 @@ short /goal
   -> CONTINUE / REPLICATE / SWITCH / ROLLBACK / PAUSE_REQUIRED / COMPLETE
 ```
 
-The first version intentionally has no database, dashboard, hook, supervisor agent, or training scheduler. It can work alongside existing dispatch, Slurm, and deterministic monitoring systems without changing their authority boundaries.
+The first version intentionally has no database, dashboard, hook, supervisor agent, or task scheduler. It can work alongside existing dispatch, Slurm, CI, benchmark runners, and deterministic monitoring systems without changing their authority boundaries.
 
 ## Install
 
 Ask Codex:
 
 ```text
-$skill-installer install codex-model-optimization-guardrails from https://github.com/ChenLiangyu-sc/codex-model-optimization-guardrails
+$skill-installer install goal-guardrails from https://github.com/ChenLiangyu-sc/goal-guardrails
 ```
 
 Or install manually:
 
 ```bash
-git clone https://github.com/ChenLiangyu-sc/codex-model-optimization-guardrails \
-  ~/.codex/skills/codex-model-optimization-guardrails
+git clone https://github.com/ChenLiangyu-sc/goal-guardrails \
+  ~/.codex/skills/goal-guardrails
 ```
 
 Restart Codex or use `/skills` if the skill does not appear immediately.
 
 ## Initialize one project
 
-From a model-training repository, ask Codex:
+From an optimization repository, the short form is:
 
 ```text
-Use $codex-model-optimization-guardrails to initialize the current project.
-Inspect existing training and evaluation files, fill only verifiable contract facts,
-and list the critical TODOs I must decide before an expensive run.
+$goal-guardrails init
 ```
+
+Add context only when needed, for example: `$goal-guardrails init; optimize p95 latency without reducing throughput.`
 
 The deterministic initializer can also be run directly:
 
 ```bash
-python3 ~/.codex/skills/codex-model-optimization-guardrails/scripts/init_project.py .
+python3 ~/.codex/skills/goal-guardrails/scripts/init_project.py .
 ```
 
 It creates missing files under `optimization/` and additively inserts one marked policy block into `AGENTS.md`. Existing optimization files are never overwritten.
@@ -55,7 +57,7 @@ It creates missing files under `optimization/` and additively inserts one marked
 Preview first:
 
 ```bash
-python3 ~/.codex/skills/codex-model-optimization-guardrails/scripts/init_project.py \
+python3 ~/.codex/skills/goal-guardrails/scripts/init_project.py \
   --dry-run /path/project-a /path/project-b /path/project-c
 ```
 
@@ -63,17 +65,15 @@ Then repeat without `--dry-run`. The script scaffolds templates only; use Codex 
 
 The initializer preflights every supplied path before writing and rolls back files created in a project if that project's initialization fails. A batch is not transactional across repositories: if a later runtime write fails, earlier completed repositories remain initialized and the command reports a partial batch. Symbolic-link project roots, `optimization/` directories, template targets, and `AGENTS.md` files are rejected rather than followed or replaced. When appending to an existing `AGENTS.md`, the initializer preserves its bytes, newline style, mode, owner, group, timestamps, and supported metadata; it fails closed if the operating system does not allow that preservation.
 
-## Run or audit
+## Short commands
 
 ```text
-Use $codex-model-optimization-guardrails to resume the optimization from the
-project contract and current state. Admit only one bounded next experiment.
+$goal-guardrails init
+$goal-guardrails run
+$goal-guardrails audit
 ```
 
-```text
-Use $codex-model-optimization-guardrails to audit whether the current long-running
-optimization has drifted. Do not modify files or launch work.
-```
+`init` scaffolds/adopts the protocol, `run` starts or resumes one bounded loop, and `audit` checks alignment without modifying files or launching work.
 
 ## Design principles
 
