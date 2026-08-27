@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Optimization Guardrails"
+  short_description: "Keep long-running model optimization focused on measurable gains"
+  default_prompt: "Use $codex-model-optimization-guardrails to initialize a lightweight anti-drift workflow in the current model-training project."
