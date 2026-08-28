@@ -53,6 +53,8 @@ After a valid result, record the fact, update the short state, and choose exactl
 CONTINUE | REPLICATE | SWITCH | ROLLBACK | PAUSE_REQUIRED | COMPLETE
 ```
 
+An experiment can remain causally related to the goal while its execution path has become unproductive. Track the contract's **core progress unit**, a stable chain ID and causal bottleneck, and the number of consecutive valid experiments that produced no core progress. Renaming a component or moving between internal contracts does not create a new chain. When the declared mechanism or diagnostic-chain limit is reached, choose `SWITCH`, `ROLLBACK`, or `PAUSE_REQUIRED`; do not extend the chain with another audit, format patch, reviewer, recovery path, or contract check. At most one explicitly predeclared final discriminator may exceed the limit. It closes the diagnostic chain regardless of outcome; a positive result may enter only its separately named verification/promotion path.
+
 Waiting for a long-running experiment does not authorize cleanup or unrelated improvements. Use an existing deterministic monitor when available; do not introduce a new monitoring system through this skill.
 
 ## Preserve the boundary
@@ -62,6 +64,8 @@ Waiting for a long-running experiment does not authorize cleanup or unrelated im
 - Never change the primary metric, target, evaluator, frozen inputs/workload, reserved-validation policy, guardrails, or budget merely to show progress.
 - Budget exhaustion is `PAUSE_REQUIRED`, never `COMPLETE`.
 - A finished process is transport evidence, not optimization-success evidence. Apply the frozen evaluation and guardrails before promotion.
+- Repeated status recovery, identity/SHA checks, schema or protocol proofs, monitoring, and reviewer passes count as non-core work unless they restore evaluation integrity needed by the admitted experiment. Repeating the same status adds no progress evidence.
+- Keep `optimization/STATE.md` as a replaceable frontier snapshot within the contract's size cap. Move history and detailed diagnostics to experiment artifacts instead of accumulating them in state.
 - Do not create or activate a Codex Goal unless the user explicitly asks to start or follow one. Otherwise, provide the ready-to-copy `/goal` text.
 
 ## Escalate only from evidence

@@ -9,6 +9,8 @@
 - Target or stopping rule: `TODO`
 - Minimum meaningful delta: `TODO`
 - Baseline commit/artifact: `TODO`
+- Core progress unit: `TODO: an end-to-end usable output or other goal-level unit`
+- No-progress definition: `TODO: what counts as zero core progress despite a valid experiment`
 
 The primary metric, target, and evaluation definition may change only through an explicit user-approved contract revision.
 
@@ -50,8 +52,11 @@ Excluded unless the user revises this contract:
 - Wall-clock budget: `TODO`
 - Resource/cost/compute budget: `TODO`
 - Maximum valid experiments or iterations: `TODO`
+- Maximum experiments or budget per mechanism/diagnostic chain: `TODO`
+- Maximum consecutive valid experiments with no core progress: `3`
 - Non-core work limit: `10%` of the applicable active budget
 - Final independent-validation reserve: `TODO: for example 15% of the applicable budget, or not applicable`
+- `STATE.md` maximum nonblank lines: `25`
 
 Budget exhaustion is not completion.
 
@@ -72,6 +77,10 @@ If the first four items are not concrete, defer the task to `BACKLOG.md`. Keep a
 
 Infrastructure, refactoring, documentation, tooling, and cleanup are admissible only when they block the highest-value experiment now, no smaller workaround exists, and the change stops when the blocker is removed.
 
+Repeated monitoring, recovery, identity/SHA checks, schema/contract proofs, and reviewer passes are non-core unless they restore evaluation integrity required by the admitted experiment. Internal validity does not reset the no-progress counter unless it produces the declared core progress unit.
+
+Each mechanism or diagnostic chain must have a stable ID and causal bottleneck. Component renames or movement among internal representations, adapters, contracts, or transport layers do not create a new chain when the causal bottleneck is unchanged. A new diagnostic or optimization chain must cite the closed predecessor or parent and state the materially different causal path. A verification/promotion child may inherit a successful path but may only replicate, run applicable validation, promote, or roll back; it cannot patch or reopen the diagnostic chain. A frozen evaluator that completes normally with failure or zero yield is a valid no-progress result; only broken evaluation integrity makes the run invalid.
+
 ## Checkpoints
 
 Audit after every valid experiment and after resume, compaction, guardrail regression, scope expansion, or material cost overrun. If no experiment event occurs, audit every `TODO: budget fraction or time interval`. Keep protocol maintenance below 5% of the adjacent experiment cycle.
@@ -79,6 +88,8 @@ Audit after every valid experiment and after resume, compaction, guardrail regre
 Every experiment ends with exactly one decision:
 
 `CONTINUE | REPLICATE | SWITCH | ROLLBACK | PAUSE_REQUIRED | COMPLETE`
+
+When a mechanism or consecutive-no-progress limit fires, do not add another patch or audit in that chain. One explicitly predeclared final discriminator may exceed the limit only if it changes one variable, uses the frozen end-to-end evaluator, and names mutually exclusive next paths beforehand. It closes the diagnostic chain regardless of outcome. A positive result may enter only the separately named verification/promotion path for replication and applicable independent validation; every other result follows its named switch, rollback, or pause path.
 
 ## Stop conditions
 

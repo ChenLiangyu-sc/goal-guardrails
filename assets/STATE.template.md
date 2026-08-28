@@ -5,9 +5,12 @@
 - Baseline: `TODO`
 - Best verified: `TODO`, commit/artifact `TODO`
 - Delta from baseline: `TODO`
+- Core progress / end-to-end yield: `TODO`
 - Guardrails: `TODO: PASS | FAIL | UNKNOWN`
 - Budget used / remaining: `TODO`
 - Non-core spend: `TODO`
+- Active chain: `TODO: stable ID; causal bottleneck; parent/closed predecessor`
+- Consecutive valid experiments with no core progress: `TODO`
 - Last valid experiment: `TODO`
 - Last decision: `TODO`
 

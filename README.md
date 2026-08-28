@@ -80,8 +80,13 @@ $goal-guardrails audit
 - One stable metric and evaluation contract.
 - At most three active candidate hypotheses.
 - One primary causal change per experiment.
+- A goal-level core progress unit and an explicit no-progress definition.
+- A stop line for each mechanism or diagnostic chain, including repeated valid experiments that produce no end-to-end progress.
+- Stable chain identity by causal bottleneck, so renaming a component cannot reset its stop line.
 - Low-contribution findings go to a backlog rather than interrupting the run.
 - Infrastructure work must unblock the highest-value experiment now.
+- Repeated monitoring, recovery, identity checks, contract proofs, and reviews consume the non-core budget instead of masquerading as progress.
+- `STATE.md` remains a bounded frontier snapshot; experiment artifacts hold the history.
 - Every valid experiment ends in one explicit decision.
 - Budget exhaustion and process completion are not successful Goal completion.
 - Escalate to wrappers, hooks, reviewers, or controllers only after measured soft-governance failures.

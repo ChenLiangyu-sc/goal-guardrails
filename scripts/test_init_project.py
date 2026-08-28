@@ -29,6 +29,13 @@ class InitProjectTests(unittest.TestCase):
         self.assertEqual(1, agents.count(init_project.START_MARKER))
         self.assertEqual(1, agents.count(init_project.END_MARKER))
 
+    def test_state_template_respects_declared_default_cap(self) -> None:
+        init_project.apply_project(self.root, dry_run=False)
+        goal = (self.root / "optimization/GOAL.md").read_text(encoding="utf-8")
+        state = (self.root / "optimization/STATE.md").read_text(encoding="utf-8")
+        self.assertIn("`STATE.md` maximum nonblank lines: `25`", goal)
+        self.assertLessEqual(sum(bool(line.strip()) for line in state.splitlines()), 25)
+
     def test_rerun_is_idempotent(self) -> None:
         init_project.apply_project(self.root, dry_run=False)
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}

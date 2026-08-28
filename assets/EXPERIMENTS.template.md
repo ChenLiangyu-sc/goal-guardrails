@@ -2,7 +2,7 @@
 
 Keep one row per experiment. Put raw logs and full metrics in the referenced artifact.
 
-| ID | Time | Hypothesis | Primary change / commit | Evaluation | Metric delta | Guardrails | Cost | Decision | Artifact |
+| ID | Time | Hypothesis | Primary change / commit | Evaluation | Metric / core-progress delta | Guardrails | Cost | Decision | Artifact |
 |---|---|---|---|---|---:|---|---|---|---|
 
 ## Exceptional notes

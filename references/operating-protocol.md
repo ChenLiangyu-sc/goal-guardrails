@@ -13,6 +13,8 @@ Confirm these facts before choosing work:
 - remaining token, wall-clock, compute, and experiment budgets where applicable;
 - current run or next decision event;
 - recent falsified or inconclusive hypotheses.
+- the core progress unit, current end-to-end yield, stable chain ID and causal bottleneck, parent or closed-chain reference, and consecutive no-progress count;
+- the mechanism stop line and remaining allowance for implementation, experiments, and non-core overhead.
 
 If a critical fact is missing or evaluation integrity is uncertain, return `PAUSE_REQUIRED`. Do not fill the time with cleanup.
 
@@ -28,6 +30,7 @@ Generate no more than three candidates. A medium- or high-cost task is admissibl
 6. What implementation and experiment cost will it consume?
 7. What useful uncertainty disappears if it fails?
 8. Is it reversible and attributable to one primary change?
+9. Does it test end-to-end progress, or merely prove an internal representation, contract, or transport property again?
 
 Reject the task to the backlog when any of the first four answers is missing.
 
@@ -46,9 +49,13 @@ Rank candidates lexicographically instead of inventing precise confidence scores
 - Start from the best verified candidate or an explicitly selected frontier, not automatically from `latest`.
 - Make one primary causal change.
 - Record the success and failure threshold before running.
+- Record a stable chain ID, its causal bottleneck and parent or closed-chain reference, the core progress expected, and the chain stop line before running.
 - Keep the change reversible and preserve the exact commit/config/artifact identity.
 - Use a cheap pilot only for screening. Promote only under the contract's full-evaluation rule.
-- Distinguish an invalid run from a falsified hypothesis.
+- Distinguish an invalid run from a falsified hypothesis. A frozen evaluator that completes normally and reports failure or zero yield is a valid no-progress result; mark a run invalid only when evaluation integrity failed.
+- Do not count a valid schema, parser, envelope, transport, terminal, or protocol result as core progress unless the contract defines it as the optimized outcome or it measurably restores end-to-end yield.
+
+Keep the chain identity stable across component renames and adjacent internal layers when they address the same causal bottleneck. A new diagnostic or optimization chain requires a materially different causal path plus a reference to the closed parent or predecessor and the evidence that triggered the switch. A verification/promotion child may inherit the successful path, but it is limited to replication, contract-required validation, promotion, or rollback; it cannot patch the mechanism or reopen its diagnostic chain.
 
 Infrastructure work requires all of the following:
 
@@ -69,17 +76,20 @@ Keep the audit short:
 3. Is the current path still the shortest defensible route to the target?
 4. Did scope or non-core spend expand?
 5. What is the single next decision and action?
+6. How many consecutive valid experiments on this mechanism produced no core progress, and has its stop line fired?
 
-Update `STATE.md` by replacement, not accumulation. Append one concise fact row to `EXPERIMENTS.md`. Store raw metrics and logs in project artifacts, not in the state file.
+Update `STATE.md` by replacement, not accumulation, and keep it within the contract's nonblank-line cap. Append one concise fact row to `EXPERIMENTS.md`. Store raw metrics and logs in project artifacts, not in the state file. Repeated polling, recovery, identity checks, and unchanged status must not create narrative state growth or reset a no-progress counter.
+
+Treat the mechanism as exhausted when its declared experiment, wall-clock, or consecutive-no-progress limit is reached. One final discriminator is admissible only when it changes exactly one variable, has a frozen end-to-end evaluator, and names mutually exclusive next paths in advance. A positive result may enter a separately named verification/promotion chain limited to replication and contract-required independent validation. A negative or zero-progress result must enter the named switch or rollback path. An inconclusive result or failed evaluation integrity must enter the named switch, rollback, or pause path. Every outcome closes the original diagnostic/patch chain and cannot authorize another experiment in it.
 
 ## Decide and stop
 
 - `CONTINUE`: the current mechanism has valid positive evidence and the next test remains bounded.
 - `REPLICATE`: a positive signal needs another repetition, trial, seed, or independent check.
-- `SWITCH`: evidence rejects or exhausts the current mechanism, or a clearly stronger candidate exists.
+- `SWITCH`: evidence rejects or exhausts the current mechanism, its no-progress stop line fires, or a clearly stronger candidate exists.
 - `ROLLBACK`: no verified gain, a guardrail failed, evaluation was invalid, or complexity increased without benefit.
 - `PAUSE_REQUIRED`: the contract is incomplete, evaluation is untrusted, scope or budget must change, no candidate passes admission, or human tradeoff is required.
-- `COMPLETE`: the target and every required guardrail, replication, holdout, and reproducibility condition are satisfied.
+- `COMPLETE`: the target and every guardrail, replication, independent-validation or holdout, and reproducibility condition declared applicable in the contract are satisfied.
 
 Never equate budget exhaustion, process completion, or lack of ideas with successful completion.
 
@@ -97,6 +107,6 @@ optimization/BACKLOG.md.
 
 Checkpoint after each valid experiment and at the budget interval in the
 contract. Stop with PAUSE_REQUIRED when evaluation is untrusted, scope or budget
-must change, or no candidate passes admission. Complete only after the target,
-guardrails, replication, holdout, and reproducibility conditions all pass.
+must change, or no candidate passes admission. Complete only after the target and
+all guardrail and validation conditions declared applicable in the contract pass.
 ```
