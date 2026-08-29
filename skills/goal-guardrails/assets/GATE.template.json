@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "project_root": null,
+  "enabled": false,
+  "state_max_nonblank_lines": 25,
+  "max_consecutive_no_progress": 3,
+  "max_unchanged_polls": 2,
+  "default_lease_minutes": 60,
+  "default_max_mutations": 12,
+  "max_non_core_cost_units_per_chain": 1
+}

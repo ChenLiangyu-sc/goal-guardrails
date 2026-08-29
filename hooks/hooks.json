@@ -1,0 +1,45 @@
+{
+  "description": "Experiment-lease enforcement for initialized Goal Guardrails projects.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/goal_guard.py\" hook",
+            "timeout": 10,
+            "statusMessage": "Restoring optimization gate",
+            "additionalContextLimit": 1200
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/goal_guard.py\" hook",
+            "timeout": 10,
+            "statusMessage": "Checking experiment lease"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/goal_guard.py\" hook",
+            "timeout": 10,
+            "statusMessage": "Recording optimization activity"
+          }
+        ]
+      }
+    ]
+  }
+}

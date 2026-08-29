@@ -1,101 +1,109 @@
 # Goal Guardrails
 
-A lightweight Codex skill that keeps long-running, metric-driven optimization focused on measurable gains instead of low-contribution cleanup and infrastructure work.
+Goal Guardrails keeps long-running, metric-driven optimization from drifting into low-contribution cleanup, repeated diagnostics, and ever-heavier execution paths.
 
-It applies beyond model training: prompt and model quality, performance, latency, cost, reliability, search and recommendation, conversion, data pipelines, and other iterative optimization with a measurable objective, evidence loop, budget, and stopping rule.
+It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-It installs a small project-local protocol:
+Version 0.2 combines:
 
 ```text
-short /goal
-  -> optimization/GOAL.md
-  -> optimization/STATE.md
-  -> admission of one bounded experiment
-  -> optimization/EXPERIMENTS.md
-  -> CONTINUE / REPLICATE / SWITCH / ROLLBACK / PAUSE_REQUIRED / COMPLETE
+GOAL.md + STATE.md
+        -> fresh proposal review + attestation
+        -> one bounded experiment lease
+        -> Codex PreToolUse/PostToolUse hooks
+        -> RESULT.json checkpoint
+        -> continue / switch / rollback / pause / complete
 ```
 
-The first version intentionally has no database, dashboard, hook, supervisor agent, or task scheduler. It can work alongside existing dispatch, Slurm, CI, benchmark runners, and deterministic monitoring systems without changing their authority boundaries.
+The Markdown files remain readable project memory. A small JSON state machine enforces lease expiry, mutation count, allowed paths and Bash commands, stable causal-chain identity, no-progress stop lines, non-core allowance, and repeated-poll limits. There is no database, dashboard, resident service, or per-command LLM review.
 
-## Install
+## Install as a Codex plugin
 
-Ask Codex:
+Add the public marketplace:
+
+```bash
+codex plugin marketplace add ChenLiangyu-sc/goal-guardrails
+```
+
+Install **Goal Guardrails** from the Plugins Directory, then open `/hooks` and review/trust its hook definition. Plugin installation alone does not trust non-managed hooks.
+
+The repository remains compatible with standalone Skill installation, but standalone mode cannot enforce lifecycle hooks:
 
 ```text
 $skill-installer install goal-guardrails from https://github.com/ChenLiangyu-sc/goal-guardrails
 ```
 
-Or install manually:
+## Initialize
 
-```bash
-git clone https://github.com/ChenLiangyu-sc/goal-guardrails \
-  ~/.codex/skills/goal-guardrails
-```
-
-Restart Codex or use `/skills` if the skill does not appear immediately.
-
-## Initialize one project
-
-From an optimization repository, the short form is:
+From an optimization repository:
 
 ```text
 $goal-guardrails init
 ```
 
-Add context only when needed, for example: `$goal-guardrails init; optimize p95 latency without reducing throughput.`
+The initializer creates missing files under `optimization/` and additively inserts one marked block into `AGENTS.md`. Existing files are never overwritten. `optimization/GATE.json` starts with `enabled: false`.
 
-The deterministic initializer can also be run directly:
-
-```bash
-python3 ~/.codex/skills/goal-guardrails/scripts/init_project.py .
-```
-
-It creates missing files under `optimization/` and additively inserts one marked policy block into `AGENTS.md`. Existing optimization files are never overwritten.
-
-## Initialize several projects
-
-Preview first:
+After the metric, evaluator, budgets, state, and stop rules are concrete, explicitly approve activation:
 
 ```bash
-python3 ~/.codex/skills/goal-guardrails/scripts/init_project.py \
-  --dry-run /path/project-a /path/project-b /path/project-c
+python3 <plugin-root>/hooks/goal_guard.py activate --approved-by user --project .
 ```
 
-Then repeat without `--dry-run`. The script scaffolds templates only; use Codex separately in each repository to fill project-specific metrics, evaluation commands, targets, and budgets.
+The Skill resolves `<plugin-root>` when running inside Codex. Confirm `/hooks` shows the plugin hook as trusted before relying on enforcement.
 
-The initializer preflights every supplied path before writing and rolls back files created in a project if that project's initialization fails. A batch is not transactional across repositories: if a later runtime write fails, earlier completed repositories remain initialized and the command reports a partial batch. Symbolic-link project roots, `optimization/` directories, template targets, and `AGENTS.md` files are rejected rather than followed or replaced. When appending to an existing `AGENTS.md`, the initializer preserves its bytes, newline style, mode, owner, group, timestamps, and supported metadata; it fails closed if the operating system does not allow that preservation.
+## Run an experiment
 
-## Short commands
+The short user command remains:
 
 ```text
-$goal-guardrails init
 $goal-guardrails run
-$goal-guardrails audit
 ```
 
-`init` scaffolds/adopts the protocol, `run` starts or resumes one bounded loop, and `audit` checks alignment without modifying files or launching work.
+The workflow then:
 
-## Design principles
+1. Restores `GOAL.md`, `STATE.md`, and recent evidence.
+2. Writes one bounded `PROPOSAL.json`.
+3. Obtains one fresh read-only subagent or user review.
+4. Admits the proposal to create a temporary lease.
+5. Allows only bounded mutation while the lease is live.
+6. Writes `RESULT.json` and checkpoints the lease.
 
-- One stable metric and evaluation contract.
-- At most three active candidate hypotheses.
-- One primary causal change per experiment.
-- A goal-level core progress unit and an explicit no-progress definition.
-- A stop line for each mechanism or diagnostic chain, including repeated valid experiments that produce no end-to-end progress.
-- Stable chain identity by causal bottleneck, so renaming a component cannot reset its stop line.
-- Low-contribution findings go to a backlog rather than interrupting the run.
-- Infrastructure work must unblock the highest-value experiment now.
-- Repeated monitoring, recovery, identity checks, contract proofs, and reviews consume the non-core budget instead of masquerading as progress.
-- `STATE.md` remains a bounded frontier snapshot; experiment artifacts hold the history.
-- Every valid experiment ends in one explicit decision.
-- Budget exhaustion and process completion are not successful Goal completion.
-- Escalate to wrappers, hooks, reviewers, or controllers only after measured soft-governance failures.
+Manual controller commands are:
+
+```bash
+python3 <plugin-root>/hooks/goal_guard.py status --project .
+python3 <plugin-root>/hooks/goal_guard.py admit optimization/PROPOSAL.json --project .
+python3 <plugin-root>/hooks/goal_guard.py checkpoint optimization/RESULT.json --project .
+```
+
+## What the hook blocks
+
+- mutation without a live review-attested lease;
+- edits outside admitted paths;
+- Bash outside admitted command prefixes;
+- all MCP writes and unknown MCP operations (until a parameter-level scope adapter exists);
+- work after expiry or mutation-budget exhaustion;
+- reuse of a closed chain or renaming the same causal bottleneck;
+- repeated non-core leases beyond the configured allowance;
+- contract changes after admission;
+- continued work when `STATE.md` exceeds its cap;
+- identical polling after repeated unchanged results.
+
+Read-only inspection stays available. `PROPOSAL.json` can be prepared before a lease. `GOAL.md`, `GATE.json`, and `CONTROL.json` are protected during experiments.
+
+## Boundaries
+
+This is a strong behavioral guardrail, not a security sandbox. The workflow requires a genuinely fresh subagent or user review, but the local controller can validate only the recorded attestation's shape; it cannot authenticate who produced it. `--approved-by user` likewise records an explicit-approval attestation and must be used only after the user actually approves. Cryptographically or administratively unforgeable approval requires a managed hook or external trusted service.
+
+Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, read-only MCP classification is conservative name-based policy, and users can disable non-managed hooks. MCP mutation currently fails closed; perform scoped project writes through `apply_patch` or an admitted Bash command. A hook denial must be treated as a decision boundary rather than an invitation to find another execution path.
 
 ## Validation
 
 ```bash
-python3 -m unittest discover -s scripts -p 'test_*.py'
-python3 /path/to/skill-creator/scripts/quick_validate.py .
+python3 -m unittest discover -s skills/goal-guardrails/scripts -p 'test_*.py'
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 /path/to/skill-creator/scripts/quick_validate.py skills/goal-guardrails
+python3 /path/to/plugin-creator/scripts/validate_plugin.py .
 ```
 
 ## License

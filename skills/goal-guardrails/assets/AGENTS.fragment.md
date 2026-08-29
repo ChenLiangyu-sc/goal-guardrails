@@ -10,5 +10,6 @@ When `optimization/GOAL.md` governs an active task, its primary metric and hard 
 - Prefer one primary causal change per experiment. Record the baseline, candidate result, guardrails, cost, decision, artifact, and rollback identity.
 - Track the contract's end-to-end core progress unit under a stable chain ID and causal bottleneck. Renaming a component does not reset the chain. When a chain reaches its experiment, budget, or consecutive-no-progress limit, switch, roll back, or pause; internal schema/protocol success and repeated recovery or review do not reset the limit.
 - Keep `optimization/STATE.md` as a bounded current snapshot, not an accumulated work log.
+- When `optimization/GATE.json` is enabled, mutating work requires one unexpired review-attested experiment lease. Obtain a real fresh subagent or user review; the controller validates the attestation but cannot authenticate its author. Do not bypass a denial by changing tools, commands, chain names, or control files; checkpoint or return to admission.
 - Treat budget exhaustion, untrusted evaluation, required scope changes, and absence of admissible candidates as reasons to pause, not permission to fill time with low-contribution work.
 <!-- goal-guardrails:end -->

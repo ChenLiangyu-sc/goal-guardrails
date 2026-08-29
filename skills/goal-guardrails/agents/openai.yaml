@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goal Guardrails"
+  short_description: "Bound optimization with reviewed experiment leases"
+  default_prompt: "Use $goal-guardrails init to set up guarded optimization in this project."

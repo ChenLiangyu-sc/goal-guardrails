@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +20,10 @@ TARGETS = {
     "STATE.template.md": Path("optimization/STATE.md"),
     "EXPERIMENTS.template.md": Path("optimization/EXPERIMENTS.md"),
     "BACKLOG.template.md": Path("optimization/BACKLOG.md"),
+    "GATE.template.json": Path("optimization/GATE.json"),
+    "CONTROL.template.json": Path("optimization/CONTROL.json"),
+    "PROPOSAL.template.json": Path("optimization/PROPOSAL.json"),
+    "RESULT.template.json": Path("optimization/RESULT.json"),
 }
 AGENTS_FRAGMENT = ASSET_DIR / "AGENTS.fragment.md"
 START_MARKER = "<!-- goal-guardrails:start -->"
@@ -89,7 +94,12 @@ def plan_project(project: Path) -> list[Action]:
                 raise InitError(f"template target is not a regular file: {target}")
             actions.append(("skip-existing", target, None))
         else:
-            actions.append(("create", target, (ASSET_DIR / asset_name).read_bytes()))
+            content = (ASSET_DIR / asset_name).read_bytes()
+            if asset_name == "GATE.template.json":
+                gate = json.loads(content.decode("utf-8"))
+                gate["project_root"] = os.fspath(project)
+                content = (json.dumps(gate, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            actions.append(("create", target, content))
 
     agents = project / "AGENTS.md"
     if agents.is_symlink():

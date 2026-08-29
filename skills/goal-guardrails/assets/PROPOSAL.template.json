@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "experiment_id": "TODO",
+  "chain_id": "TODO",
+  "chain_kind": "optimization",
+  "parent_chain": null,
+  "causal_bottleneck": "TODO",
+  "hypothesis": "TODO",
+  "core_progress_expected": "TODO",
+  "allowed_paths": ["TODO"],
+  "allowed_command_prefixes": ["TODO"],
+  "expires_minutes": 60,
+  "max_mutations": 12,
+  "work_class": "core",
+  "cost_units": 1,
+  "final_discriminator": false,
+  "next_paths": null,
+  "review": {
+    "decision": "TODO: ALLOW | REJECT_TO_BACKLOG | SWITCH_CHAIN | PAUSE_REQUIRED",
+    "reviewer": "TODO: subagent:<id> | user:<id>",
+    "reason": "TODO"
+  }
+}

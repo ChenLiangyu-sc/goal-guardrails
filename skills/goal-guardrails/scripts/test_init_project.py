@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -22,7 +23,7 @@ class InitProjectTests(unittest.TestCase):
 
     def test_creates_templates_and_agents_fragment(self) -> None:
         messages = init_project.apply_project(self.root, dry_run=False)
-        self.assertEqual(5, len(messages))
+        self.assertEqual(len(init_project.TARGETS) + 1, len(messages))
         for relative in init_project.TARGETS.values():
             self.assertTrue((self.root / relative).is_file())
         agents = (self.root / "AGENTS.md").read_text(encoding="utf-8")
@@ -35,6 +36,14 @@ class InitProjectTests(unittest.TestCase):
         state = (self.root / "optimization/STATE.md").read_text(encoding="utf-8")
         self.assertIn("`STATE.md` maximum nonblank lines: `25`", goal)
         self.assertLessEqual(sum(bool(line.strip()) for line in state.splitlines()), 25)
+
+    def test_gate_starts_disabled_and_machine_state_is_created(self) -> None:
+        init_project.apply_project(self.root, dry_run=False)
+        gate = (self.root / "optimization/GATE.json").read_text(encoding="utf-8")
+        control = (self.root / "optimization/CONTROL.json").read_text(encoding="utf-8")
+        self.assertIn('"enabled": false', gate)
+        self.assertIn('"active_lease": null', control)
+        self.assertEqual(str(self.root), json.loads(gate)["project_root"])
 
     def test_rerun_is_idempotent(self) -> None:
         init_project.apply_project(self.root, dry_run=False)
@@ -58,7 +67,7 @@ class InitProjectTests(unittest.TestCase):
 
     def test_dry_run_does_not_write(self) -> None:
         messages = init_project.apply_project(self.root, dry_run=True)
-        self.assertEqual(5, len(messages))
+        self.assertEqual(len(init_project.TARGETS) + 1, len(messages))
         self.assertEqual([], list(self.root.iterdir()))
 
     def test_incomplete_agents_marker_fails_closed(self) -> None:

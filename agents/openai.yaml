@@ -1,4 +1,0 @@
-interface:
-  display_name: "Goal Guardrails"
-  short_description: "Keep long-running optimization focused on measurable gains"
-  default_prompt: "Use $goal-guardrails init in the current metric-driven optimization project."

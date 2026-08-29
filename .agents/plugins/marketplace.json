@@ -1,0 +1,21 @@
+{
+  "name": "goal-guardrails",
+  "interface": {
+    "displayName": "Goal Guardrails"
+  },
+  "plugins": [
+    {
+      "name": "goal-guardrails",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/ChenLiangyu-sc/goal-guardrails.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

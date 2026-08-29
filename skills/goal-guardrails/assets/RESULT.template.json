@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "experiment_id": "TODO",
+  "valid": true,
+  "evaluation_integrity": "PASS",
+  "core_progress": false,
+  "metric_delta": "TODO",
+  "outcome": "TODO: positive | negative | zero_progress | inconclusive | invalid",
+  "decision": "TODO: CONTINUE | REPLICATE | SWITCH | ROLLBACK | PAUSE_REQUIRED | COMPLETE",
+  "artifact": "TODO"
+}

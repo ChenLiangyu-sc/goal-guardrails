@@ -1,0 +1,29 @@
+{
+  "name": "goal-guardrails",
+  "version": "0.2.0",
+  "description": "Keep long-running optimization aligned through bounded experiment leases and Codex lifecycle hooks.",
+  "author": {
+    "name": "Chen Liangyu",
+    "url": "https://github.com/ChenLiangyu-sc"
+  },
+  "homepage": "https://github.com/ChenLiangyu-sc/goal-guardrails",
+  "repository": "https://github.com/ChenLiangyu-sc/goal-guardrails",
+  "license": "MIT",
+  "keywords": ["codex", "optimization", "goal", "guardrails", "experiments"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Goal Guardrails",
+    "shortDescription": "Bound long optimization loops with experiment leases",
+    "longDescription": "A lightweight contract, review-attested experiment leases, and a lifecycle-hook gate for keeping metric-driven optimization focused on end-to-end progress.",
+    "developerName": "Chen Liangyu",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Lifecycle hooks"],
+    "websiteURL": "https://github.com/ChenLiangyu-sc/goal-guardrails",
+    "defaultPrompt": [
+      "Initialize guarded optimization in this project.",
+      "Admit and run the next bounded experiment.",
+      "Audit this optimization for drift or stagnation."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

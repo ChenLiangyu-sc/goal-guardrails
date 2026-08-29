@@ -44,6 +44,14 @@ Rank candidates lexicographically instead of inventing precise confidence scores
 6. reversibility and narrower scope;
 7. mechanism diversity relative to recent failed attempts.
 
+## Obtain and enforce one lease
+
+Put the selected experiment in `optimization/PROPOSAL.json`. Every proposal requires one fresh read-only subagent or user review at the experiment boundary. The reviewer sees the contract and evidence, not the desired verdict. Do not treat a main-agent self-review as independent, and do not repeat review on each tool call. The controller records this as a behavioral attestation and validates its shape; it does not authenticate the reviewer identity.
+
+After `ALLOW`, use the bundled controller to admit the proposal. A proposal is rejected deterministically when another lease is active, state exceeds its cap, the same causal bottleneck is renamed, a chain is closed, its stop line fired without an unused final discriminator, non-core allowance is exhausted, or the proposal attempts to authorize protected control files.
+
+The lease limits paths, Bash prefixes, expiry, mutation count, work class, and cost. MCP mutation fails closed until a parameter-level scope adapter exists; use scoped `apply_patch` or an admitted Bash command. Hook denial means return to admission or checkpoint. Never evade it with another tool, alternate command spelling, direct control-file edits, or gate deactivation. Read-only inspection is not a license to perform adjacent cleanup.
+
 ## Execute minimally
 
 - Start from the best verified candidate or an explicitly selected frontier, not automatically from `latest`.
@@ -80,6 +88,8 @@ Keep the audit short:
 
 Update `STATE.md` by replacement, not accumulation, and keep it within the contract's nonblank-line cap. Append one concise fact row to `EXPERIMENTS.md`. Store raw metrics and logs in project artifacts, not in the state file. Repeated polling, recovery, identity checks, and unchanged status must not create narrative state growth or reset a no-progress counter.
 
+Write the machine-readable outcome to `RESULT.json` and checkpoint the active lease. The controller updates the chain counter and closes or stops a chain from the declared result. Do not edit `CONTROL.json` manually. If Markdown evidence and controller state disagree, pause and reconcile from the frozen evaluator artifact rather than selecting the more favorable record.
+
 Treat the mechanism as exhausted when its declared experiment, wall-clock, or consecutive-no-progress limit is reached. One final discriminator is admissible only when it changes exactly one variable, has a frozen end-to-end evaluator, and names mutually exclusive next paths in advance. A positive result may enter a separately named verification/promotion chain limited to replication and contract-required independent validation. A negative or zero-progress result must enter the named switch or rollback path. An inconclusive result or failed evaluation integrity must enter the named switch, rollback, or pause path. Every outcome closes the original diagnostic/patch chain and cannot authorize another experiment in it.
 
 ## Decide and stop
@@ -100,13 +110,14 @@ Adapt only the bracketed values:
 ```text
 /goal Follow optimization/GOAL.md to optimize [TARGET, SYSTEM, OR PROCESS].
 
-Before each experiment, restore optimization/STATE.md and admit only a minimal,
-reversible, attributable test with a causal path to the primary metric. Record
-valid results in optimization/EXPERIMENTS.md and defer non-core work to
-optimization/BACKLOG.md.
+Before each experiment, restore optimization/STATE.md, obtain fresh external review,
+attest it, and admit one bounded lease for a reversible test with a causal path
+to the primary metric. Record valid results in optimization/EXPERIMENTS.md and
+defer non-core work to optimization/BACKLOG.md.
 
 Checkpoint after each valid experiment and at the budget interval in the
-contract. Stop with PAUSE_REQUIRED when evaluation is untrusted, scope or budget
-must change, or no candidate passes admission. Complete only after the target and
-all guardrail and validation conditions declared applicable in the contract pass.
+contract. Treat hook denial or lease exhaustion as a decision boundary. Stop with
+PAUSE_REQUIRED when evaluation is untrusted, scope or budget must change, or no
+candidate passes admission. Complete only after the target and all applicable
+guardrail and validation conditions pass.
 ```
