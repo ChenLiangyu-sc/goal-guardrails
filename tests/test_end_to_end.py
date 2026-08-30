@@ -33,6 +33,34 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
         completed = self.run_cli(GUARD, "hook", input_text=json.dumps(event))
         return json.loads(completed.stdout) if completed.stdout.strip() else None
 
+    def test_fast_unattended_flow_runs_without_lease_review_or_poll_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.run_cli(INIT, project)
+            optimization = project / "optimization"
+            (optimization / "GOAL.md").write_text("# Goal\n\nMetric: accepted output yield\n", encoding="utf-8")
+            (optimization / "STATE.md").write_text("# State\n\n- frontier: baseline\n", encoding="utf-8")
+            self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+
+            status = json.loads(self.run_cli(GUARD, "status", "--project", project).stdout)
+            self.assertEqual("fast", status["profile"])
+            self.assertEqual("CONTINUE_FAST", status["next_action"]["kind"])
+            self.assertIsNone(self.hook(project, "apply_patch", {"patch": "*** Begin Patch\n*** Add File: src/candidate.py\n+x = 1\n*** End Patch"}))
+            self.assertIsNone(self.hook(project, "Bash", {"command": "python3 train.py --overnight && pytest -q"}))
+            self.assertIsNone(self.hook(project, "mcp__filesystem__write_file", {"path": "artifacts/result.json", "content": "{}"}))
+
+            for _ in range(5):
+                event = {
+                    "hook_event_name": "PostToolUse", "cwd": str(project), "tool_name": "Bash",
+                    "tool_input": {"command": "squeue -j 12345"}, "tool_response": {"state": "RUNNING"},
+                }
+                completed = self.run_cli(GUARD, "hook", input_text=json.dumps(event))
+                self.assertEqual("", completed.stdout)
+
+            protected = self.hook(project, "apply_patch", {"patch": "*** Begin Patch\n*** Update File: optimization/GOAL.md\n@@\n-Metric\n+Other metric\n*** End Patch"})
+            self.assertEqual("deny", protected["hookSpecificOutput"]["permissionDecision"])
+            self.assertIn("do not stop the Goal", protected["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_initialize_activate_and_run_two_checkpointed_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -46,6 +74,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             artifacts = project / "artifacts"
             artifacts.mkdir()
             self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+            self.run_cli(GUARD, "mode", "strict", "--approved-by", "user", "--project", project)
 
             for index in range(2):
                 experiment = f"E{index + 1:03d}"
@@ -152,6 +181,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             self.assertIn("gate is not activated", disabled.stderr)
 
             self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+            self.run_cli(GUARD, "mode", "strict", "--approved-by", "user", "--project", project)
             self.run_cli(GUARD, "admit", proposal_path, "--project", project)
             outside_patch = "*** Begin Patch\n*** Add File: docs/drift.md\n+drift\n*** End Patch"
             self.assertEqual("deny", self.hook(project, "apply_patch", {"patch": outside_patch})["hookSpecificOutput"]["permissionDecision"])
@@ -233,6 +263,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             proposal_path = optimization / "PROPOSAL.json"
             proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
             self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+            self.run_cli(GUARD, "mode", "strict", "--approved-by", "user", "--project", project)
             self.run_cli(GUARD, "admit", proposal_path, "--project", project)
             bound = self.run_cli(GUARD, "submit-bind", "--policy", "submit", "--project", project)
             self.assertEqual("24680", json.loads(bound.stdout)["value"])

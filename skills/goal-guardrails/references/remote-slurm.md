@@ -1,6 +1,6 @@
 # Remote Slurm submission
 
-Use `ssh-helper-v1` when the guarded project and controller are local but `sbatch` exists only on a reviewed SSH host. The local controller remains the sole owner of the lease, lock, mutation budget, runtime binding, and `optimization/CONTROL.json`. The remote host owns only a restricted helper and immutable submission receipts.
+Use `ssh-helper-v1` when the guarded project and controller are local but `sbatch` exists only on a frozen SSH host. This is one of the few workflows that still uses a lease in fast profile because duplicate submission is externally expensive. Fast admission performs deterministic validation without a separate reviewer; strict admission also requires its reviewer attestation. The local controller remains the sole owner of the lease, lock, runtime binding, and `optimization/CONTROL.json`. The remote host owns only a restricted helper and immutable submission receipts.
 
 ## Trust boundary
 
@@ -19,11 +19,11 @@ Record SHA-256 values for:
 - the bundled and deployed helper, which must be byte-identical;
 - every submitted project input such as the Slurm script.
 
-The reviewed remote work directory must contain the same input bytes. `doctor` checks the deployed helper, remote `sbatch`, work directory, receipt root, and every remote input before submission. Submission repeats the relevant checks and pins the `sbatch` digest returned by doctor.
+The frozen remote work directory must contain the same input bytes. `doctor` checks the deployed helper, remote `sbatch`, work directory, receipt root, and every remote input before submission. Submission repeats the relevant checks and pins the `sbatch` digest returned by doctor.
 
 ## Proposal contract
 
-The transport is allowed only on a one-shot policy that captures a required runtime binding. All arguments remain in the reviewed policy; `submit-bind` accepts no runtime argv.
+The transport is allowed only on a one-shot policy that captures a required runtime binding. All arguments remain in the frozen policy; `submit-bind` accepts no runtime argv. The example includes the `review` block for strict compatibility; fast profile ignores it and synthesizes controller validation.
 
 ```json
 {
@@ -92,7 +92,7 @@ The proposal's `executable` represents the remote executable identity and must a
 
 ## Run and recover
 
-After fresh review and admission:
+After deterministic fast admission, or fresh review plus strict admission:
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py doctor --policy submit-slurm --project .
@@ -111,4 +111,4 @@ python3 <plugin-root>/hooks/goal_guard.py reconcile-bind --policy submit-slurm -
 
 The lease exposes `budget_plan`: one-shot submission costs one mutation; doctor, reconciliation, wait/wake, and controller receipt bookkeeping cost zero. Account external scheduler compute separately in the experiment budget.
 
-After the binding succeeds, start the separately reviewed deterministic monitor with the bound Job ID and use `wait-monitor` / `wake-monitor`. The monitor remains project-read-only and does not make Goal or business-metric decisions.
+After the binding succeeds, start the frozen deterministic monitor with the bound Job ID and use `wait-monitor` / `wake-monitor`. Strict mode additionally requires review. The monitor remains project-read-only and does not make Goal or business-metric decisions.

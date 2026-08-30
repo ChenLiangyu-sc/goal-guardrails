@@ -108,19 +108,28 @@ def plan_project(project: Path) -> list[Action]:
     if agents.exists() and not agents.is_file():
         raise InitError(f"AGENTS.md is not a regular file: {agents}")
     existing = agents.read_bytes() if agents.exists() else b""
-    complete_marker_found = False
+    found_pair: tuple[str, str] | None = None
     for start_text, end_text in MARKER_PAIRS:
         has_start = start_text.encode("utf-8") in existing
         has_end = end_text.encode("utf-8") in existing
         if has_start != has_end:
             raise InitError(f"AGENTS.md contains an incomplete guardrails marker block: {agents}")
-        complete_marker_found = complete_marker_found or has_start
-    if complete_marker_found:
-        actions.append(("skip-marked", agents, None))
+        if has_start:
+            if found_pair is not None:
+                raise InitError(f"AGENTS.md contains multiple guardrails marker blocks: {agents}")
+            found_pair = (start_text, end_text)
+    newline = b"\r\n" if b"\r\n" in existing else b"\n"
+    fragment = AGENTS_FRAGMENT.read_bytes().replace(b"\r\n", b"\n").rstrip(b"\n")
+    fragment = fragment.replace(b"\n", newline)
+    if found_pair is not None:
+        start_marker = found_pair[0].encode("utf-8")
+        end_marker = found_pair[1].encode("utf-8")
+        start = existing.index(start_marker)
+        end = existing.index(end_marker, start) + len(end_marker)
+        updated = existing[:start] + fragment + existing[end:]
+        actions.append(("skip-marked", agents, None) if updated == existing else ("update-marked", agents, updated))
     else:
-        newline = b"\r\n" if b"\r\n" in existing else b"\n"
-        fragment = AGENTS_FRAGMENT.read_bytes().replace(b"\r\n", b"\n").rstrip(b"\n")
-        fragment = fragment.replace(b"\n", newline) + newline
+        fragment += newline
         prefix = existing
         if prefix and not prefix.endswith((b"\n", b"\r")):
             prefix += newline
@@ -142,7 +151,7 @@ def apply_actions(project: Path, actions: list[Action], dry_run: bool) -> list[s
             messages.append(f"{action}: {target}")
             if content is None:
                 continue
-            preserve_from = target if action == "append" else None
+            preserve_from = target if action in {"append", "update-marked"} else None
             atomic_write(target, content, preserve_from=preserve_from)
             if action == "create":
                 created.append(target)

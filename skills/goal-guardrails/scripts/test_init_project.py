@@ -43,6 +43,7 @@ class InitProjectTests(unittest.TestCase):
         control = (self.root / "optimization/CONTROL.json").read_text(encoding="utf-8")
         pre_run = (self.root / "optimization/PRE_RUN_RESULTS.json").read_text(encoding="utf-8")
         self.assertIn('"enabled": false', gate)
+        self.assertEqual("fast", json.loads(gate)["profile"])
         self.assertEqual(1440, json.loads(gate)["default_lease_minutes"])
         self.assertEqual(24, json.loads(gate)["default_max_mutations"])
         self.assertIn('"active_lease": null', control)
@@ -82,17 +83,34 @@ class InitProjectTests(unittest.TestCase):
             init_project.apply_project(self.root, dry_run=False)
         self.assertFalse((self.root / "optimization").exists())
 
-    def test_legacy_agents_marker_is_not_duplicated(self) -> None:
+    def test_legacy_agents_marker_is_migrated_without_duplication(self) -> None:
         agents = self.root / "AGENTS.md"
         agents.write_text(
             init_project.LEGACY_START_MARKER + "\nlegacy rules\n" + init_project.LEGACY_END_MARKER + "\n",
             encoding="utf-8",
         )
         messages = init_project.apply_project(self.root, dry_run=False)
-        self.assertTrue(messages[-1].startswith("skip-marked"))
+        self.assertTrue(messages[-1].startswith("update-marked"))
         updated = agents.read_text(encoding="utf-8")
-        self.assertNotIn(init_project.START_MARKER, updated)
-        self.assertEqual(1, updated.count(init_project.LEGACY_START_MARKER))
+        self.assertEqual(1, updated.count(init_project.START_MARKER))
+        self.assertNotIn(init_project.LEGACY_START_MARKER, updated)
+        self.assertIn("unattended YOLO execution", updated)
+
+    def test_outdated_managed_agents_block_is_updated_in_place(self) -> None:
+        agents = self.root / "AGENTS.md"
+        agents.write_text(
+            "# Keep before\n\n"
+            + init_project.START_MARKER + "\nold strict lease rule\n" + init_project.END_MARKER
+            + "\n\n# Keep after\n",
+            encoding="utf-8",
+        )
+        messages = init_project.apply_project(self.root, dry_run=False)
+        self.assertTrue(messages[-1].startswith("update-marked"))
+        updated = agents.read_text(encoding="utf-8")
+        self.assertIn("# Keep before", updated)
+        self.assertIn("# Keep after", updated)
+        self.assertNotIn("old strict lease rule", updated)
+        self.assertIn("ordinary in-scope local edits", updated)
 
     def test_main_handles_multiple_projects(self) -> None:
         second = self.root / "second"

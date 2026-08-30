@@ -1,19 +1,19 @@
 ---
 name: goal-guardrails
-description: Initialize, run, resume, or audit anti-drift guardrails for long-running metric-driven optimization. Use for iterative work with a measurable objective, evidence loop, budget, and stopping rule, including model quality, prompts, performance, latency, cost, reliability, search, recommendation, conversion, and system tuning. When installed as a plugin, enforce review-attested experiment leases through Codex lifecycle hooks. Do not use for ordinary one-off changes, goals without a measurable evaluation, or general project management.
+description: Initialize, run, resume, or audit fast anti-drift guardrails for unattended metric-driven optimization. Use for long-running iterative work with a measurable objective, evidence loop, budget, and stopping rule. The plugin defaults to autonomous local execution without per-command approval; strict review-attested leases remain optional for high-assurance runs.
 ---
 
 # Goal Guardrails
 
-Keep the optimization target stable while making the next experiment small, measurable, and worth its cost. Project Markdown remains the human-readable contract and evidence. When plugin hooks are available, use the small lease controller as the execution gate; do not replace it with a database, dashboard, scheduler, or per-tool model review.
+Keep the optimization target stable while making the next experiment small, measurable, and worth its cost. Project Markdown remains the human-readable contract and evidence. The default `fast` profile is designed for YOLO/full-access and unattended overnight Goals: routine local work must not wait for a lease, reviewer, or user approval. `strict` is an explicit opt-in for high-assurance workflows.
 
 ## Choose the mode
 
 - **`init` — initialize or adopt:** scaffold the protocol, fill supported facts, then activate enforcement only with explicit user approval.
-- **`run` — run or resume:** restore the frontier, obtain a fresh proposal review, attest it, admit one lease, execute it, and checkpoint the result.
+- **`run` — run or resume:** restore the frontier, execute the highest-value bounded experiment autonomously, evaluate it, and checkpoint the semantic result.
 - **`audit` — audit:** inspect alignment and report evidence without changing code or launching work unless the user also requests changes.
 
-Read [references/operating-protocol.md](references/operating-protocol.md) before running, resuming, or auditing an optimization. Initialization alone can follow the steps below.
+Read [references/operating-protocol.md](references/operating-protocol.md) only when strict leases or detailed state-machine recovery are actually needed. Fast local execution follows the shorter loop below.
 
 ## Initialize safely
 
@@ -23,7 +23,7 @@ Run the initializer from the repository root:
 python3 <skill-dir>/scripts/init_project.py .
 ```
 
-Use `--dry-run` first for multiple repositories. It creates only missing templates and additively inserts one marked block in `AGENTS.md`; existing optimization files are never overwritten. `GATE.json` starts disabled, so scaffolding cannot unexpectedly block work.
+Use `--dry-run` first for multiple repositories. It creates only missing templates and additively manages one marked block in `AGENTS.md`; unrelated guidance and existing optimization files are preserved. Re-running it upgrades the plugin-owned block from older strict instructions to the current fast/unattended policy. `GATE.json` starts disabled, so scaffolding cannot unexpectedly block work.
 
 After scaffolding:
 
@@ -42,49 +42,27 @@ Never claim enforcement is active when only the standalone Skill is installed. R
 
 ## Run one bounded loop
 
-Before selecting work, read `GOAL.md`, `STATE.md`, the recent relevant experiment rows, and the backlog only to avoid repeating deferred work. Keep at most three candidates and select exactly one experiment.
+Before selecting work, read `GOAL.md`, `STATE.md`, recent relevant experiment rows, and the backlog only to avoid repetition. Keep at most three candidates and select exactly one experiment. State its hypothesis, causal path, smallest valid test, success/failure threshold, and stop condition briefly; then execute it directly.
 
-Write a schema-v2 bounded proposal to `optimization/PROPOSAL.json`. Freeze existing evidence with its current SHA-256, future lease mutations by path/scope/operation, preregistered checkpoint artifacts, pre-run gates, and exact Bash executable/ordered-argv/cwd/output/resource policies. Use `argv` literal tokens for static commands; add reviewed runtime bindings only when an external system produces an identifier after admission. Obtain one fresh read-only reviewer decision before every admission; this is deliberately once per experiment rather than once per tool call. Use a subagent when available and give it only the contract, frontier, recent evidence, and proposal; do not reveal a desired verdict. It must return exactly one of:
+In `fast` profile:
 
-```text
-ALLOW | REJECT_TO_BACKLOG | SWITCH_CHAIN | PAUSE_REQUIRED
-```
+- local editing, tests, builds, evaluation, diagnostics, recovery, MCP work, and evidence updates need no proposal, lease, reviewer, or user approval;
+- an absent/expired lease, one rejected tool call, a failed test, or a malformed intermediate result is recoverable and must not stop the Goal;
+- skip a protected high-impact action, record it in `BACKLOG.md`, and continue the next safe, high-contribution action instead of asking the user;
+- ask the user only when progress truly requires changing the objective/metric, budget or material scope, an irreversible external action, or a fired stop line;
+- update `STATE.md` concisely and append the experiment fact after a semantic result, not after every command.
 
-The reviewer checks that the evidence supports admission, lease mutations are bounded, pre-run gates are sufficient, and the proposed mutation happens only after admission. If required gates exist, it also affirms `preflight_failure_closure_reviewed=true`: every FAIL has preregistered immutable evidence, prohibits workload, and can exit through one invalid checkpoint without another review. For an external monitor, it additionally affirms `external_monitor_contract_bounded=true` after checking the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary. For remote submission it affirms `remote_submission_contract_bounded=true` after checking the SSH identity, pinned helper and inputs, nonce receipt, and no-retry path. Do not require planned files or mutations to exist before review; the reviewer evaluates the frozen authorization contract. If no reviewer independent of the main agent is available, ask the user instead of self-approving. Record an allowed reviewer as `subagent:<id>` or `user:<id>` with a short reason and all required review checks. This is a behavioral attestation: the controller validates its shape but cannot authenticate its author.
-
-Admit an allowed proposal through the controller:
-
-```bash
-python3 <plugin-root>/hooks/goal_guard.py admit optimization/PROPOSAL.json --project .
-```
-
-Admission copies the complete phase contract plus canonical and file SHA-256 values into the lease. Later proposal or existing-evidence changes invalidate it. `apply_patch` must match the admitted path, scope, and operation. Bash must match one complete structured policy; suffix arguments, cwd drift, undeclared output paths, and GPU-policy conflicts fail closed. MCP writes and unknown MCP operations also fail closed.
-
-After preparation produces gate evidence, write `optimization/PRE_RUN_RESULTS.json` and record it before workload or postflight commands:
-
-```bash
-python3 <plugin-root>/hooks/goal_guard.py gates optimization/PRE_RUN_RESULTS.json --project .
-```
-
-A genuine required-gate `FAIL` is valid evidence, not a controller error. It is frozen exactly once, all further workload and ordinary mutation remain denied, and the same `PASS` cannot be substituted later. Prefer `goal_guard.py abort --project .`: the controller creates the exact invalid result from frozen evidence, verifies it, clears the lease without closing or renaming the chain, and returns to fresh review. Manual `RESULT.json` staging/correction remains legal if needed.
-
-After evaluation, write `optimization/RESULT.json` with every required preregistered artifact path and actual SHA-256 plus the recorded gate results. The controller verifies evidence integrity and result consistency but does not decide whether a domain metric is good. Update concise Markdown evidence and checkpoint:
-
-```bash
-python3 <plugin-root>/hooks/goal_guard.py checkpoint optimization/RESULT.json --project .
-```
-
-Do not begin a new experiment before the prior lease is checkpointed. A failed, expired, or exhausted lease is a decision boundary, not permission to work outside the controller.
+Use a schema-v2 proposal and controller lease only when the run needs deterministic one-shot runtime binding, immutable external-monitor evidence, or the user explicitly selected `strict`. Fast admission performs deterministic validation and does not require an external reviewer. Strict profile retains the full review/lease/gates/checkpoint protocol in [references/operating-protocol.md](references/operating-protocol.md).
 
 ## Wait for asynchronous work
 
-When a reviewed workload is running normally and no semantic event is available, enter `WAITING_EXTERNAL_EVENT` instead of polling or returning `blocked`:
+When a frozen external workload is running normally and no semantic event is available, enter `WAITING_EXTERNAL_EVENT` instead of returning `blocked`:
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py wait --event-key <stable-job-id> --event-path <preregistered-terminal-artifact> --project .
 ```
 
-This preserves the gate and active lease, freezes its remaining lifetime, blocks mutation and polling, and allows ordinary non-polling read-only inspection. End the activation immediately. A trusted event bridge writes a changed terminal artifact and invokes:
+Use `wait` only when a trusted event bridge is configured. It preserves the gate and active lease and blocks mutation until wake. Fast profile still permits read-only inspection or bounded polling; strict profile ends the activation immediately. Without an event bridge, keep the process attached or use bounded controller-managed monitoring instead of entering a state that cannot wake itself. A trusted event bridge writes a changed terminal artifact and invokes:
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py wake --event-key <same-id> --event-path <same-artifact> --project .
@@ -92,7 +70,7 @@ python3 <plugin-root>/hooks/goal_guard.py wake --event-key <same-id> --event-pat
 
 Wake events are deduplicated by key and artifact SHA-256. A successful wake freezes that terminal artifact into the lease; postflight cannot overwrite it and checkpoint must present the same SHA. Resume the same lease for postflight and checkpoint; do not create workload, monitoring, and postflight leases merely because the job waited. This state cannot pause Codex Goal scheduling itself, so never claim that the plugin disabled platform automatic continuation.
 
-When the terminal belongs in a deterministic monitor's private state directory, read the external-monitor section of [references/operating-protocol.md](references/operating-protocol.md). Do not add a project relay. Run the reviewed `sbatch --parsable` submission only through `submit-bind`; direct execution is denied before it runs and therefore does not consume the policy. If Slurm exists only on another host, read [references/remote-slurm.md](references/remote-slurm.md), use `ssh-helper-v1`, and run `doctor` first. Never use raw SSH submission or a remote controller. Once the controller starts the one-shot submission, success, failure, malformed output, timeout, or uncertain outcome consumes it. For `UNCERTAIN`, run `reconcile-bind`; never repeat `submit-bind`. Start the monitor with the resulting frozen argv binding, then use `wait-monitor` and `wake-monitor`. The bridge must remain project-read-only. Only the controller may verify the external evidence chain and materialize the protected project receipt. Include that receipt path and SHA under `external_monitor_results` at checkpoint, but never treat scheduler success as the business verdict.
+When the terminal belongs in a deterministic monitor's private state directory, read the external-monitor section of [references/operating-protocol.md](references/operating-protocol.md). Do not add a project relay. Run the frozen `sbatch --parsable` submission only through `submit-bind`; direct execution is denied before it runs and therefore does not consume the policy. Fast admission is deterministic; strict additionally requires review. If Slurm exists only on another host, read [references/remote-slurm.md](references/remote-slurm.md), use `ssh-helper-v1`, and run `doctor` first. Never use raw SSH submission or a remote controller. Once the controller starts the one-shot submission, success, failure, malformed output, timeout, or uncertain outcome consumes it. For `UNCERTAIN`, run `reconcile-bind`; never repeat `submit-bind`. Start the monitor with the resulting frozen argv binding, then use `wait-monitor` and `wake-monitor`. The bridge must remain project-read-only. Only the controller may verify the external evidence chain and materialize the protected project receipt. Include that receipt path and SHA under `external_monitor_results` at checkpoint, but never treat scheduler success as the business verdict.
 
 ## Stop unproductive chains
 
@@ -104,9 +82,7 @@ Waiting does not authorize cleanup. Repeated status recovery, identity/SHA check
 
 ## Keep long runs recoverable
 
-Use a lease duration proportional to wall time, up to seven days; long duration never widens frozen paths, argv, gates, or mutation count. New projects default to 24 hours and 24 mutations. For an external job, enter `WAITING_EXTERNAL_EVENT` immediately after launch so elapsed waiting does not consume the remaining lease.
-
-A Hook denial rejects one tool call, not the Goal. Run controller `status`, follow `next_action`, and continue through `RECORD_GATES`, `ABORT_PREFLIGHT`, `CHECKPOINT`, or `FRESH_REVIEW` as reported. Do not mark the Goal complete or blocked merely because a command was denied, a lease expired, its mutation allowance was exhausted, or a result failed validation. `RESULT.json` remains correctable until checkpoint succeeds; a new review is required only for a new experiment or changed authorization contract, never per command.
+In fast profile, do not create leases for routine work. Keep long local processes attached, or use a deterministic monitor with a real wake path. A Hook denial rejects one high-impact call, not the Goal: continue another safe action without asking for permission. Do not mark the Goal complete or blocked merely because a command was denied, a lease expired, a test failed, or a result needed correction.
 
 ## Preserve the boundary
 
@@ -120,4 +96,4 @@ A Hook denial rejects one tool call, not the Goal. Run controller `status`, foll
 
 ## Enforcement boundary
 
-Hooks reduce accidental drift; they are not a security sandbox. Review and activation fields are attestations rather than authenticated identities. Structured Bash contracts freeze observable invocation fields but cannot infer every process side effect. `submit-bind` inherits the controller process environment while avoiding a shell; keep secrets out of argv and output. Hosted tools may not pass through lifecycle hooks, MCP read-only classification is conservative and name-based, project/plugin hooks require trust, and plugin wait cannot reconfigure Codex Goal scheduling. If repeated intentional bypass remains, pause and ask the user before proposing managed hooks or an external orchestrator.
+Hooks reduce accidental drift; they are not a security sandbox. Fast profile intentionally delegates ordinary authorization to Codex YOLO/full-access mode and guards only a small high-impact boundary through direct patches, recognizable Bash path references, and conventional visible MCP path/command fields; opaque tool or script side effects cannot be inferred. Strict structured Bash contracts freeze observable invocation fields but cannot infer every process side effect. `submit-bind` inherits the controller environment while avoiding a shell; keep secrets out of argv and output. Plugin wait cannot reconfigure Codex Goal scheduling.

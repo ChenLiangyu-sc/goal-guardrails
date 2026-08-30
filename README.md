@@ -4,21 +4,21 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.5.0 combines:
+Version 0.6.0 is fast by default:
 
 ```text
 GOAL.md + STATE.md
-        -> fresh proposal review + attestation
-        -> one frozen evidence/mutation/gate lease
-        -> Codex PreToolUse/PostToolUse hooks
-        -> static argv or local/SSH-helper one-shot runtime binding
-        -> active / waiting-external-event / active
-        -> verified external evidence -> controller receipt
-        -> RESULT.json checkpoint
+        -> choose one bounded high-value experiment
+        -> edit / test / evaluate directly in YOLO mode
+        -> semantic evidence checkpoint
         -> continue / switch / rollback / pause / complete
+
+optional strict or external one-shot path
+        -> deterministic proposal validation (strict adds review)
+        -> frozen lease + runtime binding + monitor receipt
 ```
 
-The Markdown files remain readable project memory. A small JSON state machine freezes existing evidence, planned mutations, pre-run gates, ordered Bash argv/cwd/output contracts, one-shot runtime bindings, external-monitor identities, artifact paths, lease expiry, mutation count, stable causal-chain identity, no-progress stop lines, non-core allowance, and repeated-poll limits. There is no database, dashboard, resident service, or per-command LLM review.
+The default `fast` profile is intended for Codex YOLO/full-access and unattended overnight Goals. It adds no per-command approval, lease, mutation counter, exact Bash policy, or reviewer requirement to routine local work. It protects the objective/controller files, frozen run inputs/evidence, duplicate one-shot submissions, and broadly destructive commands. `strict` remains an explicit opt-in. There is no database, dashboard, resident service, or per-command LLM review.
 
 ## Install as a Codex plugin
 
@@ -44,9 +44,13 @@ From an optimization repository:
 $goal-guardrails init
 ```
 
-The initializer creates missing files under `optimization/` and additively inserts one marked block into `AGENTS.md`. Existing files are never overwritten. `optimization/GATE.json` starts with `enabled: false`.
+The initializer creates missing files under `optimization/` and additively manages one marked block in `AGENTS.md`; unrelated guidance is preserved. Re-running it upgrades an old plugin-owned strict block to the fast/unattended policy without replacing project files. `optimization/GATE.json` starts with `enabled: false`.
 
-Version 0.5.0 keeps proposal/result schema v2 and adds an optional reviewed `ssh-helper-v1` transport to one-shot runtime binding policies. Existing local and `fixed_args` proposals remain compatible. New projects default to a 24-hour, 24-mutation lease; reviewed proposals may use up to seven days without widening their path or command scope. Re-run `init` only to add missing files; do not replace `CONTROL.json`. Existing projects may explicitly raise `default_lease_minutes` and `default_max_mutations` in `GATE.json` while the gate is disabled, or declare the values per proposal.
+Version 0.6.0 adds `GATE.json.profile`. New projects use `fast`; existing projects without the field also resolve to `fast`, so upgrading immediately removes legacy routine lease denials. Select strict mode only when wanted:
+
+```bash
+python3 <plugin-root>/hooks/goal_guard.py mode strict --approved-by user --project .
+```
 
 After the metric, evaluator, budgets, state, and stop rules are concrete, explicitly approve activation:
 
@@ -64,19 +68,17 @@ The short user command remains:
 $goal-guardrails run
 ```
 
-The workflow then:
+The default fast workflow is:
 
 1. Restores `GOAL.md`, `STATE.md`, and recent evidence.
-2. Writes one bounded schema-v2 `PROPOSAL.json`, including `existing_evidence`, future `lease_mutations`, `pre_run_gates`, checkpoint artifacts, and structured Bash policies.
-3. Obtains one fresh read-only subagent or user review of that future mutation contract. Admission does not require the mutations to exist yet.
-4. Admits the proposal to create a temporary lease.
-5. Allows only bounded mutation while the lease is live.
-6. Records required gate evidence before workload execution.
-7. Writes artifact paths and SHA-256 values to `RESULT.json`, then checkpoints the lease.
+2. Chooses one bounded experiment with a direct causal path and stop condition.
+3. Runs local edits, tests, builds, evaluation, diagnostics, and recovery directly without asking for approval.
+4. Records a semantic result and updates the concise frontier.
+5. Continues, switches, rolls back, or pauses according to evidence and budget.
 
-If a required pre-run gate genuinely fails, `gates` freezes the `FAIL` and its evidence. Workload and ordinary mutation stay denied. Run `abort`; the controller materializes and verifies the strict invalid checkpoint, clears the lease, and leaves the causal chain open for a newly reviewed attempt. Manual `RESULT.json` staging remains available when inspection or correction is necessary.
+Routine fast work does not use `PROPOSAL.json`, `admit`, reviewer attestation, exact command whitelists, or mutation accounting. A denial skips only a high-impact action; it explicitly tells Codex to continue another safe action without asking the user. Proposal admission remains available for strict mode and deterministic external one-shot submission; fast admission validates it automatically without external review.
 
-Manual controller commands are:
+Strict/external controller commands remain available but are not the normal fast loop:
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py status --project .
@@ -96,7 +98,7 @@ python3 <plugin-root>/hooks/goal_guard.py wait --event-key job-122020 --event-pa
 python3 <plugin-root>/hooks/goal_guard.py wake --event-key job-122020 --event-path artifacts/job-terminal.json --project .
 ```
 
-`wait` freezes the lease's remaining lifetime and enters `WAITING_EXTERNAL_EVENT`. Mutation and polling stop; ordinary non-polling inspection remains available. `wake` requires a changed regular event artifact, freezes its SHA-256 into the lease, and deduplicates it before restoring the same lease for postflight work. The terminal artifact cannot change again and checkpoint must reference that exact SHA.
+Use `wait` only when a real bridge can invoke `wake`. Mutation stops until the registered event; fast profile permits read-only bounded polling, while strict also blocks repeated polling. Without a bridge, keep the process attached or use controller-managed monitoring so an unattended Goal does not enter a state that cannot wake itself.
 
 ### External monitor integration
 
@@ -108,9 +110,9 @@ Run the frozen submission through the controller rather than executing it direct
 python3 <plugin-root>/hooks/goal_guard.py submit-bind --policy submit-slurm --project .
 ```
 
-With local Slurm, the controller runs the exact reviewed executable and argv without a shell. When `sbatch` exists only on a remote host, add the reviewed `ssh-helper-v1` transport described in [remote Slurm submission](skills/goal-guardrails/references/remote-slurm.md). The local controller remains the sole owner of the lease, lock, and `CONTROL.json`; SSH carries one JSON request to a fixed, digest-pinned helper. Run `doctor` once, then `submit-bind`. Never run raw `ssh ... sbatch`, move the controller to the compute host, or share controller state across hosts.
+With local Slurm, the controller runs the exact frozen executable and argv without a shell. When `sbatch` exists only on a remote host, add the frozen `ssh-helper-v1` transport described in [remote Slurm submission](skills/goal-guardrails/references/remote-slurm.md). Fast mode validates the contract deterministically; strict mode additionally requires review. The local controller remains the sole owner of the lease, lock, and `CONTROL.json`; SSH carries one JSON request to a fixed, digest-pinned helper. Run `doctor` once, then `submit-bind`. Never run raw `ssh ... sbatch`, move the controller to the compute host, or share controller state across hosts.
 
-The controller accepts one parsable Slurm Job ID, freezes it, and consumes the submission policy before the remote call. If SSH disconnects or the result is ambiguous, the binding becomes `UNCERTAIN`: run `reconcile-bind` with the same policy. Reconciliation reads the immutable nonce receipt and costs no mutation; it never submits again. Bound argv tokens can then be used only through reviewed policies. After starting `codex-hpc-monitor`, enter and leave waiting with:
+The controller accepts one parsable Slurm Job ID, freezes it, and consumes the submission policy before the remote call. If SSH disconnects or the result is ambiguous, the binding becomes `UNCERTAIN`: run `reconcile-bind` with the same policy. Reconciliation reads the immutable nonce receipt and costs no mutation; it never submits again. Bound argv tokens can then be used only through frozen policies. After starting `codex-hpc-monitor`, enter and leave waiting with:
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py wait-monitor --monitor scheduler --project .
@@ -120,6 +122,18 @@ python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --pro
 `wait-monitor` freezes the monitor run and manifest SHA. The event bridge continues to write only its private cache receipt and wake the thread; it never edits the project. `wake-monitor` resolves the canonical receipt path, verifies owner/mode/symlink safety, bridge manifest, Job ID, run ID, terminal SHA, `terminal_verified=true`, monitor manifest, and scheduler owner/name/partition. Only then does the controller create `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. That protected receipt remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
 
 ## What the hook blocks
+
+Fast profile blocks only:
+
+- changes to `GOAL.md`, `GATE.json`, `CONTROL.json`, or controller-owned state;
+- overwriting frozen preflight/terminal evidence or inputs of an active one-shot remote submission;
+- direct execution of a frozen one-shot binding-capture command instead of `submit-bind`;
+- broadly destructive commands such as hard reset, force clean/push, infrastructure destroy, or deleting a filesystem root;
+- mutation while `WAITING_EXTERNAL_EVENT` (read-only inspection and polling remain available).
+
+It does **not** block routine project edits, tests, builds, training/evaluation commands, diagnostics, recovery, MCP writes, result correction, or work because no lease exists.
+
+Strict profile additionally blocks:
 
 - mutation without a live review-attested lease;
 - edits outside admitted mutation path, scope, and operation contracts;
@@ -139,19 +153,19 @@ python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --pro
 - continued work when `STATE.md` exceeds its cap;
 - identical polling after repeated unchanged results.
 
-Read-only inspection, including `cat`, stays available without a mutation lease. `PROPOSAL.json` can be prepared and reviewed before a lease. `GOAL.md`, `GATE.json`, `CONTROL.json`, the admitted proposal, and controller receipt tree are protected during experiments. A denied tool call does not by itself complete or block the Goal: `status.next_action` identifies the legal continuation. After expiry, budget exhaustion, or a malformed checkpoint, `RESULT.json` may still be corrected and checkpointed without another review.
+In both profiles a denied tool call does not complete or block the Goal. In fast mode Codex must not turn it into a user authorization request: it records/defer the skipped action and continues the next safe path. User input is reserved for an unavoidable objective/metric change, budget or material-scope expansion, irreversible external action, or stop-line override.
 
 ## Boundaries
 
-This is a strong behavioral guardrail, not a security sandbox. The workflow requires a genuinely fresh subagent or user review, but the local controller can validate only the recorded attestation's shape; it cannot authenticate who produced it. `--approved-by user` likewise records an explicit-approval attestation and must be used only after the user actually approves. Cryptographically or administratively unforgeable approval requires a managed hook or external trusted service.
+This is a behavioral direction guardrail, not a security sandbox. Fast profile intentionally relies on the user's Codex YOLO/full-access authorization for ordinary in-scope execution. Its high-impact file checks cover direct `apply_patch`, recognizable Bash path references, and conventional visible MCP path/command fields; arbitrary scripts or opaque hosted tools can have side effects the hook cannot infer. Strict review fields are behavioral attestations; the controller validates their shape but cannot authenticate who produced them.
 
-Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, read-only MCP classification is conservative name-based policy, and users can disable non-managed hooks. MCP mutation currently fails closed; perform scoped project writes through `apply_patch` or an admitted Bash command. A hook denial must be treated as a decision boundary rather than an invitation to find another execution path.
+Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, and users can disable non-managed hooks. Fast mode deliberately avoids pretending it can authorize every local command: it focuses on direction, a small protected boundary, and unattended continuation.
 
 `WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. It makes repeated Goal activations terminate cheaply through injected context and denied polling, but it cannot pause or reconfigure Codex Goal scheduling itself. A project-artifact bridge updates the preregistered file and invokes `wake`; an external-monitor bridge publishes its private immutable receipt, after which the controller invokes `wake-monitor` and materializes the project receipt.
 
-Remote Slurm submission deliberately does not accept runtime argv after review. A transport policy freezes the local SSH executable and digest, host, user, port, dedicated known-hosts file and digest, dedicated identity path and digest, remote helper path and digest, remote `sbatch` path, work directory, receipt root, and submitted file digests. The controller ignores ambient SSH configuration, proxy commands, jump hosts, and agents. `status` reports the controller budget plan: each one-shot submission costs one mutation; doctor, reconciliation, waiting, waking, and receipt materialization cost zero. OpenSSH still invokes the remote command through the remote user's shell, so the helper path is restricted to a safe absolute token; a forced-command SSH key is recommended for a stronger administrative boundary.
+Remote Slurm submission deliberately does not accept runtime argv after admission. A transport policy freezes the local SSH executable and digest, host, user, port, dedicated known-hosts file and digest, dedicated identity path and digest, remote helper path and digest, remote `sbatch` path, work directory, receipt root, and submitted file digests. The controller ignores ambient SSH configuration, proxy commands, jump hosts, and agents. `status` reports the controller budget plan: each one-shot submission costs one mutation; doctor, reconciliation, waiting, waking, and receipt materialization cost zero. OpenSSH still invokes the remote command through the remote user's shell, so the helper path is restricted to a safe absolute token; a forced-command SSH key is recommended for a stronger administrative boundary.
 
-Version 0.5.0 does not yet ingest rejected reviewer packets, so proposal-revision time before admission is not part of the chain stop-line budget. A later schema revision should introduce one controller-owned `record-review` contract that binds every verdict to the proposal SHA, counts distinct rejected attempts and observable admission wall time by causal bottleneck, and fires a pause/switch stop line. Project-specific completeness checks belong in a bounded declarative lint profile rather than hard-coded domain fields. Read-only shell recognition remains intentionally conservative; a future improvement may allow a small audited pipeline grammar, not arbitrary “safe shell AST” inference.
+Strict mode retains the v0.5 lease state machine for high-assurance and external-monitor use. Fast mode is the recommended default when throughput and unattended execution matter more than command-level enforcement.
 
 ## Validation
 

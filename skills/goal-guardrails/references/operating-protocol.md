@@ -1,6 +1,6 @@
 # Operating protocol
 
-Use this protocol when running, resuming, or auditing a long-running metric-driven optimization.
+Use this detailed protocol for `strict` profile or when deterministic runtime binding/external-monitor evidence requires a lease. In default `fast` profile, routine local work skips proposal, external review, admission, exact command policies, and mutation accounting; restore the frontier, run one bounded experiment directly, evaluate it, and update semantic evidence. A denial skips one high-impact action and must not stop the Goal or trigger a user authorization request when other safe work remains.
 
 ## Restore the frontier
 
@@ -106,7 +106,7 @@ Use an external monitor contract instead of a project relay when the monitor own
 - a monitor-start policy whose ordered argv contains that binding;
 - provider and contract version, state root, host, expected scheduler owner, job name, and partition.
 
-The fresh reviewer must additionally attest `external_monitor_contract_bounded=true`, covering the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary.
+In strict profile, the fresh reviewer must additionally attest `external_monitor_contract_bounded=true`, covering the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary. Fast profile performs deterministic controller validation instead.
 
 The relevant proposal fields have this shape; keep the executable paths and literal arguments specific to the installed monitor:
 
@@ -147,7 +147,7 @@ The relevant proposal fields have this shape; keep the executable paths and lite
 }
 ```
 
-Invoke `submit-bind --policy <id>` once. For a local policy the controller executes the reviewed argv without a shell. For `ssh-helper-v1`, run `doctor --policy <id>` first; the local controller sends a versioned JSON request to the pinned helper. It parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt. A definitive failure requires a fresh reviewed proposal; an uncertain remote result uses `reconcile-bind --policy <id>` against the same nonce and must never be resubmitted. Only controller-frozen values may fill binding tokens.
+Invoke `submit-bind --policy <id>` once. For a local policy the controller executes the frozen argv without a shell. For `ssh-helper-v1`, run `doctor --policy <id>` first; the local controller sends a versioned JSON request to the pinned helper. It parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt. A definitive failure requires a fresh proposal (and fresh review only in strict profile); an uncertain remote result uses `reconcile-bind --policy <id>` against the same nonce and must never be resubmitted. Only controller-frozen values may fill binding tokens.
 
 After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge may publish only its private receipt and a semantic notification. It must not write the project or decide the business outcome.
 
@@ -166,9 +166,25 @@ Treat the mechanism as exhausted when its declared experiment, wall-clock, or co
 
 Never equate budget exhaustion, process completion, or lack of ideas with successful completion.
 
-## Short Goal template
+## Short Goal templates
 
-Adapt only the bracketed values:
+Default fast/unattended template; adapt only the bracketed values:
+
+```text
+/goal Follow optimization/GOAL.md to optimize [TARGET, SYSTEM, OR PROCESS].
+
+Run unattended in fast profile. Restore the concise frontier, choose one bounded
+high-contribution experiment, edit/test/evaluate directly, and record semantic
+evidence. Routine in-scope work needs no lease, reviewer, or user authorization.
+A denied call, failed test, expired optional lease, or recoverable controller error
+must not stop the Goal: defer that action and continue the next safe path.
+
+Ask the user only if progress truly requires changing the objective/metric, budget
+or material scope, an irreversible external action, or overriding a fired stop line.
+Complete only after the target and applicable validation conditions pass.
+```
+
+Strict opt-in template:
 
 ```text
 /goal Follow optimization/GOAL.md to optimize [TARGET, SYSTEM, OR PROCESS].
@@ -179,7 +195,7 @@ to the primary metric. Record valid results in optimization/EXPERIMENTS.md and
 defer non-core work to optimization/BACKLOG.md.
 
 Checkpoint after each valid experiment and at the budget interval in the
-contract. Treat hook denial or lease exhaustion as a decision boundary. Stop with
+contract. Treat hook denial or lease exhaustion as a controller transition. Stop with
 PAUSE_REQUIRED when evaluation is untrusted, scope or budget must change, or no
 candidate passes admission. Complete only after the target and all applicable
 guardrail and validation conditions pass.

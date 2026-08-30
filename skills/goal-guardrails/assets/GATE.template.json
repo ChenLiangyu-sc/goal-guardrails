@@ -2,6 +2,7 @@
   "schema_version": 1,
   "project_root": null,
   "enabled": false,
+  "profile": "fast",
   "state_max_nonblank_lines": 25,
   "max_consecutive_no_progress": 3,
   "max_unchanged_polls": 2,

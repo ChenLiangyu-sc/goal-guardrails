@@ -58,14 +58,24 @@ RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_-]+$")
 GPU_COMMAND_RE = re.compile(r"(?:^|[/_-])(nvidia-smi|torchrun|deepspeed)(?:$|\s)|\baccelerate\s+launch\b|CUDA_VISIBLE_DEVICES", re.I)
 POLL_RE = re.compile(r"\b(squeue|sacct|qstat|kubectl\s+get|docker\s+ps|systemctl\s+status|nvidia-smi|tail\b|ps\b)", re.I)
 READ_ONLY_PREFIXES = (
-    "pwd", "ls", "cat", "rg", "grep", "sed -n", "head", "tail", "wc", "stat", "sha256sum",
+    "pwd", "ls", "cat", "echo", "printf", "rg", "grep", "sed -n", "head", "tail", "wc", "stat", "sha256sum",
     "git status", "git diff", "git log", "git show", "git rev-parse", "git branch --show-current",
     "jq",
 )
 MUTATING_SHELL_RE = re.compile(
-    r"(?:^|[;&|]\s*)(?:rm|mv|cp|install|chmod|chown|mkdir|touch|tee|truncate|dd|git\s+(?:add|commit|push|reset|checkout|switch|merge|rebase|clean))\b|(?:^|\s)(?:>|>>)(?:\s|$)",
+    r"(?:^|[;&|]\s*)(?:rm|mv|cp|install|chmod|chown|mkdir|touch|tee|truncate|dd|sed\s+-i|git\s+(?:add|commit|push|reset|checkout|switch|merge|rebase|clean))\b|(?:^|\s)(?:>|>>)(?:\s|$)",
     re.I,
 )
+FAST_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|\s)(?:rm\s+(?:-[A-Za-z]*[rf][A-Za-z]*\s+)+(?:/|~|\$HOME|\.\.?)(?:\s|$)|"
+    r"git\s+reset\s+--hard\b|git\s+clean\s+-[A-Za-z]*[fdx][A-Za-z]*\b|"
+    r"git\s+push\b[^\n]*(?:--force(?:-with-lease)?\b|-f(?:\s|$))|"
+    r"terraform\s+destroy\b|kubectl\s+delete\b|docker\s+system\s+prune\b|"
+    r"(?:shutdown|reboot|poweroff|mkfs(?:\.[A-Za-z0-9]+)?)\b|"
+    r"DROP\s+(?:DATABASE|SCHEMA|TABLE)\b)",
+    re.I,
+)
+FAST_PROTECTED_PATHS = (GOAL_REL, GATE_REL, CONTROL_REL)
 
 
 class GuardError(RuntimeError):
@@ -165,7 +175,18 @@ def load_gate(project: Path) -> dict[str, Any]:
     declared_root = gate.get("project_root")
     if declared_root is not None and Path(str(declared_root)).resolve() != project.resolve():
         raise GuardError("GATE.json project_root does not match the guarded project")
+    profile = gate.get("profile", "fast")
+    if profile not in {"fast", "strict"}:
+        raise GuardError("GATE.json profile must be fast or strict")
+    gate["profile"] = profile
     return gate
+
+
+def gate_profile(gate: dict[str, Any]) -> str:
+    profile = gate.get("profile", "fast")
+    if profile not in {"fast", "strict"}:
+        raise GuardError("gate profile must be fast or strict")
+    return str(profile)
 
 
 def default_control() -> dict[str, Any]:
@@ -392,6 +413,32 @@ def validate_review_attestation(
         "reviewer": reviewer,
         "reason": ensure_text(review.get("reason"), "review.reason"),
         "checks": {name: True for name in sorted(required_checks)},
+    }
+
+
+def automatic_fast_review_attestation(
+    *,
+    require_external_monitor: bool = False,
+    require_preflight_failure: bool = False,
+    require_remote_submission: bool = False,
+) -> dict[str, Any]:
+    checks = {
+        "evidence_sufficient",
+        "lease_mutations_bounded",
+        "pre_run_gates_sufficient",
+        "mutation_not_required_before_admission",
+    }
+    if require_external_monitor:
+        checks.add("external_monitor_contract_bounded")
+    if require_preflight_failure:
+        checks.add("preflight_failure_closure_reviewed")
+    if require_remote_submission:
+        checks.add("remote_submission_contract_bounded")
+    return {
+        "decision": "ALLOW",
+        "reviewer": "controller:fast",
+        "reason": "fast profile uses deterministic proposal validation without an external admission review",
+        "checks": {name: True for name in sorted(checks)},
     }
 
 
@@ -837,7 +884,7 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         raise GuardError(f"proposal schema_version must be {PROPOSAL_SCHEMA_VERSION}")
     if isinstance(control.get("active_lease"), dict):
         raise GuardError("an experiment lease is still active or awaiting checkpoint")
-    if state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
+    if gate_profile(gate) == "strict" and state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
         raise GuardError("STATE.md exceeds its nonblank-line cap; compact it before admission")
     if not (project / GOAL_REL).is_file():
         raise GuardError("optimization/GOAL.md is missing")
@@ -863,12 +910,17 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
     runtime_bindings = validate_runtime_bindings(proposal.get("runtime_bindings"))
     bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates, runtime_bindings)
     external_monitors = validate_external_monitors(proposal.get("external_monitors"), runtime_bindings, bash_policies)
-    reviewer = validate_review_attestation(
-        proposal.get("review"),
-        require_external_monitor=bool(external_monitors),
-        require_preflight_failure=any(gate["required"] for gate in pre_run_gates),
-        require_remote_submission=any(policy.get("transport", {}).get("kind") == "ssh-helper-v1" for policy in bash_policies),
-    )
+    review_requirements = {
+        "require_external_monitor": bool(external_monitors),
+        "require_preflight_failure": any(item["required"] for item in pre_run_gates),
+        "require_remote_submission": any(
+            policy.get("transport", {}).get("kind") == "ssh-helper-v1" for policy in bash_policies
+        ),
+    }
+    if gate_profile(gate) == "fast":
+        reviewer = automatic_fast_review_attestation(**review_requirements)
+    else:
+        reviewer = validate_review_attestation(proposal.get("review"), **review_requirements)
     parent = proposal.get("parent_chain")
     if parent is not None:
         parent = ensure_id(parent, "parent_chain")
@@ -2231,7 +2283,7 @@ def command_toggle(args: argparse.Namespace, enabled: bool) -> int:
     with state_lock(project):
         gate = load_gate(project)
         if enabled:
-            if state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
+            if gate_profile(gate) == "strict" and state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
                 raise GuardError("STATE.md exceeds its cap")
             if not (project / GOAL_REL).is_file():
                 raise GuardError("GOAL.md is missing")
@@ -2246,6 +2298,21 @@ def command_toggle(args: argparse.Namespace, enabled: bool) -> int:
     return 0
 
 
+def command_mode(args: argparse.Namespace) -> int:
+    if args.approved_by != "user":
+        raise GuardError("profile changes require --approved-by user")
+    project = explicit_project(args.project)
+    if args.profile not in {"fast", "strict"}:
+        raise GuardError("profile must be fast or strict")
+    with state_lock(project):
+        gate = load_gate(project)
+        gate["profile"] = args.profile
+        gate["updated_at"] = iso_time(utc_now())
+        atomic_json(project / GATE_REL, gate)
+    print(args.profile)
+    return 0
+
+
 def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> dict[str, str]:
     if not gate.get("enabled"):
         return {"kind": "ACTIVATE", "instruction": "Obtain explicit user approval and activate the project gate."}
@@ -2253,6 +2320,14 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
     if runtime.get("state") == "WAITING_EXTERNAL_EVENT":
         wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
         command = "wake-monitor" if wait.get("kind") == "external_monitor" else "wake"
+        if gate_profile(gate) == "fast":
+            return {
+                "kind": "WAIT",
+                "instruction": (
+                    f"Continue unattended with read-only bounded polling or process the registered {command} event; "
+                    "do not ask the user or mark the Goal blocked/complete merely because the event is pending."
+                ),
+            }
         return {"kind": "WAIT", "instruction": f"End this activation without polling; resume only through the registered {command} event."}
     raw_lease = control.get("active_lease")
     lease = raw_lease if isinstance(raw_lease, dict) else None
@@ -2290,9 +2365,19 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
         return {"kind": "CONTINUE_LEASE", "instruction": "Continue the admitted experiment within its frozen paths and command policies."}
     last = control.get("last_checkpoint")
     if isinstance(last, dict) and last.get("preflight_failed"):
+        if gate_profile(gate) == "fast":
+            return {
+                "kind": "CONTINUE_FAST",
+                "instruction": "Correct the failed preflight path and continue; fast profile does not require an external re-review.",
+            }
         return {"kind": "FRESH_REVIEW", "instruction": "Prepare a corrected proposal on the same causal chain and obtain one fresh experiment review."}
     if isinstance(last, dict) and last.get("decision") == "PAUSE_REQUIRED":
         return {"kind": "AWAIT_DECISION", "instruction": "The last valid checkpoint explicitly requires a user decision; do not invent adjacent work."}
+    if gate_profile(gate) == "fast":
+        return {
+            "kind": "CONTINUE_FAST",
+            "instruction": "Continue autonomous in-scope work; routine local actions need no lease or external review.",
+        }
     return {"kind": "ADMIT_NEXT", "instruction": "Prepare and admit the next bounded experiment; review occurs once at the experiment boundary."}
 
 
@@ -2311,6 +2396,7 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         chains = {key: control["chains"][key] for key in dict.fromkeys(frontier_ids) if key in control["chains"]}
     return {
         "enabled": bool(gate.get("enabled")),
+        "profile": gate_profile(gate),
         "active_experiment": lease.get("experiment_id") if lease else None,
         "active_chain": lease.get("chain_id") if lease else None,
         "lease_expires_at": lease.get("expires_at") if lease else None,
@@ -2341,6 +2427,24 @@ def command_status(args: argparse.Namespace) -> int:
 def deny(reason: str) -> dict[str, Any]:
     prefix = "This tool call was denied, but a denial alone is not Goal completion or blocked status. "
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": prefix + reason + " Inspect controller status and take its next_action."}}
+
+
+def fast_deny(reason: str, recovery: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Goal Guardrails fast profile skipped one high-impact action: "
+                + reason
+                + " "
+                + recovery
+                + " Do not ask the user merely because this call was denied and do not stop the Goal; "
+                "continue with the next safe, in-scope action. Ask only if the objective truly cannot progress "
+                "without changing the protected boundary."
+            ),
+        }
+    }
 
 
 def hook_context(text: str) -> dict[str, Any]:
@@ -2381,6 +2485,161 @@ def patch_mutations(project: Path, cwd: Path, patch: str) -> list[tuple[Path, st
 
 def patch_paths(project: Path, cwd: Path, patch: str) -> list[Path]:
     return [path for path, _operation in patch_mutations(project, cwd, patch)]
+
+
+def is_fast_protected_path(path: Path) -> bool:
+    return (
+        path in FAST_PROTECTED_PATHS
+        or path == CONTROLLER_STATE_REL
+        or CONTROLLER_STATE_REL in path.parents
+    )
+
+
+def command_mutates_fast_protected_path(command: str) -> bool:
+    normalized = command.replace("\\", "/")
+    protected_names = (
+        "optimization/GOAL.md",
+        "optimization/GATE.json",
+        "optimization/CONTROL.json",
+        "optimization/.goal-guardrails",
+    )
+    mentions_protected = any(name in normalized for name in protected_names)
+    return mentions_protected and (MUTATING_SHELL_RE.search(command) is not None or not is_read_only_command(command))
+
+
+def fast_frozen_lease_paths(lease: dict[str, Any]) -> set[Path]:
+    paths = {PROPOSAL_REL}
+    paths.update(
+        Path(item["path"])
+        for item in lease.get("existing_evidence", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    )
+    paths.update(
+        Path(item["path"])
+        for item in (lease.get("pre_run_gate_results") or {}).get("artifacts", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    )
+    wake_event = lease.get("wake_event")
+    if isinstance(wake_event, dict) and isinstance(wake_event.get("path"), str):
+        paths.add(Path(wake_event["path"]))
+    for policy in lease.get("bash_policies", []):
+        transport = policy.get("transport") if isinstance(policy, dict) else None
+        if isinstance(transport, dict) and transport.get("kind") == "ssh-helper-v1":
+            paths.update(
+                Path(item["path"])
+                for item in transport.get("remote_files", [])
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            )
+    return paths
+
+
+def command_mutates_fast_frozen_path(command: str, paths: set[Path]) -> bool:
+    normalized = command.replace("\\", "/")
+    mentions_frozen = any(path.as_posix() in normalized for path in paths)
+    return mentions_frozen and not is_read_only_command(command)
+
+
+def visible_mcp_project_paths(project: Path, cwd: Path, payload: dict[str, Any]) -> set[Path]:
+    paths: set[Path] = set()
+    path_keys = {
+        "path", "paths", "file", "filename", "file_path", "filepath", "target", "target_file", "target_path",
+        "destination", "destination_file", "destination_path", "source_path",
+    }
+
+    def add(raw: str) -> None:
+        candidate = Path(raw)
+        absolute = Path(os.path.abspath(os.fspath(candidate if candidate.is_absolute() else cwd / candidate)))
+        try:
+            paths.add(absolute.relative_to(project))
+        except ValueError:
+            pass
+
+    def visit(value: Any, key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key).casefold())
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str) and key in path_keys:
+            add(value)
+
+    visit(payload)
+    return paths
+
+
+def visible_mcp_commands(payload: dict[str, Any]) -> list[str]:
+    commands: list[str] = []
+    command_keys = {"command", "cmd", "shell_command", "shell"}
+
+    def visit(value: Any, key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key).casefold())
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str) and key in command_keys:
+            commands.append(value)
+
+    visit(payload)
+    return commands
+
+
+def is_fast_bounded_poll(command: str) -> bool:
+    stripped = command.strip()
+    if not stripped or not POLL_RE.search(stripped):
+        return False
+    if re.search(r"[\n;&`<>]|\$\(|\|\||&&", stripped):
+        return False
+    allowed_first = {"squeue", "sacct", "qstat", "kubectl", "docker", "systemctl", "nvidia-smi", "tail", "ps"}
+    allowed_filters = {"head", "tail", "grep", "rg", "jq", "wc"}
+    stages = stripped.split("|")
+    try:
+        tokens = [shlex.split(stage) for stage in stages]
+    except ValueError:
+        return False
+    if not tokens or any(not stage for stage in tokens):
+        return False
+    first = Path(tokens[0][0]).name
+    if first not in allowed_first:
+        return False
+    if first == "kubectl" and (len(tokens[0]) < 2 or tokens[0][1] != "get"):
+        return False
+    if first == "docker" and (len(tokens[0]) < 2 or tokens[0][1] != "ps"):
+        return False
+    if first == "systemctl" and (len(tokens[0]) < 2 or tokens[0][1] != "status"):
+        return False
+    if first == "nvidia-smi":
+        mutating_options = {
+            "--gpu-reset", "-r", "--reset-ecc-errors", "-pm", "--persistence-mode", "-pl", "--power-limit",
+            "-ac", "--applications-clocks",
+        }
+        if any(
+            token == option or token.startswith(option + "=")
+            for token in tokens[0][1:]
+            for option in mutating_options
+        ):
+            return False
+    if any(Path(stage[0]).name == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in stage[1:]) for stage in tokens[1:]):
+        return False
+    return all(Path(stage[0]).name in allowed_filters for stage in tokens[1:])
+
+
+def resembles_capture_policy(command: str, policy: dict[str, Any]) -> bool:
+    if is_read_only_command(command):
+        return False
+    executable = str(policy.get("executable", ""))
+    if not executable:
+        return False
+    words = re.findall(r"[A-Za-z0-9_./:+-]+", command.replace("\\", "/"))
+    mentioned = any(word == executable or Path(word).name == Path(executable).name for word in words)
+    if not mentioned:
+        return False
+    literals = [token.get("literal") for token in policy.get("argv", []) if isinstance(token, dict) and isinstance(token.get("literal"), str)]
+    if Path(executable).name == "sbatch":
+        return "--parsable" in command
+    return not literals or any(literal in command for literal in literals)
 
 
 def path_allowed(path: Path, allowed: list[str]) -> bool:
@@ -2479,7 +2738,7 @@ def is_controller_command(command: str) -> bool:
         return False
     return script == CONTROLLER_PATH and tokens[2] in {
         "status", "admit", "gates", "doctor", "submit-bind", "reconcile-bind", "wait", "wake", "wait-monitor", "wake-monitor",
-        "checkpoint", "abort", "abort-preflight", "activate", "deactivate",
+        "checkpoint", "abort", "abort-preflight", "activate", "deactivate", "mode",
     }
 
 
@@ -2521,7 +2780,138 @@ def lease_error(project: Path, gate: dict[str, Any], control: dict[str, Any]) ->
     return lease, None
 
 
+def hook_pre_tool_fast(project: Path, event: dict[str, Any], control: dict[str, Any]) -> dict[str, Any] | None:
+    tool = event.get("tool_name")
+    tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    if tool == "apply_patch":
+        command = str(tool_input.get("patch", tool_input.get("input", tool_input.get("command", ""))))
+    else:
+        command = str(tool_input.get("command", ""))
+    cwd = Path(str(event.get("cwd", project)))
+    waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+
+    if tool == "Bash" and is_controller_command(command):
+        return None
+    if waiting:
+        if tool == "Bash":
+            if is_read_only_command(command) or is_fast_bounded_poll(command):
+                return None
+        if isinstance(tool, str) and tool.startswith("mcp__") and is_read_only_mcp(tool):
+            return None
+        return fast_deny(
+            "the runtime is WAITING_EXTERNAL_EVENT and this call could mutate state before the registered event",
+            "Inspect or poll read-only evidence, process the registered wake event, or end this activation until it arrives.",
+        )
+
+    if tool == "apply_patch":
+        try:
+            mutations = patch_mutations(project, cwd, command)
+        except GuardError as error:
+            return fast_deny(str(error), "Use a project-relative, non-symlink patch target.")
+        protected = sorted(path.as_posix() for path, _operation in mutations if is_fast_protected_path(path))
+        if protected:
+            return fast_deny(
+                f"the patch changes protected goal/controller files: {protected}",
+                "Leave the objective and controller boundary unchanged; put optional changes in BACKLOG.md.",
+            )
+        lease = control.get("active_lease")
+        if isinstance(lease, dict):
+            frozen_paths = fast_frozen_lease_paths(lease)
+            drifted = sorted(path.as_posix() for path, _operation in mutations if path in frozen_paths)
+            if drifted:
+                return fast_deny(
+                    f"the patch would overwrite frozen run evidence or submitted inputs: {drifted}",
+                    "Finish/reconcile the active run, then create new evidence for a later attempt.",
+                )
+        return None
+
+    if tool == "Bash":
+        if FAST_DESTRUCTIVE_RE.search(command):
+            return fast_deny(
+                "the command is broadly destructive or difficult to recover",
+                "Use a narrower recoverable command or defer it to BACKLOG.md.",
+            )
+        if command_mutates_fast_protected_path(command):
+            return fast_deny(
+                "the command mutates protected goal/controller files",
+                "Continue without changing the objective or controller state.",
+            )
+        lease = control.get("active_lease")
+        if isinstance(lease, dict):
+            if command_mutates_fast_frozen_path(command, fast_frozen_lease_paths(lease)):
+                return fast_deny(
+                    "the command would overwrite a frozen proposal, evidence file, or submitted input",
+                    "Finish/reconcile the active run, then create new evidence for a later attempt.",
+                )
+            capture_policy = next(
+                (
+                    policy for policy in lease.get("bash_policies", [])
+                    if isinstance(policy, dict) and policy.get("capture_binding") and resembles_capture_policy(command, policy)
+                ),
+                None,
+            )
+            if isinstance(capture_policy, dict):
+                return fast_deny(
+                    "a one-shot runtime-binding submission was invoked directly",
+                    "Run controller submit-bind so a timeout cannot cause a duplicate external job.",
+                )
+        return None
+
+    if isinstance(tool, str) and tool.startswith("mcp__") and not is_read_only_mcp(tool):
+        paths = visible_mcp_project_paths(project, cwd, tool_input)
+        commands = visible_mcp_commands(tool_input)
+        if any(FAST_DESTRUCTIVE_RE.search(candidate) for candidate in commands):
+            return fast_deny(
+                "the MCP call contains a broadly destructive command",
+                "Use a narrower recoverable command or defer it to BACKLOG.md.",
+            )
+        if any(command_mutates_fast_protected_path(candidate) for candidate in commands):
+            return fast_deny(
+                "the MCP call contains a command that could mutate protected goal/controller files",
+                "Leave the objective and controller boundary unchanged.",
+            )
+        protected = sorted(path.as_posix() for path in paths if is_fast_protected_path(path))
+        if protected:
+            return fast_deny(
+                f"the MCP call targets protected goal/controller files: {protected}",
+                "Leave the objective and controller boundary unchanged.",
+            )
+        lease = control.get("active_lease")
+        if isinstance(lease, dict):
+            if any(command_mutates_fast_frozen_path(candidate, fast_frozen_lease_paths(lease)) for candidate in commands):
+                return fast_deny(
+                    "the MCP call contains a command that could mutate frozen run evidence or submitted inputs",
+                    "Finish/reconcile the active run, then create new evidence for a later attempt.",
+                )
+            capture_policy = next(
+                (
+                    policy for policy in lease.get("bash_policies", [])
+                    if isinstance(policy, dict)
+                    and policy.get("capture_binding")
+                    and any(resembles_capture_policy(candidate, policy) for candidate in commands)
+                ),
+                None,
+            )
+            if isinstance(capture_policy, dict):
+                return fast_deny(
+                    "the MCP call could directly invoke a one-shot runtime-binding submission",
+                    "Run controller submit-bind so a timeout cannot cause a duplicate external job.",
+                )
+            drifted = sorted(path.as_posix() for path in paths if path in fast_frozen_lease_paths(lease))
+            if drifted:
+                return fast_deny(
+                    f"the MCP call targets frozen run evidence or submitted inputs: {drifted}",
+                    "Finish/reconcile the active run, then create new evidence for a later attempt.",
+                )
+
+    # YOLO/full-access mode already owns ordinary authorization. Fast profile adds no
+    # per-tool MCP admission or mutation accounting beyond visible protected paths.
+    return None
+
+
 def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], control: dict[str, Any]) -> dict[str, Any] | None:
+    if gate_profile(gate) == "fast":
+        return hook_pre_tool_fast(project, event, control)
     tool = event.get("tool_name")
     tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
     if tool == "apply_patch":
@@ -2645,6 +3035,8 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
 
 
 def hook_post_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], control: dict[str, Any]) -> dict[str, Any] | None:
+    if gate_profile(gate) == "fast":
+        return None
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
@@ -2682,14 +3074,29 @@ def command_hook() -> int:
             if name == "SessionStart":
                 status = compact_status(project, gate, control, session_frontier_only=True)
                 waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
-                suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived." if waiting else ""
-                output = hook_context(
-                    "Goal Guardrails enforcement is active. Current gate status: "
-                    + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
-                    + ". A single denied tool call is a recoverable control transition, not permission to mark the Goal complete or blocked; follow next_action. "
-                    + "Do not self-attest proposals; obtain one fresh subagent or user review at the experiment boundary. The controller validates attestation shape, not reviewer identity."
-                    + suffix
-                )
+                if gate_profile(gate) == "fast":
+                    suffix = (
+                        " Runtime is WAITING_EXTERNAL_EVENT: read-only inspection and polling are allowed, but mutation must wait for the registered wake event."
+                        if waiting else ""
+                    )
+                    output = hook_context(
+                        "Goal Guardrails fast profile is active for unattended execution. Current status: "
+                        + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+                        + ". This runtime profile supersedes older project-managed text that says every mutation needs a review-attested lease. "
+                        + " Continue routine in-scope local editing, tests, builds, evaluation, diagnostics, recovery, and semantic evidence recording without a lease, external review, or user approval. Controller checkpoint is only for an optional active lease. "
+                        + "A tool denial skips only that high-impact action: do not stop the Goal or ask the user merely because of it; record it in BACKLOG.md and continue the next safe action. "
+                        + "Request user input only when progress truly requires changing the objective/metric, budget or material scope, executing an irreversible external action, or overriding a fired stop line."
+                        + suffix
+                    )
+                else:
+                    suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived." if waiting else ""
+                    output = hook_context(
+                        "Goal Guardrails enforcement is active in strict profile. Current gate status: "
+                        + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+                        + ". A single denied tool call is a recoverable control transition, not permission to mark the Goal complete or blocked; follow next_action. "
+                        + "Do not self-attest proposals; obtain one fresh subagent or user review at the experiment boundary. The controller validates attestation shape, not reviewer identity."
+                        + suffix
+                    )
             elif name == "PreToolUse":
                 output = hook_pre_tool(project, event, gate, control)
             elif name == "PostToolUse":
@@ -2700,7 +3107,15 @@ def command_hook() -> int:
     except Exception as error:
         event_name = locals().get("event", {}).get("hook_event_name") if isinstance(locals().get("event"), dict) else None
         if event_name == "PreToolUse":
-            print(json.dumps(deny(f"Goal Guardrails failed closed: {error}"), ensure_ascii=False))
+            loaded_gate = locals().get("gate")
+            if isinstance(loaded_gate, dict) and loaded_gate.get("profile", "fast") == "fast":
+                payload = fast_deny(
+                    f"the guard configuration could not be evaluated safely: {error}",
+                    "Skip this call, record the configuration defect, and continue other safe work.",
+                )
+            else:
+                payload = deny(f"Goal Guardrails failed closed: {error}")
+            print(json.dumps(payload, ensure_ascii=False))
         elif event_name == "SessionStart":
             print(json.dumps(hook_context(f"Goal Guardrails configuration error: {error}"), ensure_ascii=False))
         return 0
@@ -2752,6 +3167,10 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--project")
         item.add_argument("--approved-by", required=True)
         item.add_argument("--reason", default="explicit user-approved gate change")
+    mode = sub.add_parser("mode")
+    mode.add_argument("profile", choices=("fast", "strict"))
+    mode.add_argument("--project")
+    mode.add_argument("--approved-by", required=True)
     return parser
 
 
@@ -2788,6 +3207,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_toggle(args, True)
         if args.command == "deactivate":
             return command_toggle(args, False)
+        if args.command == "mode":
+            return command_mode(args)
         raise GuardError("unknown command")
     except (GuardError, OSError, UnicodeError, ValueError, KeyError) as error:
         print(f"error: {error}", file=sys.stderr)

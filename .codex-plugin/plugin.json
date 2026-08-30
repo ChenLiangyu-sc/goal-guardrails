@@ -1,7 +1,7 @@
 {
   "name": "goal-guardrails",
-  "version": "0.5.0",
-  "description": "Keep long-running optimization aligned through bounded experiment leases and Codex lifecycle hooks.",
+  "version": "0.6.0",
+  "description": "Keep unattended long-running optimization aligned with fast-by-default Codex lifecycle guardrails.",
   "author": {
     "name": "Chen Liangyu",
     "url": "https://github.com/ChenLiangyu-sc"
@@ -13,15 +13,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Goal Guardrails",
-    "shortDescription": "Bound long optimization loops with experiment leases",
-    "longDescription": "Frozen evidence, mutation, gate, local or SSH-helper runtime binding, external-monitor, artifact, and async-wait contracts for focused metric-driven optimization.",
+    "shortDescription": "Run aligned optimization unattended",
+    "longDescription": "Fast-by-default direction guardrails for autonomous optimization, with optional strict leases for high-assurance runs.",
     "developerName": "Chen Liangyu",
     "category": "Productivity",
     "capabilities": ["Read", "Write", "Lifecycle hooks"],
     "websiteURL": "https://github.com/ChenLiangyu-sc/goal-guardrails",
     "defaultPrompt": [
       "Initialize guarded optimization in this project.",
-      "Admit and run the next bounded experiment.",
+      "Run the next bounded experiment unattended.",
       "Audit this optimization for drift or stagnation."
     ],
     "brandColor": "#2563EB"

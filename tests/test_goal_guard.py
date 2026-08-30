@@ -39,6 +39,7 @@ class GoalGuardTests(unittest.TestCase):
         self.write_json("GATE.json", {
             "schema_version": 1,
             "enabled": True,
+            "profile": "strict",
             "state_max_nonblank_lines": 25,
             "max_consecutive_no_progress": 3,
             "max_unchanged_polls": 2,
@@ -1105,6 +1106,155 @@ class GoalGuardTests(unittest.TestCase):
             self.admit(self.proposal(experiment="E002", chain="C-next", bottleneck="different bottleneck"))
         result_patch = "*** Begin Patch\n*** Update File: optimization/RESULT.json\n@@\n-{}\n+{}\n*** End Patch"
         self.assertIsNone(self.pre("apply_patch", result_patch))
+
+    def test_fast_profile_defaults_for_legacy_gate_and_allows_routine_yolo_work(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate.pop("profile", None)
+        self.write_json("GATE.json", gate)
+        self.assertEqual("fast", goal_guard.load_gate(self.project)["profile"])
+
+        routine_patch = "*** Begin Patch\n*** Add File: src/fast.py\n+value = 1\n*** End Patch"
+        self.assertIsNone(self.pre("apply_patch", routine_patch))
+        self.assertIsNone(self.pre("Bash", "python3 train.py --resume latest && pytest -q"))
+        self.assertIsNone(self.pre("Bash", "rm -rf build"))
+        self.assertIsNone(self.pre("Bash", "git add src/fast.py && git commit -m fast && git push origin main"))
+        self.assertIsNone(self.pre("Bash", "ssh hpc142 nvidia-smi"))
+        self.assertIsNone(self.pre("Bash", "sudo apt-get install -y jq"))
+        self.assertIsNone(self.pre_input("mcp__filesystem__write_file", {"path": "src/fast.py", "content": "x"}))
+
+        status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
+        self.assertEqual("fast", status["profile"])
+        self.assertEqual("CONTINUE_FAST", status["next_action"]["kind"])
+
+    def test_fast_profile_blocks_only_high_impact_boundary_and_says_continue(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+
+        protected_patch = "*** Begin Patch\n*** Update File: optimization/GOAL.md\n@@\n-Primary metric\n+Different metric\n*** End Patch"
+        protected = self.pre("apply_patch", protected_patch)
+        self.assertEqual("deny", protected["hookSpecificOutput"]["permissionDecision"])
+        reason = protected["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("Do not ask the user merely", reason)
+        self.assertIn("do not stop the Goal", reason)
+
+        destructive = self.pre("Bash", "git reset --hard HEAD")
+        self.assertEqual("deny", destructive["hookSpecificOutput"]["permissionDecision"])
+        protected_mcp = self.pre_input(
+            "mcp__filesystem__write_file",
+            {"path": "optimization/GOAL.md", "content": "different objective"},
+        )
+        self.assertEqual("deny", protected_mcp["hookSpecificOutput"]["permissionDecision"])
+        protected_mcp_command = self.pre_input(
+            "mcp__remote__execute_command",
+            {"command": "python3 -c \"open('optimization/GATE.json','w').write('{}')\""},
+        )
+        self.assertEqual("deny", protected_mcp_command["hookSpecificOutput"]["permissionDecision"])
+        protected_python = self.pre("Bash", "python3 -c \"open('optimization/GOAL.md','w').write('x')\"")
+        self.assertEqual("deny", protected_python["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("Bash", "echo optimization/GOAL.md"))
+        self.assertIsNone(self.pre("Bash", "printf '%s\\n' optimization/GATE.json"))
+        self.assertIsNone(self.pre("Bash", "git status --short; python3 run_eval.py"))
+
+    def test_fast_admission_needs_no_external_review_and_does_not_scope_routine_work(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+        proposal = self.proposal()
+        proposal.pop("review")
+        self.admit(proposal)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("controller:fast", control["active_lease"]["review"]["reviewer"])
+
+        outside_patch = "*** Begin Patch\n*** Add File: docs/notes.md\n+routine notes\n*** End Patch"
+        self.assertIsNone(self.pre("apply_patch", outside_patch))
+        self.assertIsNone(self.pre("Bash", "python3 unrelated_but_in_scope.py --small"))
+        evidence_patch = "*** Begin Patch\n*** Update File: reports/baseline.json\n@@\n-{\"accepted\": 0}\n+{\"accepted\": 99}\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", evidence_patch)["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(
+            "deny",
+            self.pre("Bash", "sed -i s/0/99/ reports/baseline.json")["hookSpecificOutput"]["permissionDecision"],
+        )
+        self.assertEqual(
+            "deny",
+            self.pre("Bash", "python3 -c \"open('reports/baseline.json','w').write('{}')\"")["hookSpecificOutput"]
+            ["permissionDecision"],
+        )
+        self.assertEqual(
+            "deny",
+            self.pre_input("mcp__filesystem__write_file", {"path": "reports/baseline.json", "content": "{}"})[
+                "hookSpecificOutput"
+            ]["permissionDecision"],
+        )
+        self.assertEqual(0, goal_guard.load_control(self.project)["active_lease"]["mutations_used"])
+
+    def test_fast_one_shot_capture_cannot_be_wrapped_or_redirected(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+        proposal = self.external_monitor_proposal()
+        proposal.pop("review")
+        self.admit(proposal)
+
+        exact = self.pre("Bash", "./sbatch --parsable train.sbatch")
+        redirected = self.pre("Bash", "./sbatch --parsable train.sbatch >/tmp/job-id")
+        compounded = self.pre("Bash", "./sbatch --parsable train.sbatch && echo submitted")
+        self.assertEqual("deny", exact["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", redirected["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", compounded["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("Bash", "echo './sbatch --parsable train.sbatch'"))
+
+    def test_fast_remote_submission_input_is_frozen_against_arbitrary_script_write(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+        proposal = self.remote_submission_proposal()
+        proposal.pop("review")
+        self.admit(proposal)
+
+        overwrite = self.pre("Bash", "python3 -c \"open('train.sbatch','w').write('changed')\"")
+        self.assertEqual("deny", overwrite["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("Bash", "cat train.sbatch"))
+
+    def test_fast_waiting_allows_polling_but_not_mutation_and_session_says_unattended(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+        control = goal_guard.load_control(self.project)
+        control["runtime"] = {"state": "WAITING_EXTERNAL_EVENT", "wait": {"kind": "artifact"}, "seen_events": []}
+        self.write_json("CONTROL.json", control)
+
+        self.assertIsNone(self.pre("Bash", "tail -f artifacts/job.log"))
+        self.assertIsNone(self.pre("Bash", "squeue -j 12345 | tail -n 1"))
+        compound_poll = self.pre("Bash", "squeue -j 12345; python3 mutate.py")
+        self.assertEqual("deny", compound_poll["hookSpecificOutput"]["permissionDecision"])
+        redirected_poll = self.pre("Bash", "squeue -j 12345 >/tmp/status")
+        self.assertEqual("deny", redirected_poll["hookSpecificOutput"]["permissionDecision"])
+        gpu_mutation = self.pre("Bash", "nvidia-smi --gpu-reset")
+        self.assertEqual("deny", gpu_mutation["hookSpecificOutput"]["permissionDecision"])
+        gpu_assignment = self.pre("Bash", "nvidia-smi --power-limit=250")
+        self.assertEqual("deny", gpu_assignment["hookSpecificOutput"]["permissionDecision"])
+        preprocessor_poll = self.pre("Bash", "squeue -j 12345 | rg --pre dangerous")
+        self.assertEqual("deny", preprocessor_poll["hookSpecificOutput"]["permissionDecision"])
+        status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
+        self.assertEqual("WAIT", status["next_action"]["kind"])
+        self.assertIn("do not ask the user", status["next_action"]["instruction"])
+        self.assertNotIn("End this activation", status["next_action"]["instruction"])
+        mutation = self.pre("apply_patch", "*** Begin Patch\n*** Add File: src/while-waiting.py\n+x = 1\n*** End Patch")
+        self.assertEqual("deny", mutation["hookSpecificOutput"]["permissionDecision"])
+        session = self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "resume"})
+        context = session["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("unattended execution", context)
+        self.assertIn("without a lease, external review, or user approval", context)
+        self.assertIn("Controller checkpoint is only for an optional active lease", context)
+        self.assertIn("do not stop the Goal", context)
+
+    def test_mode_command_changes_profile_only_with_user_attestation(self) -> None:
+        with self.assertRaisesRegex(goal_guard.GuardError, "require --approved-by user"):
+            goal_guard.command_mode(argparse.Namespace(project=str(self.project), profile="fast", approved_by="agent"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_mode(argparse.Namespace(project=str(self.project), profile="fast", approved_by="user"))
+        self.assertEqual("fast", goal_guard.load_gate(self.project)["profile"])
 
     def test_result_remains_correctable_after_mutation_cap(self) -> None:
         proposal = self.proposal()
