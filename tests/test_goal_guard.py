@@ -176,7 +176,8 @@ class GoalGuardTests(unittest.TestCase):
             "created_at": goal_guard.iso_time(goal_guard.utc_now()),
         }
         manifest_path = run / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        if not manifest_path.exists():
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
         current = root / "supervisors/fakehost-12345/current.json"
         current.write_text(json.dumps({
             "schema_version": "codex-hpc-monitor.current/v1", "host": "fakehost",
