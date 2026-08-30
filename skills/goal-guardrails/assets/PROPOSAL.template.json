@@ -22,7 +22,7 @@
   ],
   "runtime_bindings": [],
   "bash_policies": [
-    {"id": "prepare", "phase": "preparation", "executable": "TODO", "argv": [{"literal": "TODO"}], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}}
+    {"id": "prepare", "phase": "preparation", "executable": "TODO", "argv": [{"literal": "TODO"}], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}, "transport": null}
   ],
   "external_monitors": [],
   "expires_minutes": 1440,

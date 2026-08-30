@@ -1,6 +1,6 @@
 {
   "name": "goal-guardrails",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Keep long-running optimization aligned through bounded experiment leases and Codex lifecycle hooks.",
   "author": {
     "name": "Chen Liangyu",
@@ -14,7 +14,7 @@
   "interface": {
     "displayName": "Goal Guardrails",
     "shortDescription": "Bound long optimization loops with experiment leases",
-    "longDescription": "Frozen evidence, mutation, gate, runtime-binding, external-monitor, artifact, and async-wait contracts for focused metric-driven optimization.",
+    "longDescription": "Frozen evidence, mutation, gate, local or SSH-helper runtime binding, external-monitor, artifact, and async-wait contracts for focused metric-driven optimization.",
     "developerName": "Chen Liangyu",
     "category": "Productivity",
     "capabilities": ["Read", "Write", "Lifecycle hooks"],

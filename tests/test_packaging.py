@@ -15,6 +15,9 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual("./skills/", manifest["skills"])
         self.assertTrue((ROOT / "skills/goal-guardrails/SKILL.md").is_file())
         self.assertTrue((ROOT / "hooks/hooks.json").is_file())
+        helper = ROOT / "hooks/remote_submit_helper.py"
+        self.assertTrue(helper.is_file())
+        self.assertTrue(helper.stat().st_mode & 0o100)
 
     def test_hook_handlers_use_plugin_root_and_supported_events(self) -> None:
         payload = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))

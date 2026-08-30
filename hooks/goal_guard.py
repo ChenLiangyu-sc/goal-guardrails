@@ -25,6 +25,10 @@ PROPOSAL_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 2
 MAX_LEASE_MINUTES = 7 * 24 * 60
 CONTROLLER_PATH = Path(__file__).resolve()
+REMOTE_HELPER_PATH = CONTROLLER_PATH.with_name("remote_submit_helper.py")
+REMOTE_REQUEST_SCHEMA = "goal-guardrails.remote-submit.request/v1"
+REMOTE_RECEIPT_SCHEMA = "goal-guardrails.remote-submit.receipt/v1"
+REMOTE_DOCTOR_SCHEMA = "goal-guardrails.remote-submit.doctor/v1"
 GATE_REL = Path("optimization/GATE.json")
 CONTROL_REL = Path("optimization/CONTROL.json")
 GOAL_REL = Path("optimization/GOAL.md")
@@ -48,6 +52,8 @@ PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SLURM_JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+REMOTE_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+REMOTE_SHELL_PATH_RE = re.compile(r"^/[A-Za-z0-9_./:+-]+$")
 RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_-]+$")
 GPU_COMMAND_RE = re.compile(r"(?:^|[/_-])(nvidia-smi|torchrun|deepspeed)(?:$|\s)|\baccelerate\s+launch\b|CUDA_VISIBLE_DEVICES", re.I)
 POLL_RE = re.compile(r"\b(squeue|sacct|qstat|kubectl\s+get|docker\s+ps|systemctl\s+status|nvidia-smi|tail\b|ps\b)", re.I)
@@ -364,6 +370,7 @@ def validate_review_attestation(
     *,
     require_external_monitor: bool = False,
     require_preflight_failure: bool = False,
+    require_remote_submission: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(review, dict) or review.get("decision") != "ALLOW":
         raise GuardError("proposal requires an ALLOW review attestation")
@@ -376,6 +383,8 @@ def validate_review_attestation(
         required_checks.add("external_monitor_contract_bounded")
     if require_preflight_failure:
         required_checks.add("preflight_failure_closure_reviewed")
+    if require_remote_submission:
+        required_checks.add("remote_submission_contract_bounded")
     if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required_checks):
         raise GuardError(f"review attestation must affirm checks: {sorted(required_checks)}")
     return {
@@ -560,6 +569,98 @@ def validate_argv_template(raw: Any, fixed_args: Any, binding_ids: set[str], ind
     return tokens
 
 
+def validate_submission_transport(project: Path, raw: Any, *, capture_binding: str | None, index: int) -> dict[str, Any]:
+    if raw is None:
+        return {"kind": "local"}
+    if capture_binding is None:
+        raise GuardError("submission transport is allowed only on a binding-capture policy")
+    if not isinstance(raw, dict) or raw.get("kind") != "ssh-helper-v1":
+        raise GuardError("submission transport currently supports only ssh-helper-v1")
+    ssh_executable = Path(ensure_text(raw.get("ssh_executable"), f"bash_policies[{index}].transport.ssh_executable", maximum=300))
+    if not ssh_executable.is_absolute() or ssh_executable.name != "ssh" or ssh_executable.is_symlink() or not ssh_executable.is_file() or not os.access(ssh_executable, os.X_OK):
+        raise GuardError("ssh transport requires an absolute regular executable named ssh")
+    ssh_executable_sha256 = ensure_sha256(
+        raw.get("ssh_executable_sha256"),
+        f"bash_policies[{index}].transport.ssh_executable_sha256",
+    )
+    if file_hash(ssh_executable) != ssh_executable_sha256:
+        raise GuardError("ssh transport executable SHA-256 mismatched")
+    host = ensure_safe_token(raw.get("host"), f"bash_policies[{index}].transport.host", maximum=128)
+    user = ensure_safe_token(raw.get("user"), f"bash_policies[{index}].transport.user", maximum=64)
+    if HOST_RE.fullmatch(host) is None or REMOTE_USER_RE.fullmatch(user) is None:
+        raise GuardError("ssh transport host or user has an invalid format")
+    port = int(raw.get("port", 22))
+    if not 1 <= port <= 65535:
+        raise GuardError("ssh transport port must be 1..65535")
+    known_hosts_file = Path(ensure_text(raw.get("known_hosts_file"), f"bash_policies[{index}].transport.known_hosts_file", maximum=500))
+    if not known_hosts_file.is_absolute() or known_hosts_file.is_symlink() or not known_hosts_file.is_file():
+        raise GuardError("ssh transport known_hosts_file must be an absolute regular file")
+    known_hosts_sha256 = ensure_sha256(raw.get("known_hosts_sha256"), f"bash_policies[{index}].transport.known_hosts_sha256")
+    if file_hash(known_hosts_file) != known_hosts_sha256:
+        raise GuardError("ssh transport known_hosts_file SHA-256 mismatched")
+    identity_path = Path(ensure_text(raw.get("identity_file"), f"bash_policies[{index}].transport.identity_file", maximum=500))
+    if not identity_path.is_absolute() or identity_path.is_symlink() or not identity_path.is_file():
+        raise GuardError("ssh transport identity_file must be an absolute regular file")
+    identity_file_sha256 = ensure_sha256(
+        raw.get("identity_file_sha256"),
+        f"bash_policies[{index}].transport.identity_file_sha256",
+    )
+    if file_hash(identity_path) != identity_file_sha256:
+        raise GuardError("ssh transport identity_file SHA-256 mismatched")
+    identity_file = os.fspath(identity_path)
+    helper_path = ensure_text(raw.get("helper_path"), f"bash_policies[{index}].transport.helper_path", maximum=500)
+    sbatch_path = ensure_text(raw.get("sbatch_path"), f"bash_policies[{index}].transport.sbatch_path", maximum=500)
+    remote_workdir = ensure_text(raw.get("remote_workdir"), f"bash_policies[{index}].transport.remote_workdir", maximum=500)
+    receipt_root = ensure_text(raw.get("receipt_root"), f"bash_policies[{index}].transport.receipt_root", maximum=500)
+    for field, value in (("helper_path", helper_path), ("sbatch_path", sbatch_path), ("remote_workdir", remote_workdir), ("receipt_root", receipt_root)):
+        if REMOTE_SHELL_PATH_RE.fullmatch(value) is None:
+            raise GuardError(f"ssh transport {field} must be a safe absolute path")
+    if Path(sbatch_path).name != "sbatch":
+        raise GuardError("ssh transport sbatch_path basename must be sbatch")
+    helper_sha256 = ensure_sha256(raw.get("helper_sha256"), f"bash_policies[{index}].transport.helper_sha256")
+    if not REMOTE_HELPER_PATH.is_file() or file_hash(REMOTE_HELPER_PATH) != helper_sha256:
+        raise GuardError("ssh transport helper_sha256 must match the bundled remote helper")
+    raw_files = raw.get("remote_files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise GuardError("ssh transport remote_files must be a non-empty list")
+    remote_files: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for file_index, item in enumerate(raw_files):
+        if not isinstance(item, dict):
+            raise GuardError(f"transport.remote_files[{file_index}] must be an object")
+        path = normalize_project_path(project, item.get("path"))
+        if path in seen:
+            raise GuardError(f"duplicate ssh transport remote file: {path}")
+        seen.add(path)
+        digest = ensure_sha256(item.get("sha256"), f"transport.remote_files[{file_index}].sha256")
+        local = project / path
+        if local.is_symlink() or not local.is_file() or file_hash(local) != digest:
+            raise GuardError(f"ssh transport local/remote file contract is missing or drifted: {path}")
+        remote_files.append({"path": path, "sha256": digest})
+    timeout_seconds = int(raw.get("timeout_seconds", 30))
+    if not 1 <= timeout_seconds <= 300:
+        raise GuardError("ssh transport timeout_seconds must be 1..300")
+    return {
+        "kind": "ssh-helper-v1",
+        "ssh_executable": os.fspath(ssh_executable),
+        "ssh_executable_sha256": ssh_executable_sha256,
+        "host": host,
+        "user": user,
+        "port": port,
+        "known_hosts_file": os.fspath(known_hosts_file),
+        "known_hosts_sha256": known_hosts_sha256,
+        "identity_file": identity_file,
+        "identity_file_sha256": identity_file_sha256,
+        "helper_path": helper_path,
+        "helper_sha256": helper_sha256,
+        "sbatch_path": sbatch_path,
+        "remote_workdir": remote_workdir,
+        "receipt_root": receipt_root,
+        "remote_files": sorted(remote_files, key=lambda item: item["path"]),
+        "timeout_seconds": timeout_seconds,
+    }
+
+
 def validate_bash_policies(
     project: Path,
     raw: Any,
@@ -623,6 +724,9 @@ def validate_bash_policies(
                 raise GuardError("Bash policy max_uses must be 1..100")
         if capture_binding is not None and max_uses != 1:
             raise GuardError("a binding-capture policy must declare max_uses=1")
+        transport = validate_submission_transport(project, item.get("transport"), capture_binding=capture_binding, index=index)
+        if transport["kind"] == "ssh-helper-v1" and executable != transport["sbatch_path"]:
+            raise GuardError("remote submission policy executable must equal transport.sbatch_path")
         timeout_seconds = int(item.get("timeout_seconds", 120))
         if not 1 <= timeout_seconds <= 1800:
             raise GuardError("Bash policy timeout_seconds must be 1..1800")
@@ -635,6 +739,7 @@ def validate_bash_policies(
             "output_paths": outputs,
             "resources": {"gpu": gpu},
             "capture_binding": capture_binding,
+            "transport": transport,
             "max_uses": max_uses,
             "timeout_seconds": timeout_seconds,
         })
@@ -762,6 +867,7 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         proposal.get("review"),
         require_external_monitor=bool(external_monitors),
         require_preflight_failure=any(gate["required"] for gate in pre_run_gates),
+        require_remote_submission=any(policy.get("transport", {}).get("kind") == "ssh-helper-v1" for policy in bash_policies),
     )
     parent = proposal.get("parent_chain")
     if parent is not None:
@@ -813,6 +919,12 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
     mutations = int(proposal.get("max_mutations", gate["default_max_mutations"]))
     if not 1 <= minutes <= MAX_LEASE_MINUTES or not 1 <= mutations <= 50:
         raise GuardError(f"lease minutes must be 1..{MAX_LEASE_MINUTES} and mutations must be 1..50")
+    required_binding_ids = {binding["id"] for binding in runtime_bindings if binding.get("required")}
+    minimum_controller_mutations = sum(1 for policy in bash_policies if policy.get("capture_binding") in required_binding_ids)
+    if mutations < minimum_controller_mutations:
+        raise GuardError(
+            f"mutation budget cannot cover required one-shot submissions: required={minimum_controller_mutations}, max_mutations={mutations}"
+        )
     work_class = proposal.get("work_class")
     if work_class not in {"core", "non_core"}:
         raise GuardError("work_class must be core or non_core")
@@ -845,6 +957,7 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "runtime_bindings": runtime_bindings,
         "binding_values": {},
         "policy_runs": {},
+        "transport_doctors": {},
         "external_monitors": external_monitors,
         "monitor_receipts": {},
         "allowed_tool_names": [],
@@ -852,6 +965,13 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "expires_at": iso_time(now + timedelta(minutes=minutes)),
         "max_mutations": mutations,
         "mutations_used": 0,
+        "budget_plan": {
+            "required_one_shot_submissions": minimum_controller_mutations,
+            "submit_bind_cost_each": 1,
+            "doctor_cost": 0,
+            "reconcile_cost": 0,
+            "wait_wake_receipt_cost": 0,
+        },
         "finalization_used": False,
         "work_class": work_class,
         "cost_units": cost_units,
@@ -1024,6 +1144,213 @@ def enforce_policy_phase(lease: dict[str, Any], policy: dict[str, Any]) -> None:
         raise GuardError("preparation phase is closed after pre-run gates are recorded")
 
 
+def transport_contract_sha256(policy: dict[str, Any]) -> str:
+    return canonical_hash({
+        "policy_id": policy.get("id"),
+        "executable": policy.get("executable"),
+        "argv": policy.get("argv"),
+        "cwd": policy.get("cwd"),
+        "capture_binding": policy.get("capture_binding"),
+        "transport": policy.get("transport"),
+    })
+
+
+def ssh_helper_argv(transport: dict[str, Any]) -> list[str]:
+    argv = [
+        transport["ssh_executable"], "-F", "none", "-T",
+        "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "ForwardAgent=no",
+        "-o", "ForwardX11=no",
+        "-o", "PermitLocalCommand=no",
+        "-o", "RequestTTY=no",
+        "-o", "ProxyCommand=none",
+        "-o", "ProxyJump=none",
+        "-o", "CanonicalizeHostname=no",
+        "-o", "IdentityAgent=none",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "UpdateHostKeys=no",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", f"UserKnownHostsFile={transport['known_hosts_file']}",
+        "-p", str(transport["port"]),
+        "-i", transport["identity_file"],
+    ]
+    argv.extend(["--", f"{transport['user']}@{transport['host']}", transport["helper_path"]])
+    return argv
+
+
+def remote_helper_request(
+    policy: dict[str, Any],
+    *,
+    operation: str,
+    submission_nonce: str | None = None,
+    sbatch_sha256: str | None = None,
+) -> dict[str, Any]:
+    transport = policy["transport"]
+    request: dict[str, Any] = {
+        "schema_version": REMOTE_REQUEST_SCHEMA,
+        "operation": operation,
+        "contract_sha256": transport_contract_sha256(policy),
+        "helper_sha256": transport["helper_sha256"],
+        "sbatch_path": transport["sbatch_path"],
+        "remote_workdir": transport["remote_workdir"],
+        "receipt_root": transport["receipt_root"],
+        "remote_files": transport["remote_files"],
+    }
+    if operation != "doctor":
+        request["submission_nonce"] = submission_nonce
+        request["sbatch_sha256"] = sbatch_sha256
+    if operation == "submit":
+        request["argv"] = [token["literal"] for token in policy["argv"]]
+        request["timeout_seconds"] = policy["timeout_seconds"]
+    return request
+
+
+def run_remote_helper(policy: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    transport = policy["transport"]
+    ssh_executable = Path(transport["ssh_executable"])
+    if (
+        ssh_executable.is_symlink()
+        or not ssh_executable.is_file()
+        or not os.access(ssh_executable, os.X_OK)
+        or file_hash(ssh_executable) != transport["ssh_executable_sha256"]
+    ):
+        raise GuardError("ssh transport executable changed after admission")
+    known_hosts = Path(transport["known_hosts_file"])
+    if known_hosts.is_symlink() or not known_hosts.is_file() or file_hash(known_hosts) != transport["known_hosts_sha256"]:
+        raise GuardError("ssh transport known_hosts_file changed after admission")
+    if transport.get("identity_file"):
+        identity_file = Path(transport["identity_file"])
+        if (
+            identity_file.is_symlink()
+            or not identity_file.is_file()
+            or file_hash(identity_file) != transport.get("identity_file_sha256")
+        ):
+            raise GuardError("ssh transport identity_file changed after admission")
+    timeout = int(transport["timeout_seconds"])
+    if request["operation"] == "submit":
+        timeout += int(policy["timeout_seconds"])
+    try:
+        completed = subprocess.run(
+            ssh_helper_argv(transport),
+            input=json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError(f"ssh helper transport failed before a verified receipt: {type(error).__name__}") from error
+    metadata = {
+        "ssh_exit_code": completed.returncode,
+        "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+        "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
+    }
+    if completed.returncode != 0:
+        raise GuardError("ssh helper returned a nonzero status without a verified receipt")
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise GuardError("ssh helper must emit exactly one JSON response line")
+    try:
+        response = json.loads(lines[0])
+    except json.JSONDecodeError as error:
+        raise GuardError("ssh helper emitted malformed JSON") from error
+    if not isinstance(response, dict) or response.get("contract_sha256") != request["contract_sha256"]:
+        raise GuardError("ssh helper response drifted from the frozen transport contract")
+    if request["operation"] == "doctor":
+        if response.get("schema_version") != REMOTE_DOCTOR_SCHEMA or response.get("ready") is not True:
+            raise GuardError("ssh helper doctor did not report ready")
+        if response.get("helper_sha256") != transport["helper_sha256"]:
+            raise GuardError("ssh helper version digest mismatched")
+        if canonical_hash(response.get("remote_files")) != canonical_hash(transport["remote_files"]):
+            raise GuardError("ssh helper remote file evidence drifted")
+        ensure_sha256(response.get("sbatch_sha256"), "remote doctor sbatch_sha256")
+    else:
+        if response.get("schema_version") != REMOTE_RECEIPT_SCHEMA or response.get("submission_nonce") != request["submission_nonce"]:
+            raise GuardError("ssh helper receipt identity mismatched")
+        if response.get("helper_sha256") != transport["helper_sha256"] or response.get("sbatch_sha256") != request.get("sbatch_sha256"):
+            raise GuardError("ssh helper receipt binary identity mismatched")
+        if response.get("state") not in {"SUCCEEDED", "FAILED", "UNCERTAIN", "RUNNING", "ABSENT"}:
+            raise GuardError("ssh helper receipt state is invalid")
+        if response.get("state") == "SUCCEEDED" and SLURM_JOB_ID_RE.fullmatch(str(response.get("job_id", ""))) is None:
+            raise GuardError("ssh helper success lacks a parsable Slurm Job ID")
+    return response, metadata
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    policy_id = ensure_id(args.policy, "policy")
+    reservation = uuid.uuid4().hex
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control.get("runtime", {}).get("state") != "ACTIVE":
+            raise GuardError("cannot run transport doctor while waiting for an external event")
+        lease = current_lease(control)
+        if lease is None:
+            raise GuardError("a live experiment lease is required")
+        verify_frozen_lease(project, lease)
+        policy = next((item for item in lease.get("bash_policies", []) if item.get("id") == policy_id), None)
+        if not isinstance(policy, dict) or policy.get("transport", {}).get("kind") != "ssh-helper-v1":
+            raise GuardError("doctor requires a reviewed ssh-helper-v1 submission policy")
+        if lease.get("preflight_failed"):
+            raise GuardError("required preflight gate failed; transport doctor is no longer actionable")
+        existing = lease.setdefault("transport_doctors", {}).get(policy_id)
+        if isinstance(existing, dict) and existing.get("state") == "RUNNING":
+            raise GuardError("ssh transport doctor is already running")
+        lease["transport_doctors"][policy_id] = {
+            "state": "RUNNING", "reservation": reservation,
+            "contract_sha256": transport_contract_sha256(policy), "started_at": iso_time(utc_now()),
+        }
+        lease_id = lease["lease_id"]
+        control["active_lease"] = lease
+        save_control(project, control)
+    try:
+        request = remote_helper_request(policy, operation="doctor")
+        response, metadata = run_remote_helper(policy, request)
+    except Exception:
+        with state_lock(project):
+            control = load_control(project)
+            lease = control.get("active_lease")
+            if isinstance(lease, dict) and lease.get("lease_id") == lease_id:
+                current = lease.setdefault("transport_doctors", {}).get(policy_id)
+                if isinstance(current, dict) and current.get("reservation") == reservation:
+                    lease["transport_doctors"][policy_id] = {
+                        "state": "FAILED", "contract_sha256": transport_contract_sha256(policy),
+                        "finished_at": iso_time(utc_now()),
+                    }
+                    control["active_lease"] = lease
+                    save_control(project, control)
+        raise
+    with state_lock(project):
+        control = load_control(project)
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
+            raise GuardError("active lease changed while ssh transport doctor was running")
+        current = lease.setdefault("transport_doctors", {}).get(policy_id)
+        if not isinstance(current, dict) or current.get("reservation") != reservation:
+            raise GuardError("ssh transport doctor reservation changed unexpectedly")
+        record = {
+            "state": "READY",
+            "contract_sha256": request["contract_sha256"],
+            "checked_at": iso_time(utc_now()),
+            "helper_sha256": response["helper_sha256"],
+            "sbatch_sha256": response["sbatch_sha256"],
+            "remote_files": response["remote_files"],
+            **metadata,
+        }
+        lease["transport_doctors"][policy_id] = record
+        control["active_lease"] = lease
+        save_control(project, control)
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_submit_bind(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     policy_id = ensure_id(args.policy, "policy")
@@ -1053,9 +1380,21 @@ def command_submit_bind(args: argparse.Namespace) -> int:
             raise GuardError("experiment mutation allowance is exhausted")
         argv = render_policy_argv(policy, lease)
         cwd = project if policy["cwd"] == "." else project / policy["cwd"]
+        transport_kind = policy.get("transport", {}).get("kind", "local")
+        doctor_record = None
+        if transport_kind == "ssh-helper-v1":
+            doctor_record = lease.get("transport_doctors", {}).get(policy_id)
+            if (
+                not isinstance(doctor_record, dict)
+                or doctor_record.get("state") != "READY"
+                or doctor_record.get("contract_sha256") != transport_contract_sha256(policy)
+            ):
+                raise GuardError("ssh submission requires a successful doctor for the frozen transport contract")
         lease.setdefault("policy_runs", {})[policy_id] = {
             "state": "RUNNING",
             "reservation": reservation,
+            "submission_nonce": reservation,
+            "transport": transport_kind,
             "started_at": iso_time(utc_now()),
             "argv_sha256": canonical_hash(argv),
         }
@@ -1069,30 +1408,77 @@ def command_submit_bind(args: argparse.Namespace) -> int:
         control["poll"] = None
         save_control(project, control)
 
-    try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=int(policy["timeout_seconds"]),
-        )
-        lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-        raw_value = lines[0] if len(lines) == 1 else ""
-        job_id = raw_value.split(";", 1)[0]
-        success = completed.returncode == 0 and SLURM_JOB_ID_RE.fullmatch(job_id) is not None
-        failure = None if success else "submission must exit 0 and emit exactly one parsable Slurm Job ID line"
-        exit_code = completed.returncode
-        stdout_sha256 = hashlib.sha256(completed.stdout.encode()).hexdigest()
-        stderr_sha256 = hashlib.sha256(completed.stderr.encode()).hexdigest()
-    except subprocess.TimeoutExpired as error:
-        success = False
-        failure = "submission timed out; outcome is uncertain and the one-shot policy remains consumed"
-        exit_code = None
-        stdout_sha256 = hashlib.sha256((error.stdout or "").encode() if isinstance(error.stdout, str) else (error.stdout or b"")).hexdigest()
-        stderr_sha256 = hashlib.sha256((error.stderr or "").encode() if isinstance(error.stderr, str) else (error.stderr or b"")).hexdigest()
-        job_id = ""
+    receipt_state = "FAILED"
+    if transport_kind == "ssh-helper-v1":
+        try:
+            request = remote_helper_request(
+                policy,
+                operation="submit",
+                submission_nonce=reservation,
+                sbatch_sha256=str(doctor_record["sbatch_sha256"]),
+            )
+            response, metadata = run_remote_helper(policy, request)
+            receipt_state = str(response["state"])
+            success = receipt_state == "SUCCEEDED"
+            job_id = str(response.get("job_id") or "")
+            failure = None if success else (
+                "remote submission failed definitively" if receipt_state == "FAILED"
+                else "remote submission outcome is uncertain; reconcile the frozen nonce and never resubmit"
+            )
+            exit_code = response.get("exit_code")
+            stdout_sha256 = str(response.get("stdout_sha256") or metadata["stdout_sha256"])
+            stderr_sha256 = str(response.get("stderr_sha256") or metadata["stderr_sha256"])
+        except Exception:
+            success = False
+            receipt_state = "UNCERTAIN"
+            failure = "remote submission transport failed without a verified receipt; reconcile the frozen nonce and never resubmit"
+            exit_code = None
+            stdout_sha256 = hashlib.sha256(b"").hexdigest()
+            stderr_sha256 = hashlib.sha256(b"").hexdigest()
+            job_id = ""
+    else:
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=int(policy["timeout_seconds"]),
+            )
+            lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+            raw_value = lines[0] if len(lines) == 1 else ""
+            job_id = raw_value.split(";", 1)[0]
+            success = completed.returncode == 0 and SLURM_JOB_ID_RE.fullmatch(job_id) is not None
+            receipt_state = "SUCCEEDED" if success else "FAILED"
+            failure = None if success else "submission must exit 0 and emit exactly one parsable Slurm Job ID line"
+            exit_code = completed.returncode
+            stdout_sha256 = hashlib.sha256(completed.stdout.encode()).hexdigest()
+            stderr_sha256 = hashlib.sha256(completed.stderr.encode()).hexdigest()
+        except subprocess.TimeoutExpired as error:
+            success = False
+            receipt_state = "UNCERTAIN"
+            failure = "submission timed out; outcome is uncertain and the one-shot policy remains consumed"
+            exit_code = None
+            stdout_sha256 = hashlib.sha256((error.stdout or "").encode() if isinstance(error.stdout, str) else (error.stdout or b"")).hexdigest()
+            stderr_sha256 = hashlib.sha256((error.stderr or "").encode() if isinstance(error.stderr, str) else (error.stderr or b"")).hexdigest()
+            job_id = ""
+        except OSError:
+            success = False
+            receipt_state = "FAILED"
+            failure = "local submission executable could not be started; the one-shot policy remains consumed"
+            exit_code = None
+            stdout_sha256 = hashlib.sha256(b"").hexdigest()
+            stderr_sha256 = hashlib.sha256(b"").hexdigest()
+            job_id = ""
+        except Exception:
+            success = False
+            receipt_state = "UNCERTAIN"
+            failure = "local submission raised an unexpected error; outcome is uncertain and the one-shot policy remains consumed"
+            exit_code = None
+            stdout_sha256 = hashlib.sha256(b"").hexdigest()
+            stderr_sha256 = hashlib.sha256(b"").hexdigest()
+            job_id = ""
 
     with state_lock(project):
         control = load_control(project)
@@ -1105,7 +1491,7 @@ def command_submit_bind(args: argparse.Namespace) -> int:
             raise GuardError("submission reservation changed unexpectedly")
         finished_at = iso_time(utc_now())
         run.update({
-            "state": "SUCCEEDED" if success else "FAILED",
+            "state": "SUCCEEDED" if success else receipt_state,
             "finished_at": finished_at,
             "exit_code": exit_code,
             "stdout_sha256": stdout_sha256,
@@ -1124,12 +1510,118 @@ def command_submit_bind(args: argparse.Namespace) -> int:
             })
         else:
             binding.clear()
-            binding.update({"state": "FAILED", "source_policy_id": policy_id, "failed_at": finished_at})
+            binding.update({
+                "state": "FAILED" if receipt_state == "FAILED" else "UNCERTAIN",
+                "source_policy_id": policy_id,
+                "submission_nonce": reservation,
+                "failed_at": finished_at,
+            })
         control["active_lease"] = lease
         save_control(project, control)
     if not success:
         raise GuardError(failure or "submission binding failed")
     print(json.dumps(lease["binding_values"][binding_id], ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_reconcile_bind(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    policy_id = ensure_id(args.policy, "policy")
+    reservation = uuid.uuid4().hex
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control.get("runtime", {}).get("state") != "ACTIVE":
+            raise GuardError("cannot reconcile while waiting for an external event")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict):
+            raise GuardError("an active experiment lease is required")
+        verify_frozen_lease(project, lease)
+        policy = next((item for item in lease.get("bash_policies", []) if item.get("id") == policy_id), None)
+        if not isinstance(policy, dict) or policy.get("transport", {}).get("kind") != "ssh-helper-v1":
+            raise GuardError("reconcile-bind requires an ssh-helper-v1 submission policy")
+        binding_id = policy.get("capture_binding")
+        binding = lease.get("binding_values", {}).get(binding_id)
+        run = lease.get("policy_runs", {}).get(policy_id)
+        if not isinstance(binding, dict) or binding.get("state") != "UNCERTAIN" or not isinstance(run, dict):
+            raise GuardError("reconcile-bind is available only for an uncertain consumed submission")
+        if isinstance(run.get("reconcile"), dict) and run["reconcile"].get("state") == "RUNNING":
+            raise GuardError("submission reconciliation is already running")
+        nonce = binding.get("submission_nonce") or run.get("submission_nonce")
+        if not isinstance(nonce, str) or re.fullmatch(r"[a-f0-9]{32}", nonce) is None:
+            raise GuardError("uncertain submission lost its frozen nonce")
+        doctor_record = lease.get("transport_doctors", {}).get(policy_id)
+        if not isinstance(doctor_record, dict) or doctor_record.get("state") != "READY":
+            raise GuardError("uncertain submission lost its frozen doctor result")
+        run["reconcile"] = {"state": "RUNNING", "reservation": reservation, "started_at": iso_time(utc_now())}
+        lease_id = lease["lease_id"]
+        control["active_lease"] = lease
+        save_control(project, control)
+    try:
+        request = remote_helper_request(
+            policy,
+            operation="reconcile",
+            submission_nonce=nonce,
+            sbatch_sha256=str(doctor_record["sbatch_sha256"]),
+        )
+        response, metadata = run_remote_helper(policy, request)
+    except Exception as error:
+        with state_lock(project):
+            control = load_control(project)
+            lease = control.get("active_lease")
+            if isinstance(lease, dict) and lease.get("lease_id") == lease_id:
+                run = lease.get("policy_runs", {}).get(policy_id)
+                reconcile = run.get("reconcile") if isinstance(run, dict) else None
+                if isinstance(reconcile, dict) and reconcile.get("reservation") == reservation:
+                    run["reconcile"] = {"state": "UNCERTAIN", "finished_at": iso_time(utc_now())}
+                    control["active_lease"] = lease
+                    save_control(project, control)
+        raise GuardError("reconciliation transport failed; submission remains uncertain and must not be retried") from error
+    with state_lock(project):
+        control = load_control(project)
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
+            raise GuardError("active lease changed while submission reconciliation was running")
+        run = lease.get("policy_runs", {}).get(policy_id)
+        binding = lease.get("binding_values", {}).get(binding_id)
+        reconcile = run.get("reconcile") if isinstance(run, dict) else None
+        if (
+            not isinstance(run, dict)
+            or not isinstance(binding, dict)
+            or not isinstance(reconcile, dict)
+            or reconcile.get("reservation") != reservation
+            or binding.get("state") != "UNCERTAIN"
+        ):
+            raise GuardError("submission reconciliation reservation changed unexpectedly")
+        state = response["state"]
+        finished_at = iso_time(utc_now())
+        run["reconcile"] = {"state": state, "finished_at": finished_at, **metadata}
+        if state == "SUCCEEDED":
+            binding.clear()
+            binding.update({
+                "state": "BOUND",
+                "kind": "slurm_job_id",
+                "value": str(response["job_id"]),
+                "source_policy_id": policy_id,
+                "bound_at": finished_at,
+                "reconciled": True,
+            })
+            run["state"] = "SUCCEEDED"
+        elif state == "FAILED":
+            binding["state"] = "FAILED"
+            binding["reconciled_at"] = finished_at
+            run["state"] = "FAILED"
+        else:
+            binding["state"] = "UNCERTAIN"
+            binding["reconciled_at"] = finished_at
+            run["state"] = "UNCERTAIN"
+        control["active_lease"] = lease
+        save_control(project, control)
+    if state != "SUCCEEDED":
+        raise GuardError(f"submission remains {state}; never rerun submit-bind for this lease")
+    print(json.dumps(binding, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1767,10 +2259,31 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
     if lease is not None:
         if lease.get("preflight_failed"):
             return {"kind": "ABORT_PREFLIGHT", "instruction": "Run goal_guard.py abort --project .; it will freeze the invalid checkpoint and release the lease."}
+        uncertain = next(
+            (
+                policy_id for policy_id, binding in lease.get("binding_values", {}).items()
+                if isinstance(binding, dict) and binding.get("state") == "UNCERTAIN"
+            ),
+            None,
+        )
+        if uncertain is not None:
+            source_policy = lease["binding_values"][uncertain].get("source_policy_id")
+            return {"kind": "RECONCILE_BIND", "instruction": f"Run goal_guard.py reconcile-bind --policy {source_policy} --project .; never resubmit the consumed policy."}
         if current_lease(control) is None:
             return {"kind": "CHECKPOINT", "instruction": "The lease expired; stage or correct RESULT.json and checkpoint instead of abandoning the Goal."}
         if int(lease.get("mutations_used", 0)) >= int(lease.get("max_mutations", 0)):
             return {"kind": "CHECKPOINT", "instruction": "The mutation allowance is exhausted; stage or correct RESULT.json and checkpoint."}
+        remote_policy = next(
+            (
+                policy for policy in lease.get("bash_policies", [])
+                if policy.get("transport", {}).get("kind") == "ssh-helper-v1"
+                and policy.get("id") not in lease.get("policy_runs", {})
+                and lease.get("transport_doctors", {}).get(policy.get("id"), {}).get("state") != "READY"
+            ),
+            None,
+        )
+        if isinstance(remote_policy, dict):
+            return {"kind": "DOCTOR", "instruction": f"Run goal_guard.py doctor --policy {remote_policy['id']} --project . before the one-shot remote submission."}
         required_gates = [item for item in lease.get("pre_run_gates", []) if item.get("required")]
         if required_gates and lease.get("pre_run_gate_results") is None:
             return {"kind": "RECORD_GATES", "instruction": "Complete preparation and record PRE_RUN_RESULTS.json before workload execution."}
@@ -1803,7 +2316,14 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "lease_expires_at": lease.get("expires_at") if lease else None,
         "lease_valid": lease_valid if lease else None,
         "mutations": f"{lease.get('mutations_used')}/{lease.get('max_mutations')}" if lease else None,
+        "mutation_budget": {
+            "used": int(lease.get("mutations_used", 0)),
+            "maximum": int(lease.get("max_mutations", 0)),
+            "remaining": max(0, int(lease.get("max_mutations", 0)) - int(lease.get("mutations_used", 0))),
+            "plan": lease.get("budget_plan", {}),
+        } if lease else None,
         "runtime_bindings": lease.get("binding_values", {}) if lease else {},
+        "transport_doctors": lease.get("transport_doctors", {}) if lease else {},
         "external_monitor_receipts": lease.get("monitor_receipts", {}) if lease else {},
         "runtime": {"state": control.get("runtime", {}).get("state", "ACTIVE"), "wait": control.get("runtime", {}).get("wait")},
         "next_action": recommended_next_action(gate, control),
@@ -1882,6 +2402,35 @@ def verify_frozen_lease(project: Path, lease: dict[str, Any]) -> None:
         target = project / str(evidence["path"])
         if target.is_symlink() or not target.is_file() or file_hash(target) != evidence.get("sha256"):
             raise GuardError(f"frozen existing evidence changed after admission: {evidence.get('path')}")
+    for policy in lease.get("bash_policies", []):
+        transport = policy.get("transport") if isinstance(policy, dict) else None
+        if not isinstance(transport, dict) or transport.get("kind") != "ssh-helper-v1":
+            continue
+        ssh_executable = Path(str(transport.get("ssh_executable")))
+        if (
+            ssh_executable.is_symlink()
+            or not ssh_executable.is_file()
+            or not os.access(ssh_executable, os.X_OK)
+            or file_hash(ssh_executable) != transport.get("ssh_executable_sha256")
+        ):
+            raise GuardError("ssh transport executable changed after admission")
+        known_hosts = Path(str(transport.get("known_hosts_file")))
+        if known_hosts.is_symlink() or not known_hosts.is_file() or file_hash(known_hosts) != transport.get("known_hosts_sha256"):
+            raise GuardError("ssh transport known_hosts_file changed after admission")
+        if transport.get("identity_file"):
+            identity_file = Path(str(transport["identity_file"]))
+            if (
+                identity_file.is_symlink()
+                or not identity_file.is_file()
+                or file_hash(identity_file) != transport.get("identity_file_sha256")
+            ):
+                raise GuardError("ssh transport identity_file changed after admission")
+        if file_hash(REMOTE_HELPER_PATH) != transport.get("helper_sha256"):
+            raise GuardError("bundled remote helper changed after admission")
+        for remote_file in transport.get("remote_files", []):
+            target = project / str(remote_file["path"])
+            if target.is_symlink() or not target.is_file() or file_hash(target) != remote_file.get("sha256"):
+                raise GuardError(f"ssh transport local file changed after admission: {remote_file.get('path')}")
     recorded = lease.get("pre_run_gate_results")
     if isinstance(recorded, dict):
         for artifact in recorded.get("artifacts", []):
@@ -1929,7 +2478,7 @@ def is_controller_command(command: str) -> bool:
     except OSError:
         return False
     return script == CONTROLLER_PATH and tokens[2] in {
-        "status", "admit", "gates", "submit-bind", "wait", "wake", "wait-monitor", "wake-monitor",
+        "status", "admit", "gates", "doctor", "submit-bind", "reconcile-bind", "wait", "wake", "wait-monitor", "wake-monitor",
         "checkpoint", "abort", "abort-preflight", "activate", "deactivate",
     }
 
@@ -2175,9 +2724,15 @@ def build_parser() -> argparse.ArgumentParser:
     gates = sub.add_parser("gates")
     gates.add_argument("results")
     gates.add_argument("--project")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--policy", required=True)
+    doctor.add_argument("--project")
     submit_bind = sub.add_parser("submit-bind")
     submit_bind.add_argument("--policy", required=True)
     submit_bind.add_argument("--project")
+    reconcile_bind = sub.add_parser("reconcile-bind")
+    reconcile_bind.add_argument("--policy", required=True)
+    reconcile_bind.add_argument("--project")
     wait = sub.add_parser("wait")
     wait.add_argument("--event-key", required=True)
     wait.add_argument("--event-path", required=True)
@@ -2211,8 +2766,12 @@ def main(argv: list[str] | None = None) -> int:
             return command_admit(args)
         if args.command == "gates":
             return command_gates(args)
+        if args.command == "doctor":
+            return command_doctor(args)
         if args.command == "submit-bind":
             return command_submit_bind(args)
+        if args.command == "reconcile-bind":
+            return command_reconcile_bind(args)
         if args.command == "wait":
             return command_wait(args)
         if args.command == "wake":

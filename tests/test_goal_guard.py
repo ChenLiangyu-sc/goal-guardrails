@@ -158,6 +158,43 @@ class GoalGuardTests(unittest.TestCase):
         proposal["review"]["checks"]["external_monitor_contract_bounded"] = True
         return proposal
 
+    def remote_submission_proposal(self) -> dict:
+        proposal = self.proposal()
+        train_script = self.project / "train.sbatch"
+        train_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_ssh = self.project / "ssh"
+        fake_ssh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_ssh.chmod(0o700)
+        known_hosts = self.project / "known_hosts"
+        known_hosts.write_text("hpc142 ssh-ed25519 AAAATEST\n", encoding="utf-8")
+        identity_file = self.project / "id_remote"
+        identity_file.write_text("TEST-PRIVATE-KEY\n", encoding="utf-8")
+        identity_file.chmod(0o600)
+        proposal["runtime_bindings"] = [{
+            "id": "slurm-job", "kind": "slurm_job_id", "source_policy_id": "submit-slurm", "required": True,
+        }]
+        proposal["bash_policies"] = [{
+            "id": "submit-slurm", "phase": "workload", "executable": "/usr/bin/sbatch",
+            "argv": [{"literal": "--parsable"}, {"literal": "train.sbatch"}],
+            "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+            "capture_binding": "slurm-job", "max_uses": 1, "timeout_seconds": 10,
+            "transport": {
+                "kind": "ssh-helper-v1", "ssh_executable": str(fake_ssh),
+                "ssh_executable_sha256": goal_guard.file_hash(fake_ssh),
+                "host": "hpc142", "user": "alice", "port": 22,
+                "known_hosts_file": str(known_hosts), "known_hosts_sha256": goal_guard.file_hash(known_hosts),
+                "identity_file": str(identity_file), "identity_file_sha256": goal_guard.file_hash(identity_file),
+                "helper_path": "/opt/goal-guardrails/remote_submit_helper.py",
+                "helper_sha256": goal_guard.file_hash(ROOT / "hooks/remote_submit_helper.py"),
+                "sbatch_path": "/usr/bin/sbatch", "remote_workdir": "/shared/project",
+                "receipt_root": "/home/alice/.cache/goal-guardrails/submissions",
+                "remote_files": [{"path": "train.sbatch", "sha256": goal_guard.file_hash(train_script)}],
+                "timeout_seconds": 10,
+            },
+        }]
+        proposal["review"]["checks"]["remote_submission_contract_bounded"] = True
+        return proposal
+
     def write_external_monitor_terminal(self, *, terminal_verified: bool = True, owner: str = "alice") -> tuple[Path, Path]:
         root = self.monitor_state
         run_id = "run_test"
@@ -755,6 +792,239 @@ class GoalGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(goal_guard.GuardError, "required external monitor results"):
             self.checkpoint(result)
 
+    def test_remote_submission_requires_reviewed_transport_and_doctor(self) -> None:
+        proposal = self.remote_submission_proposal()
+        proposal["review"]["checks"].pop("remote_submission_contract_bounded")
+        with self.assertRaisesRegex(goal_guard.GuardError, "remote_submission_contract_bounded"):
+            self.admit(proposal)
+
+        proposal = self.remote_submission_proposal()
+        self.admit(proposal)
+        control = goal_guard.load_control(self.project)
+        policy = control["active_lease"]["bash_policies"][0]
+        ssh_argv = goal_guard.ssh_helper_argv(policy["transport"])
+        self.assertEqual([policy["transport"]["ssh_executable"], "-F", "none", "-T"], ssh_argv[:4])
+        for option in (
+            "ProxyCommand=none", "ProxyJump=none", "GlobalKnownHostsFile=/dev/null",
+            "IdentityAgent=none", "IdentitiesOnly=yes", "CanonicalizeHostname=no",
+            "ClearAllForwardings=yes", "UpdateHostKeys=no",
+        ):
+            self.assertIn(option, ssh_argv)
+        self.assertEqual(policy["transport"]["helper_path"], ssh_argv[-1])
+        self.assertEqual("DOCTOR", goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)["next_action"]["kind"])
+        direct_ssh = f"{self.project / 'ssh'} alice@hpc142 /opt/goal-guardrails/remote_submit_helper.py"
+        self.assertEqual("deny", self.pre("Bash", direct_ssh)["hookSpecificOutput"]["permissionDecision"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "successful doctor"):
+            self.submit_binding()
+
+        def doctor_response(policy: dict, request: dict) -> tuple[dict, dict]:
+            return ({
+                "schema_version": goal_guard.REMOTE_DOCTOR_SCHEMA,
+                "ready": True,
+                "contract_sha256": request["contract_sha256"],
+                "helper_sha256": policy["transport"]["helper_sha256"],
+                "sbatch_sha256": "2" * 64,
+                "remote_files": policy["transport"]["remote_files"],
+            }, {"ssh_exit_code": 0, "stdout_sha256": "3" * 64, "stderr_sha256": "4" * 64})
+
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=doctor_response), contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_doctor(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("READY", control["active_lease"]["transport_doctors"]["submit-slurm"]["state"])
+        self.assertEqual(1, control["active_lease"]["budget_plan"]["required_one_shot_submissions"])
+        self.assertEqual(0, control["active_lease"]["mutations_used"])
+        control["runtime"] = {"state": "WAITING_EXTERNAL_EVENT", "wait": {"kind": "artifact"}}
+        self.write_json("CONTROL.json", control)
+        with self.assertRaisesRegex(goal_guard.GuardError, "while waiting"):
+            goal_guard.command_doctor(args)
+
+    def test_remote_doctor_runs_before_required_gates_without_consuming_budget(self) -> None:
+        proposal = self.remote_submission_proposal()
+        proposal["checkpoint_artifacts"].append({
+            "id": "preflight-proof", "path": "artifacts/preflight.json", "required": True,
+        })
+        proposal["pre_run_gates"] = [{
+            "id": "preflight", "kind": "manual", "description": "runtime check",
+            "required": True, "artifact_id": "preflight-proof",
+        }]
+        proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
+        self.admit(proposal)
+        status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
+        self.assertEqual("DOCTOR", status["next_action"]["kind"])
+
+        def doctor_response(policy: dict, request: dict) -> tuple[dict, dict]:
+            return ({
+                "schema_version": goal_guard.REMOTE_DOCTOR_SCHEMA, "ready": True,
+                "contract_sha256": request["contract_sha256"],
+                "helper_sha256": policy["transport"]["helper_sha256"],
+                "sbatch_sha256": "2" * 64, "remote_files": policy["transport"]["remote_files"],
+            }, {"ssh_exit_code": 0, "stdout_sha256": "3" * 64, "stderr_sha256": "4" * 64})
+
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=doctor_response), contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_doctor(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual(0, control["active_lease"]["mutations_used"])
+        self.assertEqual("RECORD_GATES", goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)["next_action"]["kind"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "pre-run gates are not recorded"):
+            self.submit_binding()
+
+    def test_remote_submission_uncertain_reconciles_without_resubmit(self) -> None:
+        self.admit(self.remote_submission_proposal())
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+
+        def doctor_response(policy: dict, request: dict) -> tuple[dict, dict]:
+            return ({
+                "schema_version": goal_guard.REMOTE_DOCTOR_SCHEMA, "ready": True,
+                "contract_sha256": request["contract_sha256"],
+                "helper_sha256": policy["transport"]["helper_sha256"],
+                "sbatch_sha256": "2" * 64, "remote_files": policy["transport"]["remote_files"],
+            }, {"ssh_exit_code": 0, "stdout_sha256": "3" * 64, "stderr_sha256": "4" * 64})
+
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=doctor_response), contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_doctor(args)
+
+        submit_calls = 0
+
+        def uncertain_response(_policy: dict, request: dict) -> tuple[dict, dict]:
+            nonlocal submit_calls
+            submit_calls += 1
+            return ({
+                "schema_version": goal_guard.REMOTE_RECEIPT_SCHEMA,
+                "submission_nonce": request["submission_nonce"], "contract_sha256": request["contract_sha256"],
+                "helper_sha256": _policy["transport"]["helper_sha256"], "sbatch_sha256": request["sbatch_sha256"],
+                "state": "UNCERTAIN", "exit_code": None,
+                "stdout_sha256": "5" * 64, "stderr_sha256": "6" * 64,
+            }, {"ssh_exit_code": 0, "stdout_sha256": "7" * 64, "stderr_sha256": "8" * 64})
+
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=uncertain_response):
+            with self.assertRaisesRegex(goal_guard.GuardError, "never resubmit"):
+                self.submit_binding()
+        control = goal_guard.load_control(self.project)
+        binding = control["active_lease"]["binding_values"]["slurm-job"]
+        self.assertEqual("UNCERTAIN", binding["state"])
+        self.assertEqual(1, control["active_lease"]["mutations_used"])
+        self.assertEqual("RECONCILE_BIND", goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)["next_action"]["kind"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "already consumed"):
+            self.submit_binding()
+        self.assertEqual(1, submit_calls)
+
+        def reconciled_response(_policy: dict, request: dict) -> tuple[dict, dict]:
+            return ({
+                "schema_version": goal_guard.REMOTE_RECEIPT_SCHEMA,
+                "submission_nonce": request["submission_nonce"], "contract_sha256": request["contract_sha256"],
+                "helper_sha256": _policy["transport"]["helper_sha256"], "sbatch_sha256": request["sbatch_sha256"],
+                "state": "SUCCEEDED", "job_id": "24680",
+            }, {"ssh_exit_code": 0, "stdout_sha256": "9" * 64, "stderr_sha256": "a" * 64})
+
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=reconciled_response), contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_reconcile_bind(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("BOUND", control["active_lease"]["binding_values"]["slurm-job"]["state"])
+        self.assertEqual("24680", control["active_lease"]["binding_values"]["slurm-job"]["value"])
+        self.assertEqual(1, control["active_lease"]["mutations_used"])
+
+    def test_remote_submission_transport_failure_stays_uncertain(self) -> None:
+        self.admit(self.remote_submission_proposal())
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+
+        def doctor_response(policy: dict, request: dict) -> tuple[dict, dict]:
+            return ({
+                "schema_version": goal_guard.REMOTE_DOCTOR_SCHEMA, "ready": True,
+                "contract_sha256": request["contract_sha256"],
+                "helper_sha256": policy["transport"]["helper_sha256"],
+                "sbatch_sha256": "2" * 64, "remote_files": policy["transport"]["remote_files"],
+            }, {"ssh_exit_code": 0, "stdout_sha256": "3" * 64, "stderr_sha256": "4" * 64})
+
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=doctor_response), contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_doctor(args)
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=RuntimeError("ssh disconnected")):
+            with self.assertRaisesRegex(goal_guard.GuardError, "reconcile"):
+                self.submit_binding()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("UNCERTAIN", control["active_lease"]["binding_values"]["slurm-job"]["state"])
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=RuntimeError("still disconnected")):
+            with self.assertRaisesRegex(goal_guard.GuardError, "remains uncertain"):
+                goal_guard.command_reconcile_bind(args)
+        self.assertEqual("UNCERTAIN", goal_guard.load_control(self.project)["active_lease"]["binding_values"]["slurm-job"]["state"])
+
+    def test_remote_doctor_unexpected_failure_is_recoverable(self) -> None:
+        self.admit(self.remote_submission_proposal())
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+        with mock.patch.object(goal_guard, "run_remote_helper", side_effect=RuntimeError("unexpected transport failure")):
+            with self.assertRaisesRegex(RuntimeError, "unexpected transport failure"):
+                goal_guard.command_doctor(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("FAILED", control["active_lease"]["transport_doctors"]["submit-slurm"]["state"])
+        self.assertEqual("DOCTOR", goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)["next_action"]["kind"])
+        self.assertEqual(0, control["active_lease"]["mutations_used"])
+
+    def test_remote_submission_full_fake_ssh_helper_path(self) -> None:
+        proposal = self.remote_submission_proposal()
+        transport = proposal["bash_policies"][0]["transport"]
+        fake_ssh = Path(transport["ssh_executable"])
+        fake_ssh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import subprocess, sys\n"
+            "completed = subprocess.run([sys.executable, sys.argv[-1]], input=sys.stdin.read(), text=True, capture_output=True)\n"
+            "sys.stdout.write(completed.stdout)\n"
+            "sys.stderr.write(completed.stderr)\n"
+            "raise SystemExit(completed.returncode)\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o700)
+        transport["ssh_executable_sha256"] = goal_guard.file_hash(fake_ssh)
+        remote_sbatch = self.project / "remote-bin/sbatch"
+        remote_sbatch.parent.mkdir()
+        remote_sbatch.write_text("#!/usr/bin/env python3\nprint('97531;cluster')\n", encoding="utf-8")
+        remote_sbatch.chmod(0o700)
+        receipt_root = Path(self.external_temporary.name) / "submission-receipts"
+        receipt_root.mkdir()
+        receipt_root.chmod(0o700)
+        proposal["bash_policies"][0]["executable"] = str(remote_sbatch)
+        transport["helper_path"] = str(ROOT / "hooks/remote_submit_helper.py")
+        transport["sbatch_path"] = str(remote_sbatch)
+        transport["remote_workdir"] = str(self.project)
+        transport["receipt_root"] = str(receipt_root)
+        self.admit(proposal)
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_doctor(args)
+            goal_guard.command_submit_bind(args)
+        control = goal_guard.load_control(self.project)
+        binding = control["active_lease"]["binding_values"]["slurm-job"]
+        self.assertEqual("BOUND", binding["state"])
+        self.assertEqual("97531", binding["value"])
+        receipts = list(receipt_root.glob("*.json"))
+        self.assertEqual(1, len(receipts))
+        self.assertEqual("SUCCEEDED", json.loads(receipts[0].read_text(encoding="utf-8"))["state"])
+
+    def test_remote_submission_rejects_transport_binary_or_file_drift(self) -> None:
+        proposal = self.remote_submission_proposal()
+        proposal["bash_policies"][0]["transport"]["ssh_executable_sha256"] = "0" * 64
+        with self.assertRaisesRegex(goal_guard.GuardError, "executable SHA-256 mismatched"):
+            self.admit(proposal)
+
+        proposal = self.remote_submission_proposal()
+        proposal["bash_policies"][0]["transport"]["helper_path"] = "/tmp/$(touch-owned)"
+        with self.assertRaisesRegex(goal_guard.GuardError, "safe absolute path"):
+            self.admit(proposal)
+
+        proposal = self.remote_submission_proposal()
+        self.admit(proposal)
+        transport = proposal["bash_policies"][0]["transport"]
+        Path(transport["known_hosts_file"]).write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(goal_guard.GuardError, "known_hosts_file changed"):
+            goal_guard.command_doctor(argparse.Namespace(project=str(self.project), policy="submit-slurm"))
+
+        self.write_json("CONTROL.json", goal_guard.default_control())
+        proposal = self.remote_submission_proposal()
+        self.admit(proposal)
+        (self.project / "train.sbatch").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+        with self.assertRaisesRegex(goal_guard.GuardError, "local file changed"):
+            goal_guard.command_doctor(argparse.Namespace(project=str(self.project), policy="submit-slurm"))
+
     def test_external_monitor_admission_requires_review_and_exact_start_identity(self) -> None:
         proposal = self.external_monitor_proposal()
         proposal["review"]["checks"].pop("external_monitor_contract_bounded")
@@ -1012,6 +1282,10 @@ class GoalGuardTests(unittest.TestCase):
     def test_only_the_bundled_controller_gets_controller_bypass(self) -> None:
         real = f"{sys.executable} {ROOT / 'hooks/goal_guard.py'} status --project {self.project}"
         self.assertTrue(goal_guard.is_controller_command(real))
+        doctor = f"{sys.executable} {ROOT / 'hooks/goal_guard.py'} doctor --policy submit-slurm --project {self.project}"
+        reconcile = f"{sys.executable} {ROOT / 'hooks/goal_guard.py'} reconcile-bind --policy submit-slurm --project {self.project}"
+        self.assertTrue(goal_guard.is_controller_command(doctor))
+        self.assertTrue(goal_guard.is_controller_command(reconcile))
         self.assertFalse(goal_guard.is_controller_command("python3 /tmp/goal_guard.py status"))
         self.assertFalse(goal_guard.is_controller_command(f"echo {ROOT / 'hooks/goal_guard.py'} status"))
 

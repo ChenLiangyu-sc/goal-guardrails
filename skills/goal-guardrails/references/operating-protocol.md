@@ -98,6 +98,8 @@ This is a plugin execution state, not a Codex scheduler control API. It cannot d
 
 ### External monitor evidence
 
+If the controller host has no Slurm client, use the native SSH helper contract in [remote-slurm.md](remote-slurm.md). Do not put the controller or `CONTROL.json` on the compute host and do not express submission as raw `ssh ... sbatch`.
+
 Use an external monitor contract instead of a project relay when the monitor owns immutable evidence outside the repository. Admission must freeze:
 
 - one `slurm_job_id` runtime binding and its one-shot capture policy;
@@ -145,7 +147,7 @@ The relevant proposal fields have this shape; keep the executable paths and lite
 }
 ```
 
-Invoke `submit-bind --policy <id>` once. The controller executes the reviewed argv without a shell, parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt; use a fresh reviewed proposal rather than submitting again. Only controller-frozen values may fill binding tokens.
+Invoke `submit-bind --policy <id>` once. For a local policy the controller executes the reviewed argv without a shell. For `ssh-helper-v1`, run `doctor --policy <id>` first; the local controller sends a versioned JSON request to the pinned helper. It parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt. A definitive failure requires a fresh reviewed proposal; an uncertain remote result uses `reconcile-bind --policy <id>` against the same nonce and must never be resubmitted. Only controller-frozen values may fill binding tokens.
 
 After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge may publish only its private receipt and a semantic notification. It must not write the project or decide the business outcome.
 

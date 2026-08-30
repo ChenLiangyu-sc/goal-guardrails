@@ -15,5 +15,6 @@ When `optimization/GOAL.md` governs an active task, its primary metric and hard 
 - Review the proposed future `lease_mutations`; do not require those mutations to exist before admission. Treat existing evidence, proposal semantics, pre-run gates, structured Bash invocation, and checkpoint artifact paths/SHA as frozen lease contracts.
 - For a healthy asynchronous job with no new terminal evidence, enter `WAITING_EXTERNAL_EVENT`, stop polling and end the activation. Resume the same lease only through the deduplicated registered wake artifact; normal waiting is neither blocked nor complete.
 - For controller-integrated external monitors, capture dynamic IDs only through a one-shot `submit-bind` policy. The monitor remains project-read-only; `wake-monitor` validates its immutable evidence chain and lets the controller materialize the protected project receipt.
+- When Slurm is remote, keep the controller and `CONTROL.json` local. Use only a reviewed, doctored `ssh-helper-v1` policy; never submit through raw SSH. An uncertain call consumes the attempt and may only use `reconcile-bind` with its frozen nonce, never another submission.
 - Treat budget exhaustion, untrusted evaluation, required scope changes, and absence of admissible candidates as reasons to pause, not permission to fill time with low-contribution work.
 <!-- goal-guardrails:end -->
