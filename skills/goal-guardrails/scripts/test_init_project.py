@@ -43,6 +43,8 @@ class InitProjectTests(unittest.TestCase):
         control = (self.root / "optimization/CONTROL.json").read_text(encoding="utf-8")
         pre_run = (self.root / "optimization/PRE_RUN_RESULTS.json").read_text(encoding="utf-8")
         self.assertIn('"enabled": false', gate)
+        self.assertEqual(1440, json.loads(gate)["default_lease_minutes"])
+        self.assertEqual(24, json.loads(gate)["default_max_mutations"])
         self.assertIn('"active_lease": null', control)
         self.assertIn('"state": "ACTIVE"', control)
         self.assertIn('"schema_version": 2', pre_run)

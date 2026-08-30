@@ -66,7 +66,7 @@ After preparation produces gate evidence, write `optimization/PRE_RUN_RESULTS.js
 python3 <plugin-root>/hooks/goal_guard.py gates optimization/PRE_RUN_RESULTS.json --project .
 ```
 
-A genuine required-gate `FAIL` is valid evidence, not a controller error. It is frozen exactly once, all further workload and ordinary mutation remain denied, and the same `PASS` cannot be substituted later. Only `RESULT.json` may be staged or corrected; record explicit `valid=false`, `evaluation_integrity=FAIL`, `core_progress=false`, `outcome=invalid`, and `decision=PAUSE_REQUIRED`, use the failed gate artifact as primary evidence, then checkpoint it. A rejected malformed result can be corrected without another review. A valid checkpoint clears the lease without closing or renaming the causal chain; another attempt requires a fresh proposal review.
+A genuine required-gate `FAIL` is valid evidence, not a controller error. It is frozen exactly once, all further workload and ordinary mutation remain denied, and the same `PASS` cannot be substituted later. Prefer `goal_guard.py abort --project .`: the controller creates the exact invalid result from frozen evidence, verifies it, clears the lease without closing or renaming the chain, and returns to fresh review. Manual `RESULT.json` staging/correction remains legal if needed.
 
 After evaluation, write `optimization/RESULT.json` with every required preregistered artifact path and actual SHA-256 plus the recorded gate results. The controller verifies evidence integrity and result consistency but does not decide whether a domain metric is good. Update concise Markdown evidence and checkpoint:
 
@@ -101,6 +101,12 @@ Track the **core progress unit**, stable chain ID and causal bottleneck, and con
 At the configured no-progress limit, switch, roll back, pause, or use the single predeclared final discriminator. That discriminator closes the diagnostic chain regardless of outcome. A positive result may enter only a separately named verification child restricted to replication, applicable validation, promotion, or rollback.
 
 Waiting does not authorize cleanup. Repeated status recovery, identity/SHA checks, schema proofs, monitoring, and reviewer passes are non-core unless they restore evaluation integrity. Use `WAITING_EXTERNAL_EVENT` for a healthy asynchronous job. Do not classify normal waiting as blocked, complete, or active execution.
+
+## Keep long runs recoverable
+
+Use a lease duration proportional to wall time, up to seven days; long duration never widens frozen paths, argv, gates, or mutation count. New projects default to 24 hours and 24 mutations. For an external job, enter `WAITING_EXTERNAL_EVENT` immediately after launch so elapsed waiting does not consume the remaining lease.
+
+A Hook denial rejects one tool call, not the Goal. Run controller `status`, follow `next_action`, and continue through `RECORD_GATES`, `ABORT_PREFLIGHT`, `CHECKPOINT`, or `FRESH_REVIEW` as reported. Do not mark the Goal complete or blocked merely because a command was denied, a lease expired, its mutation allowance was exhausted, or a result failed validation. `RESULT.json` remains correctable until checkpoint succeeds; a new review is required only for a new experiment or changed authorization contract, never per command.
 
 ## Preserve the boundary
 

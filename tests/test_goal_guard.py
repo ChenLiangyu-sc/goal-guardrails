@@ -550,6 +550,73 @@ class GoalGuardTests(unittest.TestCase):
         self.admit(retry)
         self.assertEqual("E002", goal_guard.load_control(self.project)["active_lease"]["experiment_id"])
 
+    def test_abort_preflight_materializes_checkpoint_and_releases_lease(self) -> None:
+        proposal = self.proposal()
+        proposal["checkpoint_artifacts"].append({"id": "preflight-proof", "path": "artifacts/preflight.json", "required": True})
+        proposal["pre_run_gates"] = [{
+            "id": "preflight", "kind": "manual", "description": "required runtime check",
+            "required": True, "artifact_id": "preflight-proof",
+        }]
+        proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
+        self.admit(proposal)
+        with self.assertRaisesRegex(goal_guard.GuardError, "only after a frozen required preflight FAIL"):
+            goal_guard.command_abort_preflight(argparse.Namespace(project=str(self.project)))
+        proof = self.project / "artifacts/preflight.json"
+        proof.write_text('{"check": "FAIL"}\n', encoding="utf-8")
+        proof_result = {"id": "preflight-proof", "path": "artifacts/preflight.json", "sha256": goal_guard.file_hash(proof)}
+        failed_gates = [{"id": "preflight", "status": "FAIL", "artifact_id": "preflight-proof"}]
+        self.record_gates({
+            "schema_version": 2, "experiment_id": "E001",
+            "artifact_results": [proof_result], "pre_run_gate_results": failed_gates,
+        })
+        status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
+        self.assertEqual("ABORT_PREFLIGHT", status["next_action"]["kind"])
+        abort_command = f"{sys.executable} {ROOT / 'hooks/goal_guard.py'} abort --project {self.project}"
+        abort_alias_command = f"{sys.executable} {ROOT / 'hooks/goal_guard.py'} abort-preflight --project {self.project}"
+        self.assertIsNone(self.pre("Bash", abort_command))
+        self.assertIsNone(self.pre("Bash", abort_alias_command))
+        fake_abort = self.pre("Bash", "python3 /tmp/goal_guard.py abort --project .")
+        self.assertEqual("deny", fake_abort["hookSpecificOutput"]["permissionDecision"])
+        proof.write_text('{"check": "TAMPERED"}\n', encoding="utf-8")
+        rejected = subprocess.run(
+            [sys.executable, str(ROOT / "hooks/goal_guard.py"), "abort", "--project", str(self.project)],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("recorded pre-run gate evidence changed", rejected.stderr)
+        self.assertIsNotNone(goal_guard.load_control(self.project)["active_lease"])
+        proof.write_text('{"check": "FAIL"}\n', encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "hooks/goal_guard.py"), "abort", "--project", str(self.project)],
+            text=True, capture_output=True, check=True,
+        )
+        self.assertIn('"preflight_failed": true', completed.stdout)
+        result = json.loads((self.project / "optimization/RESULT.json").read_text(encoding="utf-8"))
+        self.assertIs(result["valid"], False)
+        self.assertEqual("FAIL", result["evaluation_integrity"])
+        self.assertIs(result["core_progress"], False)
+        self.assertEqual("invalid", result["outcome"])
+        self.assertEqual("PAUSE_REQUIRED", result["decision"])
+        control = goal_guard.load_control(self.project)
+        self.assertIsNone(control["active_lease"])
+        self.assertFalse(control["chains"]["C-main"]["closed"])
+        self.assertEqual("FRESH_REVIEW", goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)["next_action"]["kind"])
+
+    def test_long_lease_accepts_seven_days_and_rejects_more(self) -> None:
+        proposal = self.proposal()
+        proposal["expires_minutes"] = 7 * 24 * 60
+        self.admit(proposal)
+        control = goal_guard.load_control(self.project)
+        issued = goal_guard.parse_time(control["active_lease"]["issued_at"])
+        expires = goal_guard.parse_time(control["active_lease"]["expires_at"])
+        self.assertEqual(7 * 24 * 60 * 60, int((expires - issued).total_seconds()))
+
+        self.write_json("CONTROL.json", goal_guard.default_control())
+        too_long = self.proposal(experiment="E002")
+        too_long["expires_minutes"] = 7 * 24 * 60 + 1
+        with self.assertRaisesRegex(goal_guard.GuardError, "1..10080"):
+            self.admit(too_long)
+
     def test_waiting_external_event_preserves_lease_deduplicates_wake_and_stops_polling(self) -> None:
         proposal = self.proposal()
         proposal["lease_phase"] = "workload"
@@ -769,7 +836,7 @@ class GoalGuardTests(unittest.TestCase):
         result_patch = "*** Begin Patch\n*** Update File: optimization/RESULT.json\n@@\n-{}\n+{}\n*** End Patch"
         self.assertIsNone(self.pre("apply_patch", result_patch))
 
-    def test_checkpoint_files_remain_writable_after_mutation_cap(self) -> None:
+    def test_result_remains_correctable_after_mutation_cap(self) -> None:
         proposal = self.proposal()
         proposal["max_mutations"] = 1
         self.admit(proposal)
@@ -777,8 +844,10 @@ class GoalGuardTests(unittest.TestCase):
         result_patch = "*** Begin Patch\n*** Update File: optimization/RESULT.json\n@@\n-{}\n+{}\n*** End Patch"
         self.assertIsNone(self.pre("apply_patch", result_patch))
         self.assertEqual("deny", self.pre("Bash", "python3 run_eval.py")["hookSpecificOutput"]["permissionDecision"])
-        second_finalize = self.pre("apply_patch", result_patch)
-        self.assertEqual("deny", second_finalize["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("apply_patch", result_patch))
+        state_patch = "*** Begin Patch\n*** Update File: optimization/STATE.md\n@@\n-old\n+new\n*** End Patch"
+        self.assertIsNone(self.pre("apply_patch", state_patch))
+        self.assertEqual("deny", self.pre("apply_patch", state_patch)["hookSpecificOutput"]["permissionDecision"])
 
     def test_protected_contract_file_is_never_in_proposal_scope(self) -> None:
         proposal = self.proposal()
@@ -885,6 +954,8 @@ class GoalGuardTests(unittest.TestCase):
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("enforcement is active", context)
         self.assertIn("fresh subagent", context)
+        self.assertIn("recoverable control transition", context)
+        self.assertIn('"next_action"', context)
 
     def test_session_start_context_does_not_grow_with_closed_chain_history(self) -> None:
         control = goal_guard.default_control()
@@ -926,6 +997,7 @@ class GoalGuardTests(unittest.TestCase):
         specific = output["hookSpecificOutput"]
         self.assertEqual("PreToolUse", specific["hookEventName"])
         self.assertEqual("deny", specific["permissionDecision"])
+        self.assertIn("not Goal completion", specific["permissionDecisionReason"])
 
     def test_cli_status_is_valid_json(self) -> None:
         completed = subprocess.run(
@@ -934,6 +1006,7 @@ class GoalGuardTests(unittest.TestCase):
         )
         status = json.loads(completed.stdout)
         self.assertTrue(status["enabled"])
+        self.assertEqual("ADMIT_NEXT", status["next_action"]["kind"])
         self.assertIsNone(status["active_experiment"])
 
     def test_only_the_bundled_controller_gets_controller_bypass(self) -> None:

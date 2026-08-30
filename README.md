@@ -4,7 +4,7 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.4 combines:
+Version 0.4.1 combines:
 
 ```text
 GOAL.md + STATE.md
@@ -46,7 +46,7 @@ $goal-guardrails init
 
 The initializer creates missing files under `optimization/` and additively inserts one marked block into `AGENTS.md`. Existing files are never overwritten. `optimization/GATE.json` starts with `enabled: false`.
 
-Version 0.4 keeps proposal/result schema v2 and adds optional `runtime_bindings`, ordered `argv`, `external_monitors`, and `external_monitor_results`. Existing `fixed_args` proposals remain compatible. Re-run `init` only to add missing files; do not replace `CONTROL.json`.
+Version 0.4.1 keeps proposal/result schema v2 and adds optional `runtime_bindings`, ordered `argv`, `external_monitors`, and `external_monitor_results`. Existing `fixed_args` proposals remain compatible. New projects default to a 24-hour, 24-mutation lease; reviewed proposals may use up to seven days without widening their path or command scope. Re-run `init` only to add missing files; do not replace `CONTROL.json`. Existing projects may explicitly raise `default_lease_minutes` and `default_max_mutations` in `GATE.json` while the gate is disabled, or declare the values per proposal.
 
 After the metric, evaluator, budgets, state, and stop rules are concrete, explicitly approve activation:
 
@@ -74,7 +74,7 @@ The workflow then:
 6. Records required gate evidence before workload execution.
 7. Writes artifact paths and SHA-256 values to `RESULT.json`, then checkpoints the lease.
 
-If a required pre-run gate genuinely fails, `gates` freezes the `FAIL` and its evidence. Workload and ordinary mutation stay denied; only `RESULT.json` may be staged or corrected. The only legal exit is an explicit `valid=false` / `evaluation_integrity=FAIL` / `core_progress=false` / `invalid` / `PAUSE_REQUIRED` checkpoint referencing that frozen failure artifact. Checkpoint clears the lease while leaving the causal chain open for a newly reviewed attempt.
+If a required pre-run gate genuinely fails, `gates` freezes the `FAIL` and its evidence. Workload and ordinary mutation stay denied. Run `abort`; the controller materializes and verifies the strict invalid checkpoint, clears the lease, and leaves the causal chain open for a newly reviewed attempt. Manual `RESULT.json` staging remains available when inspection or correction is necessary.
 
 Manual controller commands are:
 
@@ -82,6 +82,7 @@ Manual controller commands are:
 python3 <plugin-root>/hooks/goal_guard.py status --project .
 python3 <plugin-root>/hooks/goal_guard.py admit optimization/PROPOSAL.json --project .
 python3 <plugin-root>/hooks/goal_guard.py gates optimization/PRE_RUN_RESULTS.json --project .
+python3 <plugin-root>/hooks/goal_guard.py abort --project .
 python3 <plugin-root>/hooks/goal_guard.py checkpoint optimization/RESULT.json --project .
 ```
 
@@ -132,7 +133,7 @@ python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --pro
 - continued work when `STATE.md` exceeds its cap;
 - identical polling after repeated unchanged results.
 
-Read-only inspection, including `cat`, stays available without a mutation lease. `PROPOSAL.json` can be prepared and reviewed before a lease. `GOAL.md`, `GATE.json`, `CONTROL.json`, the admitted proposal, and controller receipt tree are protected during experiments.
+Read-only inspection, including `cat`, stays available without a mutation lease. `PROPOSAL.json` can be prepared and reviewed before a lease. `GOAL.md`, `GATE.json`, `CONTROL.json`, the admitted proposal, and controller receipt tree are protected during experiments. A denied tool call does not by itself complete or block the Goal: `status.next_action` identifies the legal continuation. After expiry, budget exhaustion, or a malformed checkpoint, `RESULT.json` may still be corrected and checkpointed without another review.
 
 ## Boundaries
 

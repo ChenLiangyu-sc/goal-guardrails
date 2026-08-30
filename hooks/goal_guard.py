@@ -23,6 +23,7 @@ from typing import Any, Iterator
 SCHEMA_VERSION = 1
 PROPOSAL_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 2
+MAX_LEASE_MINUTES = 7 * 24 * 60
 CONTROLLER_PATH = Path(__file__).resolve()
 GATE_REL = Path("optimization/GATE.json")
 CONTROL_REL = Path("optimization/CONTROL.json")
@@ -810,8 +811,8 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
 
     minutes = int(proposal.get("expires_minutes", gate["default_lease_minutes"]))
     mutations = int(proposal.get("max_mutations", gate["default_max_mutations"]))
-    if not 1 <= minutes <= 240 or not 1 <= mutations <= 50:
-        raise GuardError("lease minutes must be 1..240 and mutations must be 1..50")
+    if not 1 <= minutes <= MAX_LEASE_MINUTES or not 1 <= mutations <= 50:
+        raise GuardError(f"lease minutes must be 1..{MAX_LEASE_MINUTES} and mutations must be 1..50")
     work_class = proposal.get("work_class")
     if work_class not in {"core", "non_core"}:
         raise GuardError("work_class must be core or non_core")
@@ -1672,6 +1673,65 @@ def command_checkpoint(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_abort_preflight(args: argparse.Namespace) -> int:
+    """Materialize and checkpoint the only legal result after a frozen required-gate failure."""
+    project = explicit_project(args.project)
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT":
+            raise GuardError("cannot abort preflight while waiting for an external event")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict):
+            raise GuardError("no active lease to abort")
+        verify_frozen_lease(project, lease)
+        recorded = lease.get("pre_run_gate_results")
+        if not lease.get("preflight_failed") or not isinstance(recorded, dict):
+            raise GuardError("abort is available only after a frozen required preflight FAIL")
+        artifacts = recorded.get("artifacts")
+        gates = recorded.get("gates")
+        if not isinstance(artifacts, list) or not isinstance(gates, list):
+            raise GuardError("frozen preflight failure evidence is incomplete")
+        artifact_by_id = {
+            item.get("id"): item
+            for item in artifacts
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        required_gate_ids = {
+            item.get("id") for item in lease.get("pre_run_gates", [])
+            if isinstance(item, dict) and item.get("required")
+        }
+        failed_artifact_ids = [
+            item.get("artifact_id")
+            for item in gates
+            if isinstance(item, dict) and item.get("id") in required_gate_ids and item.get("status") == "FAIL"
+        ]
+        primary = next(
+            (artifact_by_id[artifact_id] for artifact_id in failed_artifact_ids if artifact_id in artifact_by_id),
+            None,
+        )
+        if not isinstance(primary, dict):
+            raise GuardError("frozen required preflight FAIL lacks a verified primary artifact")
+        result = {
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "experiment_id": lease["experiment_id"],
+            "valid": False,
+            "evaluation_integrity": "FAIL",
+            "core_progress": False,
+            "metric_delta": "preflight failed before workload",
+            "outcome": "invalid",
+            "decision": "PAUSE_REQUIRED",
+            "artifact": primary["path"],
+            "artifact_results": artifacts,
+            "pre_run_gate_results": gates,
+            "external_monitor_results": [],
+        }
+        atomic_json(project / RESULT_REL, result)
+    return command_checkpoint(argparse.Namespace(project=str(project), result=str(project / RESULT_REL)))
+
+
 def command_toggle(args: argparse.Namespace, enabled: bool) -> int:
     if args.approved_by != "user":
         raise GuardError("activation changes require --approved-by user")
@@ -1692,6 +1752,35 @@ def command_toggle(args: argparse.Namespace, enabled: bool) -> int:
             save_control(project, default_control())
     print("enabled" if enabled else "disabled")
     return 0
+
+
+def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> dict[str, str]:
+    if not gate.get("enabled"):
+        return {"kind": "ACTIVATE", "instruction": "Obtain explicit user approval and activate the project gate."}
+    runtime = control.get("runtime", {})
+    if runtime.get("state") == "WAITING_EXTERNAL_EVENT":
+        wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
+        command = "wake-monitor" if wait.get("kind") == "external_monitor" else "wake"
+        return {"kind": "WAIT", "instruction": f"End this activation without polling; resume only through the registered {command} event."}
+    raw_lease = control.get("active_lease")
+    lease = raw_lease if isinstance(raw_lease, dict) else None
+    if lease is not None:
+        if lease.get("preflight_failed"):
+            return {"kind": "ABORT_PREFLIGHT", "instruction": "Run goal_guard.py abort --project .; it will freeze the invalid checkpoint and release the lease."}
+        if current_lease(control) is None:
+            return {"kind": "CHECKPOINT", "instruction": "The lease expired; stage or correct RESULT.json and checkpoint instead of abandoning the Goal."}
+        if int(lease.get("mutations_used", 0)) >= int(lease.get("max_mutations", 0)):
+            return {"kind": "CHECKPOINT", "instruction": "The mutation allowance is exhausted; stage or correct RESULT.json and checkpoint."}
+        required_gates = [item for item in lease.get("pre_run_gates", []) if item.get("required")]
+        if required_gates and lease.get("pre_run_gate_results") is None:
+            return {"kind": "RECORD_GATES", "instruction": "Complete preparation and record PRE_RUN_RESULTS.json before workload execution."}
+        return {"kind": "CONTINUE_LEASE", "instruction": "Continue the admitted experiment within its frozen paths and command policies."}
+    last = control.get("last_checkpoint")
+    if isinstance(last, dict) and last.get("preflight_failed"):
+        return {"kind": "FRESH_REVIEW", "instruction": "Prepare a corrected proposal on the same causal chain and obtain one fresh experiment review."}
+    if isinstance(last, dict) and last.get("decision") == "PAUSE_REQUIRED":
+        return {"kind": "AWAIT_DECISION", "instruction": "The last valid checkpoint explicitly requires a user decision; do not invent adjacent work."}
+    return {"kind": "ADMIT_NEXT", "instruction": "Prepare and admit the next bounded experiment; review occurs once at the experiment boundary."}
 
 
 def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any], *, session_frontier_only: bool = False) -> dict[str, Any]:
@@ -1717,6 +1806,7 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "runtime_bindings": lease.get("binding_values", {}) if lease else {},
         "external_monitor_receipts": lease.get("monitor_receipts", {}) if lease else {},
         "runtime": {"state": control.get("runtime", {}).get("state", "ACTIVE"), "wait": control.get("runtime", {}).get("wait")},
+        "next_action": recommended_next_action(gate, control),
         "chains": {key: {field: value.get(field) for field in ("no_progress_count", "stopline_fired", "closed", "close_outcome")} for key, value in chains.items()},
         "last_checkpoint": control.get("last_checkpoint"),
     }
@@ -1729,7 +1819,8 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def deny(reason: str) -> dict[str, Any]:
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
+    prefix = "This tool call was denied, but a denial alone is not Goal completion or blocked status. "
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": prefix + reason + " Inspect controller status and take its next_action."}}
 
 
 def hook_context(text: str) -> dict[str, Any]:
@@ -1839,7 +1930,7 @@ def is_controller_command(command: str) -> bool:
         return False
     return script == CONTROLLER_PATH and tokens[2] in {
         "status", "admit", "gates", "submit-bind", "wait", "wake", "wait-monitor", "wake-monitor",
-        "checkpoint", "activate", "deactivate",
+        "checkpoint", "abort", "abort-preflight", "activate", "deactivate",
     }
 
 
@@ -1931,12 +2022,17 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
             and raw_lease.get("preflight_failed")
             and all(path == RESULT_REL for path in targets)
         )
+        ordinary_result_correction = (
+            isinstance(raw_lease, dict)
+            and not raw_lease.get("preflight_failed")
+            and all(path == RESULT_REL for path in targets)
+        )
         ordinary_finalization = (
             isinstance(raw_lease, dict)
             and not raw_lease.get("preflight_failed")
             and all(path in FINALIZATION_PATHS for path in targets)
         )
-        if preflight_failure_result:
+        if preflight_failure_result or ordinary_result_correction:
             return None
         if ordinary_finalization and not raw_lease.get("finalization_used"):
             raw_lease["finalization_used"] = True
@@ -2038,7 +2134,13 @@ def command_hook() -> int:
                 status = compact_status(project, gate, control, session_frontier_only=True)
                 waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
                 suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived." if waiting else ""
-                output = hook_context("Goal Guardrails enforcement is active. Current gate status: " + json.dumps(status, ensure_ascii=False, separators=(",", ":")) + ". Do not self-attest proposals; obtain a fresh subagent or user review before admission. The controller validates attestation shape, not reviewer identity." + suffix)
+                output = hook_context(
+                    "Goal Guardrails enforcement is active. Current gate status: "
+                    + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+                    + ". A single denied tool call is a recoverable control transition, not permission to mark the Goal complete or blocked; follow next_action. "
+                    + "Do not self-attest proposals; obtain one fresh subagent or user review at the experiment boundary. The controller validates attestation shape, not reviewer identity."
+                    + suffix
+                )
             elif name == "PreToolUse":
                 output = hook_pre_tool(project, event, gate, control)
             elif name == "PostToolUse":
@@ -2068,6 +2170,8 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("result")
     checkpoint.add_argument("--project")
+    abort = sub.add_parser("abort", aliases=["abort-preflight"])
+    abort.add_argument("--project")
     gates = sub.add_parser("gates")
     gates.add_argument("results")
     gates.add_argument("--project")
@@ -2119,6 +2223,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_wake_monitor(args)
         if args.command == "checkpoint":
             return command_checkpoint(args)
+        if args.command in {"abort", "abort-preflight"}:
+            return command_abort_preflight(args)
         if args.command == "activate":
             return command_toggle(args, True)
         if args.command == "deactivate":

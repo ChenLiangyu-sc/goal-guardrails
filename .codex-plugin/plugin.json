@@ -1,6 +1,6 @@
 {
   "name": "goal-guardrails",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Keep long-running optimization aligned through bounded experiment leases and Codex lifecycle hooks.",
   "author": {
     "name": "Chen Liangyu",

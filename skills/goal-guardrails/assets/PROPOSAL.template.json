@@ -25,8 +25,8 @@
     {"id": "prepare", "phase": "preparation", "executable": "TODO", "argv": [{"literal": "TODO"}], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}}
   ],
   "external_monitors": [],
-  "expires_minutes": 60,
-  "max_mutations": 12,
+  "expires_minutes": 1440,
+  "max_mutations": 24,
   "work_class": "core",
   "cost_units": 1,
   "final_discriminator": false,
