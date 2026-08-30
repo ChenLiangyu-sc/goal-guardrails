@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "experiment_id": "TODO",
   "chain_id": "TODO",
   "chain_kind": "optimization",
@@ -7,8 +7,22 @@
   "causal_bottleneck": "TODO",
   "hypothesis": "TODO",
   "core_progress_expected": "TODO",
-  "allowed_paths": ["TODO"],
-  "allowed_command_prefixes": ["TODO"],
+  "lease_phase": "TODO: preparation | workload | postflight | synchronous",
+  "existing_evidence": [
+    {"id": "baseline", "path": "TODO", "sha256": "TODO", "claim": "TODO"}
+  ],
+  "lease_mutations": [
+    {"path": "TODO", "scope": "TODO: exact | tree", "operations": ["TODO: add | update | delete | move"]}
+  ],
+  "checkpoint_artifacts": [
+    {"id": "primary-result", "path": "TODO", "required": true}
+  ],
+  "pre_run_gates": [
+    {"id": "zero-gpu", "kind": "resource", "description": "TODO", "required": true, "artifact_id": "TODO", "resource": "gpu", "operator": "max", "value": 0}
+  ],
+  "bash_policies": [
+    {"id": "prepare", "phase": "preparation", "executable": "TODO", "fixed_args": ["TODO"], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}}
+  ],
   "expires_minutes": 60,
   "max_mutations": 12,
   "work_class": "core",
@@ -18,6 +32,12 @@
   "review": {
     "decision": "TODO: ALLOW | REJECT_TO_BACKLOG | SWITCH_CHAIN | PAUSE_REQUIRED",
     "reviewer": "TODO: subagent:<id> | user:<id>",
-    "reason": "TODO"
+    "reason": "TODO",
+    "checks": {
+      "evidence_sufficient": true,
+      "lease_mutations_bounded": true,
+      "pre_run_gates_sufficient": true,
+      "mutation_not_required_before_admission": true
+    }
   }
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -13,15 +14,24 @@ INIT = ROOT / "skills/goal-guardrails/scripts/init_project.py"
 GUARD = ROOT / "hooks/goal_guard.py"
 
 
+def goal_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 class EndToEndLeaseFlowTests(unittest.TestCase):
-    def run_cli(self, *args: object, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run_cli(self, *args: object, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, *(str(value) for value in args)],
             input=input_text,
             text=True,
             capture_output=True,
-            check=True,
+            check=check,
         )
+
+    def hook(self, project: Path, tool: str, tool_input: dict) -> dict | None:
+        event = {"hook_event_name": "PreToolUse", "cwd": str(project), "tool_name": tool, "tool_input": tool_input}
+        completed = self.run_cli(GUARD, "hook", input_text=json.dumps(event))
+        return json.loads(completed.stdout) if completed.stdout.strip() else None
 
     def test_initialize_activate_and_run_two_checkpointed_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -30,12 +40,17 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             optimization = project / "optimization"
             (optimization / "GOAL.md").write_text("# Goal\n\nMetric: accepted output yield\n", encoding="utf-8")
             (optimization / "STATE.md").write_text("# State\n\n- frontier: baseline\n", encoding="utf-8")
+            reports = project / "reports"
+            reports.mkdir()
+            (reports / "baseline.json").write_text('{"accepted": 0}\n', encoding="utf-8")
+            artifacts = project / "artifacts"
+            artifacts.mkdir()
             self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
 
             for index in range(2):
                 experiment = f"E{index + 1:03d}"
                 proposal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "experiment_id": experiment,
                     "chain_id": "C-e2e",
                     "chain_kind": "optimization",
@@ -43,15 +58,19 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                     "causal_bottleneck": "end to end renderer quality",
                     "hypothesis": "one renderer parameter increases accepted outputs",
                     "core_progress_expected": "one more accepted output",
-                    "allowed_paths": ["src", "optimization/RESULT.json"],
-                    "allowed_command_prefixes": ["python3 run_eval.py"],
+                    "lease_phase": "synchronous",
+                    "existing_evidence": [{"id": "baseline", "path": "reports/baseline.json", "sha256": goal_hash(reports / "baseline.json"), "claim": "baseline accepted output yield is zero"}],
+                    "lease_mutations": [{"path": "artifacts", "scope": "tree", "operations": ["add", "update"]}],
+                    "checkpoint_artifacts": [{"id": "primary-result", "path": f"artifacts/{experiment}.json", "required": True}],
+                    "pre_run_gates": [],
+                    "bash_policies": [{"id": "eval", "phase": "evaluation", "executable": "python3", "fixed_args": ["run_eval.py", "--small"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}}],
                     "expires_minutes": 10,
                     "max_mutations": 2,
                     "work_class": "core",
                     "cost_units": 1,
                     "final_discriminator": False,
                     "next_paths": None,
-                    "review": {"decision": "ALLOW", "reviewer": f"subagent:r{index}", "reason": "bounded direct test"},
+                    "review": {"decision": "ALLOW", "reviewer": f"subagent:r{index}", "reason": "bounded direct test", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
                 }
                 proposal_path = optimization / "PROPOSAL.json"
                 proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
@@ -66,8 +85,10 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                 hook = self.run_cli(GUARD, "hook", input_text=json.dumps(hook_event))
                 self.assertEqual("", hook.stdout)
 
+                artifact_path = artifacts / f"{experiment}.json"
+                artifact_path.write_text(json.dumps({"experiment": experiment, "accepted": index}) + "\n", encoding="utf-8")
                 result = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "experiment_id": experiment,
                     "valid": True,
                     "evaluation_integrity": "PASS",
@@ -75,7 +96,9 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                     "metric_delta": "0" if index == 0 else "+1 accepted output",
                     "outcome": "zero_progress" if index == 0 else "positive",
                     "decision": "CONTINUE",
-                    "artifact": f"reports/{experiment}.json",
+                    "artifact": f"artifacts/{experiment}.json",
+                    "artifact_results": [{"id": "primary-result", "path": f"artifacts/{experiment}.json", "sha256": goal_hash(artifact_path)}],
+                    "pre_run_gate_results": [],
                 }
                 result_path = optimization / "RESULT.json"
                 result_path.write_text(json.dumps(result), encoding="utf-8")
@@ -85,6 +108,91 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             self.assertIsNone(status["active_experiment"])
             self.assertEqual(0, status["chains"]["C-e2e"]["no_progress_count"])
             self.assertEqual("E002", status["last_checkpoint"]["experiment_id"])
+
+    def test_gated_async_lifecycle_from_disabled_admission_through_old_lease_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.run_cli(INIT, project)
+            optimization = project / "optimization"
+            (optimization / "GOAL.md").write_text("# Goal\n\nMetric: final quality\n", encoding="utf-8")
+            (optimization / "STATE.md").write_text("# State\n\n- frontier: baseline\n", encoding="utf-8")
+            reports = project / "reports"
+            reports.mkdir()
+            baseline = reports / "baseline.json"
+            baseline.write_text('{"quality": 0}\n', encoding="utf-8")
+            artifacts = project / "artifacts"
+            artifacts.mkdir()
+            proposal = {
+                "schema_version": 2, "experiment_id": "ASYNC-001", "chain_id": "C-async",
+                "chain_kind": "optimization", "parent_chain": None, "causal_bottleneck": "final renderer quality",
+                "hypothesis": "one frozen workload improves final quality", "core_progress_expected": "one accepted final output",
+                "lease_phase": "workload",
+                "existing_evidence": [{"id": "baseline", "path": "reports/baseline.json", "sha256": goal_hash(baseline), "claim": "baseline quality is zero"}],
+                "lease_mutations": [{"path": "artifacts", "scope": "tree", "operations": ["add", "update"]}],
+                "checkpoint_artifacts": [
+                    {"id": "gate-proof", "path": "artifacts/zero-gpu.json", "required": True},
+                    {"id": "terminal-event", "path": "artifacts/job-terminal.json", "required": True},
+                    {"id": "primary-result", "path": "artifacts/final.json", "required": True},
+                ],
+                "pre_run_gates": [{"id": "zero-gpu", "kind": "resource", "description": "preparation uses zero GPU", "required": True, "artifact_id": "gate-proof", "resource": "gpu", "operator": "max", "value": 0}],
+                "bash_policies": [
+                    {"id": "prepare", "phase": "preparation", "executable": "python3", "fixed_args": ["prepare.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                    {"id": "workload", "phase": "workload", "executable": "python3", "fixed_args": ["submit.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                    {"id": "postflight", "phase": "postflight", "executable": "python3", "fixed_args": ["postflight.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                ],
+                "expires_minutes": 10, "max_mutations": 6, "work_class": "core", "cost_units": 1,
+                "final_discriminator": False, "next_paths": None,
+                "review": {"decision": "ALLOW", "reviewer": "subagent:e2e-review", "reason": "future mutations and gates are bounded", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
+            }
+            proposal_path = optimization / "PROPOSAL.json"
+            proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
+            disabled = self.run_cli(GUARD, "admit", proposal_path, "--project", project, check=False)
+            self.assertNotEqual(0, disabled.returncode)
+            self.assertIn("gate is not activated", disabled.stderr)
+
+            self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+            self.run_cli(GUARD, "admit", proposal_path, "--project", project)
+            outside_patch = "*** Begin Patch\n*** Add File: docs/drift.md\n+drift\n*** End Patch"
+            self.assertEqual("deny", self.hook(project, "apply_patch", {"patch": outside_patch})["hookSpecificOutput"]["permissionDecision"])
+            self.assertIsNone(self.hook(project, "Bash", {"command": "python3 prepare.py"}))
+            self.assertEqual("deny", self.hook(project, "Bash", {"command": "torchrun train.py"})["hookSpecificOutput"]["permissionDecision"])
+
+            proof = artifacts / "zero-gpu.json"
+            proof.write_text('{"gpu": 0}\n', encoding="utf-8")
+            gate_results = [{"id": "zero-gpu", "status": "PASS", "artifact_id": "gate-proof"}]
+            pre_run = {"schema_version": 2, "experiment_id": "ASYNC-001", "artifact_results": [{"id": "gate-proof", "path": "artifacts/zero-gpu.json", "sha256": goal_hash(proof)}], "pre_run_gate_results": gate_results}
+            pre_run_path = optimization / "PRE_RUN_RESULTS.json"
+            pre_run_path.write_text(json.dumps(pre_run), encoding="utf-8")
+            self.run_cli(GUARD, "gates", pre_run_path, "--project", project)
+            self.assertIsNone(self.hook(project, "Bash", {"command": "python3 submit.py"}))
+
+            self.run_cli(GUARD, "wait", "--event-key", "job-122020", "--event-path", "artifacts/job-terminal.json", "--project", project)
+            waiting_poll = self.hook(project, "Bash", {"command": "tail -f artifacts/job.log"})
+            self.assertEqual("deny", waiting_poll["hookSpecificOutput"]["permissionDecision"])
+            self.assertIsNone(self.hook(project, "Bash", {"command": "cat optimization/STATE.md"}))
+            terminal = artifacts / "job-terminal.json"
+            terminal.write_text('{"state": "COMPLETED"}\n', encoding="utf-8")
+            self.run_cli(GUARD, "wake", "--event-key", "job-122020", "--event-path", "artifacts/job-terminal.json", "--project", project)
+            duplicate = self.run_cli(GUARD, "wake", "--event-key", "job-122020", "--event-path", "artifacts/job-terminal.json", "--project", project)
+            self.assertEqual("duplicate", duplicate.stdout.strip())
+            terminal_patch = "*** Begin Patch\n*** Update File: artifacts/job-terminal.json\n@@\n-{\"state\": \"COMPLETED\"}\n+{\"state\": \"FAILED\"}\n*** End Patch"
+            frozen_event = self.hook(project, "apply_patch", {"patch": terminal_patch})
+            self.assertEqual("deny", frozen_event["hookSpecificOutput"]["permissionDecision"])
+            self.assertIsNone(self.hook(project, "Bash", {"command": "python3 postflight.py"}))
+
+            primary = artifacts / "final.json"
+            primary.write_text('{"quality": 1}\n', encoding="utf-8")
+            artifact_results = [
+                {"id": "gate-proof", "path": "artifacts/zero-gpu.json", "sha256": goal_hash(proof)},
+                {"id": "terminal-event", "path": "artifacts/job-terminal.json", "sha256": goal_hash(terminal)},
+                {"id": "primary-result", "path": "artifacts/final.json", "sha256": goal_hash(primary)},
+            ]
+            result = {"schema_version": 2, "experiment_id": "ASYNC-001", "valid": True, "evaluation_integrity": "PASS", "core_progress": True, "metric_delta": "+1 accepted output", "outcome": "positive", "decision": "CONTINUE", "artifact": "artifacts/final.json", "artifact_results": artifact_results, "pre_run_gate_results": gate_results}
+            result_path = optimization / "RESULT.json"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.run_cli(GUARD, "checkpoint", result_path, "--project", project)
+            old_lease = self.hook(project, "Bash", {"command": "python3 postflight.py"})
+            self.assertEqual("deny", old_lease["hookSpecificOutput"]["permissionDecision"])
 
 
 if __name__ == "__main__":

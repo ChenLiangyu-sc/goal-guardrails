@@ -23,6 +23,7 @@ TARGETS = {
     "GATE.template.json": Path("optimization/GATE.json"),
     "CONTROL.template.json": Path("optimization/CONTROL.json"),
     "PROPOSAL.template.json": Path("optimization/PROPOSAL.json"),
+    "PRE_RUN_RESULTS.template.json": Path("optimization/PRE_RUN_RESULTS.json"),
     "RESULT.template.json": Path("optimization/RESULT.json"),
 }
 AGENTS_FRAGMENT = ASSET_DIR / "AGENTS.fragment.md"

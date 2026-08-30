@@ -3,5 +3,10 @@
   "active_lease": null,
   "chains": {},
   "poll": null,
-  "last_checkpoint": null
+  "last_checkpoint": null,
+  "runtime": {
+    "state": "ACTIVE",
+    "wait": null,
+    "seen_events": []
+  }
 }

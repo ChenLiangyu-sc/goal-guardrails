@@ -41,8 +41,11 @@ class InitProjectTests(unittest.TestCase):
         init_project.apply_project(self.root, dry_run=False)
         gate = (self.root / "optimization/GATE.json").read_text(encoding="utf-8")
         control = (self.root / "optimization/CONTROL.json").read_text(encoding="utf-8")
+        pre_run = (self.root / "optimization/PRE_RUN_RESULTS.json").read_text(encoding="utf-8")
         self.assertIn('"enabled": false', gate)
         self.assertIn('"active_lease": null', control)
+        self.assertIn('"state": "ACTIVE"', control)
+        self.assertIn('"schema_version": 2', pre_run)
         self.assertEqual(str(self.root), json.loads(gate)["project_root"])
 
     def test_rerun_is_idempotent(self) -> None:

@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "experiment_id": "TODO",
+  "artifact_results": [
+    {"id": "TODO", "path": "TODO", "sha256": "TODO"}
+  ],
+  "pre_run_gate_results": [
+    {"id": "TODO", "status": "TODO: PASS | FAIL", "artifact_id": "TODO"}
+  ]
+}

@@ -30,6 +30,10 @@ class GoalGuardTests(unittest.TestCase):
         (optimization / "STATE.md").write_text("# State\n\n- frontier: baseline\n", encoding="utf-8")
         (optimization / "EXPERIMENTS.md").write_text("# Experiments\n", encoding="utf-8")
         (optimization / "BACKLOG.md").write_text("# Backlog\n", encoding="utf-8")
+        reports = self.project / "reports"
+        reports.mkdir()
+        (reports / "baseline.json").write_text('{"accepted": 0}\n', encoding="utf-8")
+        (self.project / "artifacts").mkdir()
         self.write_json("GATE.json", {
             "schema_version": 1,
             "enabled": True,
@@ -62,7 +66,7 @@ class GoalGuardTests(unittest.TestCase):
         work_class: str = "core",
     ) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "experiment_id": experiment,
             "chain_id": chain,
             "chain_kind": kind,
@@ -70,15 +74,40 @@ class GoalGuardTests(unittest.TestCase):
             "causal_bottleneck": bottleneck,
             "hypothesis": "one bounded change improves accepted output yield",
             "core_progress_expected": "at least one accepted end to end output",
-            "allowed_paths": ["src", "optimization/STATE.md", "optimization/RESULT.json"],
-            "allowed_command_prefixes": ["python3 run_eval.py", "pytest"],
+            "lease_phase": "synchronous",
+            "existing_evidence": [{
+                "id": "baseline",
+                "path": "reports/baseline.json",
+                "sha256": goal_guard.file_hash(self.project / "reports/baseline.json"),
+                "claim": "baseline has zero accepted outputs",
+            }],
+            "lease_mutations": [
+                {"path": "src", "scope": "tree", "operations": ["add", "update", "delete", "move"]},
+                {"path": "artifacts", "scope": "tree", "operations": ["add", "update"]},
+            ],
+            "checkpoint_artifacts": [{"id": "primary-result", "path": f"artifacts/{experiment}.json", "required": True}],
+            "pre_run_gates": [],
+            "bash_policies": [
+                {"id": "eval", "phase": "evaluation", "executable": "python3", "fixed_args": ["run_eval.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                {"id": "eval-case", "phase": "evaluation", "executable": "python3", "fixed_args": ["run_eval.py", "--case", "small"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                {"id": "pytest-q", "phase": "evaluation", "executable": "pytest", "fixed_args": ["-q"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                {"id": "pytest-more", "phase": "evaluation", "executable": "pytest", "fixed_args": ["tests/test_more.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+            ],
             "expires_minutes": 60,
             "max_mutations": 3,
             "work_class": work_class,
             "cost_units": 1,
             "final_discriminator": final,
             "next_paths": {"positive": "verification child", "other": "switch representation"} if final else None,
-            "review": {"decision": "ALLOW", "reviewer": "subagent:review-1", "reason": "bounded causal test"},
+            "review": {
+                "decision": "ALLOW", "reviewer": "subagent:review-1", "reason": "bounded causal test",
+                "checks": {
+                    "evidence_sufficient": True,
+                    "lease_mutations_bounded": True,
+                    "pre_run_gates_sufficient": True,
+                    "mutation_not_required_before_admission": True,
+                },
+            },
         }
 
     def result(
@@ -90,8 +119,10 @@ class GoalGuardTests(unittest.TestCase):
         decision: str = "CONTINUE",
         valid: bool = True,
     ) -> dict:
+        artifact_path = self.project / "artifacts" / f"{experiment}.json"
+        artifact_path.write_text(json.dumps({"experiment": experiment, "core_progress": core_progress}) + "\n", encoding="utf-8")
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "experiment_id": experiment,
             "valid": valid,
             "evaluation_integrity": "PASS" if valid else "FAIL",
@@ -99,7 +130,9 @@ class GoalGuardTests(unittest.TestCase):
             "metric_delta": "+1 accepted output" if core_progress else "0 accepted outputs",
             "outcome": outcome,
             "decision": decision,
-            "artifact": f"reports/{experiment}.json",
+            "artifact": f"artifacts/{experiment}.json",
+            "artifact_results": [{"id": "primary-result", "path": f"artifacts/{experiment}.json", "sha256": goal_guard.file_hash(artifact_path)}],
+            "pre_run_gate_results": [],
         }
 
     def admit(self, proposal: dict) -> int:
@@ -113,6 +146,12 @@ class GoalGuardTests(unittest.TestCase):
         args = argparse.Namespace(project=str(self.project), result=str(path))
         with contextlib.redirect_stdout(io.StringIO()):
             return goal_guard.command_checkpoint(args)
+
+    def record_gates(self, payload: dict) -> int:
+        path = self.write_json("PRE_RUN_RESULTS.json", payload)
+        args = argparse.Namespace(project=str(self.project), results=str(path))
+        with contextlib.redirect_stdout(io.StringIO()):
+            return goal_guard.command_gates(args)
 
     def hook(self, event: dict) -> dict | None:
         stdin = io.StringIO(json.dumps(event))
@@ -165,8 +204,42 @@ class GoalGuardTests(unittest.TestCase):
         self.write_json("GATE.json", gate)
         self.assertIsNone(self.hook(event))
 
+    def test_admit_fails_when_gate_is_disabled(self) -> None:
+        gate = json.loads((self.project / "optimization/GATE.json").read_text())
+        gate["enabled"] = False
+        self.write_json("GATE.json", gate)
+        with self.assertRaisesRegex(goal_guard.GuardError, "not activated"):
+            self.admit(self.proposal())
+
+    def test_reviewed_preparation_proposal_allows_mutation_only_after_admission(self) -> None:
+        proposal = self.proposal()
+        proposal["lease_phase"] = "preparation"
+        proposal["bash_policies"] = [{
+            "id": "prepare", "phase": "preparation", "executable": "python3",
+            "fixed_args": ["prepare.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+        }]
+        add_patch = "*** Begin Patch\n*** Add File: src/prepared.py\n+ready = True\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", add_patch)["hookSpecificOutput"]["permissionDecision"])
+        self.admit(proposal)
+        self.assertIsNone(self.pre("apply_patch", add_patch))
+
+    def test_proposal_and_existing_evidence_are_frozen_after_admission(self) -> None:
+        self.admit(self.proposal())
+        original_proposal = (self.project / "optimization/PROPOSAL.json").read_text()
+        proposal = json.loads((self.project / "optimization/PROPOSAL.json").read_text())
+        proposal["hypothesis"] = "semantic drift after review"
+        self.write_json("PROPOSAL.json", proposal)
+        denial = self.pre("Bash", "python3 run_eval.py")
+        self.assertIn("PROPOSAL.json changed", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+        (self.project / "optimization/PROPOSAL.json").write_text(original_proposal, encoding="utf-8")
+        (self.project / "reports/baseline.json").write_text('{"accepted": 99}\n', encoding="utf-8")
+        denial = self.pre("Bash", "python3 run_eval.py")
+        self.assertIn("frozen existing evidence", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_no_lease_allows_inspection_and_proposal_only(self) -> None:
         self.assertIsNone(self.pre("Bash", "git status --short"))
+        self.assertIsNone(self.pre("Bash", "cat skills/goal-guardrails/references/operating-protocol.md"))
         proposal_patch = "*** Begin Patch\n*** Update File: optimization/PROPOSAL.json\n@@\n-{}\n+{}\n*** End Patch"
         self.assertIsNone(self.pre("apply_patch", proposal_patch))
         source_patch = "*** Begin Patch\n*** Update File: src/model.py\n@@\n-x\n+y\n*** End Patch"
@@ -193,6 +266,184 @@ class GoalGuardTests(unittest.TestCase):
         self.assertIsNone(self.pre("Bash", "pytest -q"))
         exhausted = self.pre("Bash", "pytest tests/test_more.py")
         self.assertEqual("deny", exhausted["hookSpecificOutput"]["permissionDecision"])
+
+    def test_structured_bash_policy_freezes_args_cwd_and_output_path(self) -> None:
+        (self.project / "work").mkdir()
+        proposal = self.proposal()
+        proposal["bash_policies"] = [{
+            "id": "prepare", "phase": "preparation", "executable": "python3",
+            "fixed_args": ["prepare.py", "--output=../artifacts/E001.json"],
+            "cwd": "work", "output_paths": ["artifacts/E001.json"], "resources": {"gpu": 0},
+        }]
+        self.admit(proposal)
+        command = "python3 prepare.py --output=../artifacts/E001.json"
+        self.assertEqual("deny", self.pre("Bash", command)["hookSpecificOutput"]["permissionDecision"])
+        allowed = self.hook({
+            "hook_event_name": "PreToolUse", "cwd": str(self.project / "work"),
+            "tool_name": "Bash", "tool_input": {"command": command},
+        })
+        self.assertIsNone(allowed)
+        extra = self.hook({
+            "hook_event_name": "PreToolUse", "cwd": str(self.project / "work"),
+            "tool_name": "Bash", "tool_input": {"command": command + " --extra"},
+        })
+        self.assertEqual("deny", extra["hookSpecificOutput"]["permissionDecision"])
+
+    def test_zero_gpu_gate_rejects_gpu_command_and_blocks_workload_before_gate_recording(self) -> None:
+        proposal = self.proposal()
+        proposal["checkpoint_artifacts"].append({"id": "zero-gpu-proof", "path": "artifacts/zero-gpu.json", "required": True})
+        proposal["pre_run_gates"] = [{
+            "id": "zero-gpu", "kind": "resource", "description": "preparation must use no GPU",
+            "required": True, "artifact_id": "zero-gpu-proof", "resource": "gpu", "operator": "max", "value": 0,
+        }]
+        proposal["bash_policies"] = [{
+            "id": "gpu-run", "phase": "workload", "executable": "torchrun", "fixed_args": ["train.py"],
+            "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+        }]
+        with self.assertRaisesRegex(goal_guard.GuardError, "conflicts with the pre-run GPU gate"):
+            self.admit(proposal)
+
+        proposal["bash_policies"] = [{
+            "id": "cpu-run", "phase": "workload", "executable": "python3", "fixed_args": ["run_eval.py"],
+            "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+        }]
+        self.admit(proposal)
+        denial = self.pre("Bash", "python3 run_eval.py")
+        self.assertIn("pre-run gates", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_checkpoint_verifies_preregistered_artifacts_sha_and_gate_results(self) -> None:
+        proposal = self.proposal()
+        proposal["checkpoint_artifacts"].append({"id": "zero-gpu-proof", "path": "artifacts/zero-gpu.json", "required": True})
+        proposal["pre_run_gates"] = [{
+            "id": "zero-gpu", "kind": "resource", "description": "preparation must use no GPU",
+            "required": True, "artifact_id": "zero-gpu-proof", "resource": "gpu", "operator": "max", "value": 0,
+        }, {
+            "id": "optional-audit", "kind": "manual", "description": "optional audit note",
+            "required": False, "artifact_id": "zero-gpu-proof",
+        }]
+        proposal["bash_policies"] = [
+            {"id": "prepare", "phase": "preparation", "executable": "python3", "fixed_args": ["prepare.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+            {"id": "workload", "phase": "workload", "executable": "python3", "fixed_args": ["run_eval.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+        ]
+        self.admit(proposal)
+        self.assertIsNone(self.pre("Bash", "python3 prepare.py"))
+        proof = self.project / "artifacts/zero-gpu.json"
+        proof.write_text('{"gpu": 0}\n', encoding="utf-8")
+        proof_result = {"id": "zero-gpu-proof", "path": "artifacts/zero-gpu.json", "sha256": goal_guard.file_hash(proof)}
+        gates = [{"id": "zero-gpu", "status": "PASS", "artifact_id": "zero-gpu-proof"}]
+        gate_payload = {"schema_version": 2, "experiment_id": "E001", "artifact_results": [proof_result], "pre_run_gate_results": gates}
+        self.record_gates(gate_payload)
+        self.record_gates(gate_payload)
+        changed_gates = gates + [{"id": "optional-audit", "status": "PASS", "artifact_id": "zero-gpu-proof"}]
+        with self.assertRaisesRegex(goal_guard.GuardError, "different replay"):
+            self.record_gates({**gate_payload, "pre_run_gate_results": changed_gates})
+        self.assertEqual("deny", self.pre("Bash", "python3 prepare.py")["hookSpecificOutput"]["permissionDecision"])
+        proof_patch = "*** Begin Patch\n*** Update File: artifacts/zero-gpu.json\n@@\n-{\"gpu\": 0}\n+{\"gpu\": 1}\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", proof_patch)["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("Bash", "python3 run_eval.py"))
+
+        result = self.result("E001")
+        result["artifact_results"].append(proof_result)
+        result["pre_run_gate_results"] = gates
+        bad = json.loads(json.dumps(result))
+        bad["artifact_results"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(goal_guard.GuardError, "SHA-256 mismatched"):
+            self.checkpoint(bad)
+        self.checkpoint(result)
+
+    def test_waiting_external_event_preserves_lease_deduplicates_wake_and_stops_polling(self) -> None:
+        proposal = self.proposal()
+        proposal["lease_phase"] = "workload"
+        proposal["checkpoint_artifacts"].append({"id": "terminal-event", "path": "artifacts/job-terminal.json", "required": True})
+        proposal["bash_policies"].append({
+            "id": "postflight", "phase": "postflight", "executable": "python3", "fixed_args": ["postflight.py"],
+            "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+        })
+        self.admit(proposal)
+        args = argparse.Namespace(project=str(self.project), event_key="job-122020", event_path="artifacts/job-terminal.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_wait(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("WAITING_EXTERNAL_EVENT", control["runtime"]["state"])
+        self.assertIn("remaining_seconds", control["active_lease"])
+        self.assertIsNone(self.pre("Bash", "cat optimization/STATE.md"))
+        self.assertEqual("deny", self.pre("Bash", "tail -f artifacts/job.log")["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", self.pre("apply_patch", "*** Begin Patch\n*** Add File: src/adjacent.py\n+x = 1\n*** End Patch")["hookSpecificOutput"]["permissionDecision"])
+        session = self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "resume"})
+        self.assertIn("end this activation", session["hookSpecificOutput"]["additionalContext"])
+
+        terminal = self.project / "artifacts/job-terminal.json"
+        terminal.write_text('{"state": "COMPLETED"}\n', encoding="utf-8")
+        original_proposal = (self.project / "optimization/PROPOSAL.json").read_text(encoding="utf-8")
+        drifted = json.loads(original_proposal)
+        drifted["hypothesis"] = "drift while waiting"
+        self.write_json("PROPOSAL.json", drifted)
+        with self.assertRaisesRegex(goal_guard.GuardError, "PROPOSAL.json changed"):
+            goal_guard.command_wake(args)
+        (self.project / "optimization/PROPOSAL.json").write_text(original_proposal, encoding="utf-8")
+        gate = json.loads((self.project / "optimization/GATE.json").read_text())
+        gate["enabled"] = False
+        self.write_json("GATE.json", gate)
+        with self.assertRaisesRegex(goal_guard.GuardError, "not activated"):
+            goal_guard.command_wake(args)
+        gate["enabled"] = True
+        self.write_json("GATE.json", gate)
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_wake(args)
+        self.assertIsNone(self.pre("Bash", "python3 postflight.py"))
+        terminal_patch = "*** Begin Patch\n*** Update File: artifacts/job-terminal.json\n@@\n-{\"state\": \"COMPLETED\"}\n+{\"state\": \"FAILED\"}\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", terminal_patch)["hookSpecificOutput"]["permissionDecision"])
+        duplicate = io.StringIO()
+        with contextlib.redirect_stdout(duplicate):
+            goal_guard.command_wake(args)
+        self.assertEqual("duplicate", duplicate.getvalue().strip())
+
+        terminal.write_text('{"state": "MUTATED_AFTER_WAKE"}\n', encoding="utf-8")
+        drifted_result = self.result("E001")
+        drifted_result["artifact_results"].append({"id": "terminal-event", "path": "artifacts/job-terminal.json", "sha256": goal_guard.file_hash(terminal)})
+        with self.assertRaisesRegex(goal_guard.GuardError, "frozen wake event"):
+            self.checkpoint(drifted_result)
+        terminal.write_text('{"state": "COMPLETED"}\n', encoding="utf-8")
+        result = self.result("E001")
+        result["artifact_results"].append({"id": "terminal-event", "path": "artifacts/job-terminal.json", "sha256": goal_guard.file_hash(terminal)})
+        gate["enabled"] = False
+        self.write_json("GATE.json", gate)
+        with self.assertRaisesRegex(goal_guard.GuardError, "not activated"):
+            self.checkpoint(result)
+        gate["enabled"] = True
+        self.write_json("GATE.json", gate)
+        self.checkpoint(result)
+        denial = self.pre("Bash", "python3 postflight.py")
+        self.assertIn("missing or expired", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_legacy_active_lease_remains_hook_and_checkpoint_compatible(self) -> None:
+        legacy_proposal = {"schema_version": 1, "experiment_id": "LEGACY-1", "review": {"decision": "ALLOW"}}
+        self.write_json("PROPOSAL.json", legacy_proposal)
+        lease = {
+            "schema_version": 1, "lease_id": "legacy", "experiment_id": "LEGACY-1", "chain_id": "C-legacy",
+            "allowed_paths": ["src"], "allowed_command_prefixes": ["python3 legacy.py"],
+            "issued_at": goal_guard.iso_time(goal_guard.utc_now()),
+            "expires_at": goal_guard.iso_time(goal_guard.utc_now() + goal_guard.timedelta(minutes=10)),
+            "max_mutations": 2, "mutations_used": 0, "finalization_used": False,
+            "final_discriminator": False, "goal_sha256": goal_guard.file_hash(self.project / "optimization/GOAL.md"),
+            "proposal_sha256": goal_guard.canonical_hash(legacy_proposal),
+        }
+        control = goal_guard.default_control()
+        control["active_lease"] = lease
+        control["chains"]["C-legacy"] = {
+            "chain_kind": "optimization", "parent_chain": None, "causal_bottleneck": "legacy",
+            "no_progress_count": 0, "non_core_cost_units": 0, "stopline_fired": False,
+            "final_discriminator_used": False, "closed": False, "close_outcome": None,
+        }
+        goal_guard.save_control(self.project, control)
+        self.assertIsNone(self.pre("Bash", "python3 legacy.py --small"))
+        legacy_result = {
+            "schema_version": 1, "experiment_id": "LEGACY-1", "valid": True,
+            "evaluation_integrity": "PASS", "core_progress": False, "metric_delta": "0",
+            "outcome": "zero_progress", "decision": "CONTINUE", "artifact": "legacy-report",
+        }
+        self.checkpoint(legacy_result)
+        self.assertIsNone(goal_guard.load_control(self.project)["active_lease"])
 
     def test_goal_change_invalidates_lease(self) -> None:
         self.admit(self.proposal())
@@ -225,18 +476,18 @@ class GoalGuardTests(unittest.TestCase):
 
     def test_protected_contract_file_is_never_in_proposal_scope(self) -> None:
         proposal = self.proposal()
-        proposal["allowed_paths"] = ["optimization/GOAL.md"]
+        proposal["lease_mutations"] = [{"path": "optimization/GOAL.md", "scope": "exact", "operations": ["update"]}]
         with self.assertRaisesRegex(goal_guard.GuardError, "protected path"):
             self.admit(proposal)
 
     def test_compound_shell_and_interpreter_prefixes_are_rejected(self) -> None:
         proposal = self.proposal()
-        proposal["allowed_command_prefixes"] = ["bash -c"]
-        with self.assertRaisesRegex(goal_guard.GuardError, "interpreters"):
+        proposal["bash_policies"][0]["executable"] = "bash"
+        with self.assertRaisesRegex(goal_guard.GuardError, "non-shell"):
             self.admit(proposal)
         self.admit(self.proposal())
         denial = self.pre("Bash", "python3 run_eval.py && python3 unrelated.py")
-        self.assertIn("compound shell", denial["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn("structured lease policy", denial["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertEqual("deny", self.pre("Bash", "python3 run_eval.py-malicious")["hookSpecificOutput"]["permissionDecision"])
 
     def test_read_only_prefix_cannot_hide_a_compound_mutation(self) -> None:
@@ -415,7 +666,7 @@ class GoalGuardTests(unittest.TestCase):
             external = Path(external_raw)
             (self.project / "src/link").symlink_to(external, target_is_directory=True)
             proposal = self.proposal()
-            proposal["allowed_paths"] = ["src/link"]
+            proposal["lease_mutations"] = [{"path": "src/link", "scope": "tree", "operations": ["add", "update"]}]
             with self.assertRaisesRegex(goal_guard.GuardError, "Symbolic|symbolic"):
                 self.admit(proposal)
             self.admit(self.proposal())

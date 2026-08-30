@@ -19,6 +19,8 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
+PROPOSAL_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 2
 CONTROLLER_PATH = Path(__file__).resolve()
 GATE_REL = Path("optimization/GATE.json")
 CONTROL_REL = Path("optimization/CONTROL.json")
@@ -26,20 +28,23 @@ GOAL_REL = Path("optimization/GOAL.md")
 STATE_REL = Path("optimization/STATE.md")
 PROPOSAL_REL = Path("optimization/PROPOSAL.json")
 RESULT_REL = Path("optimization/RESULT.json")
+PRE_RUN_RESULTS_REL = Path("optimization/PRE_RUN_RESULTS.json")
 EXPERIMENTS_REL = Path("optimization/EXPERIMENTS.md")
 BACKLOG_REL = Path("optimization/BACKLOG.md")
-ALWAYS_LEASE_PATHS = (STATE_REL, RESULT_REL, EXPERIMENTS_REL, BACKLOG_REL)
+ALWAYS_LEASE_PATHS = (STATE_REL, RESULT_REL, PRE_RUN_RESULTS_REL, EXPERIMENTS_REL, BACKLOG_REL)
 FINALIZATION_PATHS = (STATE_REL, RESULT_REL, EXPERIMENTS_REL)
-PROTECTED_PATHS = (GOAL_REL, GATE_REL, CONTROL_REL)
+PROTECTED_PATHS = (GOAL_REL, GATE_REL, CONTROL_REL, PROPOSAL_REL)
 DECISIONS = {"CONTINUE", "REPLICATE", "SWITCH", "ROLLBACK", "PAUSE_REQUIRED", "COMPLETE"}
 OUTCOMES = {"positive", "negative", "zero_progress", "inconclusive", "invalid"}
 CHAIN_KINDS = {"optimization", "diagnostic", "verification"}
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-PATCH_PATH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE)
+PATCH_DIRECTIVE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.MULTILINE)
 PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GPU_COMMAND_RE = re.compile(r"(?:^|[/_-])(nvidia-smi|torchrun|deepspeed)(?:$|\s)|\baccelerate\s+launch\b|CUDA_VISIBLE_DEVICES", re.I)
 POLL_RE = re.compile(r"\b(squeue|sacct|qstat|kubectl\s+get|docker\s+ps|systemctl\s+status|nvidia-smi|tail\b|ps\b)", re.I)
 READ_ONLY_PREFIXES = (
-    "pwd", "ls", "rg", "grep", "sed -n", "head", "tail", "wc", "stat", "sha256sum",
+    "pwd", "ls", "cat", "rg", "grep", "sed -n", "head", "tail", "wc", "stat", "sha256sum",
     "git status", "git diff", "git log", "git show", "git rev-parse", "git branch --show-current",
     "jq",
 )
@@ -150,7 +155,14 @@ def load_gate(project: Path) -> dict[str, Any]:
 
 
 def default_control() -> dict[str, Any]:
-    return {"schema_version": 1, "active_lease": None, "chains": {}, "poll": None, "last_checkpoint": None}
+    return {
+        "schema_version": 1,
+        "active_lease": None,
+        "chains": {},
+        "poll": None,
+        "last_checkpoint": None,
+        "runtime": {"state": "ACTIVE", "wait": None, "seen_events": []},
+    }
 
 
 def load_control(project: Path) -> dict[str, Any]:
@@ -162,6 +174,14 @@ def load_control(project: Path) -> dict[str, Any]:
         raise GuardError("unsupported CONTROL.json schema_version")
     if not isinstance(control.get("chains"), dict):
         raise GuardError("CONTROL.json chains must be an object")
+    if not isinstance(control.get("runtime"), dict):
+        control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": []}
+    runtime = control["runtime"]
+    runtime.setdefault("state", "ACTIVE")
+    runtime.setdefault("wait", None)
+    runtime.setdefault("seen_events", [])
+    if runtime["state"] not in {"ACTIVE", "WAITING_EXTERNAL_EVENT"} or not isinstance(runtime["seen_events"], list):
+        raise GuardError("CONTROL.json runtime state is invalid")
     return control
 
 
@@ -189,6 +209,13 @@ def ensure_id(value: Any, name: str) -> str:
     return text
 
 
+def ensure_sha256(value: Any, name: str) -> str:
+    text = ensure_text(value, name, maximum=64).casefold()
+    if SHA256_RE.fullmatch(text) is None:
+        raise GuardError(f"{name} must be a lowercase SHA-256 digest")
+    return text
+
+
 def normalize_relative(project: Path, raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise GuardError("allowed paths must be non-empty strings")
@@ -205,6 +232,30 @@ def normalize_relative(project: Path, raw: str) -> str:
         raise GuardError(f"proposal cannot authorize protected path: {relative}")
     reject_symlink_escape(project, normalized)
     return relative.as_posix()
+
+
+def normalize_project_path(project: Path, raw: str, *, allow_root: bool = False) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise GuardError("project paths must be non-empty strings")
+    candidate = Path(raw)
+    absolute = candidate if candidate.is_absolute() else project / candidate
+    normalized = Path(os.path.abspath(os.fspath(absolute)))
+    try:
+        relative = normalized.relative_to(project)
+    except ValueError as error:
+        raise GuardError(f"path escapes project: {raw}") from error
+    if relative == Path(".") and not allow_root:
+        raise GuardError(f"path is too broad: {raw}")
+    reject_symlink_escape(project, normalized)
+    return relative.as_posix()
+
+
+def normalize_cwd(project: Path, raw: str) -> str:
+    relative = normalize_project_path(project, raw, allow_root=True)
+    target = project if relative == "." else project / relative
+    if not target.is_dir():
+        raise GuardError(f"bash policy cwd must be an existing directory: {raw}")
+    return relative
 
 
 def reject_symlink_escape(project: Path, target: Path) -> None:
@@ -238,7 +289,10 @@ def current_lease(control: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(lease, dict):
         return None
     try:
-        expired = parse_time(str(lease["expires_at"])) <= utc_now()
+        if lease.get("suspended_at") and int(lease.get("remaining_seconds", 0)) > 0:
+            expired = False
+        else:
+            expired = parse_time(str(lease["expires_at"])) <= utc_now()
     except (KeyError, TypeError, ValueError):
         expired = True
     return None if expired else lease
@@ -250,12 +304,202 @@ def validate_review_attestation(review: Any) -> dict[str, str]:
     reviewer = ensure_text(review.get("reviewer"), "review.reviewer", maximum=120)
     if not reviewer.startswith(("subagent:", "user:")):
         raise GuardError("review attestation must identify a fresh subagent or user")
-    return {"decision": "ALLOW", "reviewer": reviewer, "reason": ensure_text(review.get("reason"), "review.reason")}
+    checks = review.get("checks")
+    required_checks = {"evidence_sufficient", "lease_mutations_bounded", "pre_run_gates_sufficient", "mutation_not_required_before_admission"}
+    if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required_checks):
+        raise GuardError(f"review attestation must affirm checks: {sorted(required_checks)}")
+    return {
+        "decision": "ALLOW",
+        "reviewer": reviewer,
+        "reason": ensure_text(review.get("reason"), "review.reason"),
+        "checks": {name: True for name in sorted(required_checks)},
+    }
+
+
+def mutation_allows(path: str, operation: str, mutations: list[dict[str, Any]]) -> bool:
+    target = Path(path)
+    for mutation in mutations:
+        base = Path(mutation["path"])
+        in_scope = target == base or (mutation["scope"] == "tree" and base in target.parents)
+        if in_scope and operation in mutation["operations"]:
+            return True
+    return False
+
+
+def validate_existing_evidence(project: Path, raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        raise GuardError("existing_evidence must be a list")
+    evidence: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"existing_evidence[{index}] must be an object")
+        evidence_id = ensure_id(item.get("id"), f"existing_evidence[{index}].id")
+        if evidence_id in seen:
+            raise GuardError(f"duplicate existing evidence id: {evidence_id}")
+        seen.add(evidence_id)
+        path = normalize_project_path(project, item.get("path"))
+        target = project / path
+        if not target.is_file() or target.is_symlink():
+            raise GuardError(f"existing evidence must be a regular file: {path}")
+        digest = ensure_sha256(item.get("sha256"), f"existing_evidence[{index}].sha256")
+        if file_hash(target) != digest:
+            raise GuardError(f"existing evidence SHA-256 mismatch: {path}")
+        evidence.append({
+            "id": evidence_id,
+            "path": path,
+            "sha256": digest,
+            "claim": ensure_text(item.get("claim"), f"existing_evidence[{index}].claim"),
+        })
+    return evidence
+
+
+def validate_lease_mutations(project: Path, raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list) or not raw:
+        raise GuardError("lease_mutations must be a non-empty list")
+    mutations: list[dict[str, Any]] = []
+    allowed_operations = {"add", "update", "delete", "move"}
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"lease_mutations[{index}] must be an object")
+        path = normalize_relative(project, item.get("path"))
+        scope = item.get("scope")
+        if scope not in {"exact", "tree"}:
+            raise GuardError(f"lease_mutations[{index}].scope must be exact or tree")
+        raw_operations = item.get("operations")
+        if not isinstance(raw_operations, list) or not raw_operations:
+            raise GuardError(f"lease_mutations[{index}].operations must be a non-empty list")
+        operations = sorted(set(ensure_text(value, f"lease_mutations[{index}].operation", maximum=12).casefold() for value in raw_operations))
+        if any(value not in allowed_operations for value in operations):
+            raise GuardError(f"lease_mutations[{index}] has unsupported operations")
+        mutations.append({"path": path, "scope": scope, "operations": operations})
+    canonical = {(item["path"], item["scope"], tuple(item["operations"])) for item in mutations}
+    if len(canonical) != len(mutations):
+        raise GuardError("lease_mutations contains duplicate contracts")
+    return sorted(mutations, key=lambda item: (item["path"], item["scope"], item["operations"]))
+
+
+def validate_checkpoint_artifacts(project: Path, raw: Any, mutations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(raw, list) or not raw:
+        raise GuardError("checkpoint_artifacts must be a non-empty list")
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"checkpoint_artifacts[{index}] must be an object")
+        artifact_id = ensure_id(item.get("id"), f"checkpoint_artifacts[{index}].id")
+        if artifact_id in seen:
+            raise GuardError(f"duplicate checkpoint artifact id: {artifact_id}")
+        seen.add(artifact_id)
+        path = normalize_project_path(project, item.get("path"))
+        if Path(path) in PROTECTED_PATHS or Path(path) == RESULT_REL:
+            raise GuardError(f"checkpoint artifact path is protected or recursive: {path}")
+        if not (mutation_allows(path, "add", mutations) or mutation_allows(path, "update", mutations)):
+            raise GuardError(f"checkpoint artifact is outside lease_mutations: {path}")
+        artifacts.append({"id": artifact_id, "path": path, "required": item.get("required") is not False})
+    return artifacts
+
+
+def validate_pre_run_gates(raw: Any, artifact_ids: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise GuardError("pre_run_gates must be a list")
+    gates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"pre_run_gates[{index}] must be an object")
+        gate_id = ensure_id(item.get("id"), f"pre_run_gates[{index}].id")
+        if gate_id in seen:
+            raise GuardError(f"duplicate pre-run gate id: {gate_id}")
+        seen.add(gate_id)
+        kind = item.get("kind")
+        if kind not in {"resource", "command", "manual"}:
+            raise GuardError(f"pre_run_gates[{index}].kind is unsupported")
+        artifact_id = ensure_id(item.get("artifact_id"), f"pre_run_gates[{index}].artifact_id")
+        if artifact_id not in artifact_ids:
+            raise GuardError(f"pre-run gate references unknown checkpoint artifact: {artifact_id}")
+        gate: dict[str, Any] = {
+            "id": gate_id,
+            "kind": kind,
+            "description": ensure_text(item.get("description"), f"pre_run_gates[{index}].description"),
+            "required": item.get("required") is not False,
+            "artifact_id": artifact_id,
+        }
+        if kind == "resource":
+            resource = item.get("resource")
+            operator = item.get("operator")
+            if resource != "gpu" or operator not in {"eq", "max"}:
+                raise GuardError("resource pre-run gates currently support gpu with eq or max")
+            value = int(item.get("value"))
+            if not 0 <= value <= 64:
+                raise GuardError("GPU gate value must be 0..64")
+            gate.update({"resource": resource, "operator": operator, "value": value})
+        gates.append(gate)
+    return gates
+
+
+def validate_bash_policies(project: Path, raw: Any, mutations: list[dict[str, Any]], gates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(raw, list) or not raw:
+        raise GuardError("bash_policies must be a non-empty list")
+    gpu_limits = [int(gate["value"]) for gate in gates if gate["required"] and gate["kind"] == "resource" and gate["resource"] == "gpu"]
+    gpu_limit = min(gpu_limits) if gpu_limits else None
+    policies: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"bash_policies[{index}] must be an object")
+        policy_id = ensure_id(item.get("id"), f"bash_policies[{index}].id")
+        if policy_id in seen:
+            raise GuardError(f"duplicate Bash policy id: {policy_id}")
+        seen.add(policy_id)
+        executable = ensure_text(item.get("executable"), f"bash_policies[{index}].executable", maximum=160)
+        if re.search(r"\s|[;&|`<>]", executable) or Path(executable).name in {"sh", "bash", "zsh", "csh", "fish", "env"}:
+            raise GuardError("Bash policy executable must be one exact non-shell executable token")
+        raw_args = item.get("fixed_args")
+        if not isinstance(raw_args, list):
+            raise GuardError(f"bash_policies[{index}].fixed_args must be a list")
+        fixed_args = [ensure_text(value, f"bash_policies[{index}].fixed_arg", maximum=240) for value in raw_args]
+        if any(re.search(r"[\n;&|`<>]", value) for value in fixed_args):
+            raise GuardError("Bash fixed arguments cannot contain shell control characters")
+        phase = item.get("phase")
+        if phase not in {"preparation", "workload", "postflight", "evaluation"}:
+            raise GuardError(f"bash_policies[{index}].phase is unsupported")
+        cwd = normalize_cwd(project, item.get("cwd"))
+        raw_outputs = item.get("output_paths")
+        if not isinstance(raw_outputs, list):
+            raise GuardError(f"bash_policies[{index}].output_paths must be a list")
+        outputs = sorted(set(normalize_project_path(project, value) for value in raw_outputs))
+        for output in outputs:
+            if not (mutation_allows(output, "add", mutations) or mutation_allows(output, "update", mutations)):
+                raise GuardError(f"Bash output path is outside lease_mutations: {output}")
+            cwd_path = project if cwd == "." else project / cwd
+            output_argument = os.path.relpath(project / output, cwd_path)
+            if not any(argument == output_argument or argument.endswith("=" + output_argument) for argument in fixed_args):
+                raise GuardError(f"Bash output path must be frozen in fixed_args: {output}")
+        resources = item.get("resources")
+        if not isinstance(resources, dict):
+            raise GuardError(f"bash_policies[{index}].resources must be an object")
+        gpu = int(resources.get("gpu", 0))
+        if not 0 <= gpu <= 64:
+            raise GuardError("Bash policy GPU count must be 0..64")
+        command_text = " ".join([executable, *fixed_args])
+        if gpu_limit is not None and (gpu > gpu_limit or (gpu_limit == 0 and GPU_COMMAND_RE.search(command_text))):
+            raise GuardError(f"Bash policy {policy_id} conflicts with the pre-run GPU gate")
+        policies.append({
+            "id": policy_id,
+            "phase": phase,
+            "executable": executable,
+            "fixed_args": fixed_args,
+            "cwd": cwd,
+            "output_paths": outputs,
+            "resources": {"gpu": gpu},
+        })
+    return sorted(policies, key=lambda item: item["id"])
 
 
 def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
-    if proposal.get("schema_version") != SCHEMA_VERSION:
-        raise GuardError("unsupported proposal schema_version")
+    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
+        raise GuardError(f"proposal schema_version must be {PROPOSAL_SCHEMA_VERSION}")
     if isinstance(control.get("active_lease"), dict):
         raise GuardError("an experiment lease is still active or awaiting checkpoint")
     if state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
@@ -271,6 +515,17 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
     bottleneck = ensure_text(proposal.get("causal_bottleneck"), "causal_bottleneck")
     hypothesis = ensure_text(proposal.get("hypothesis"), "hypothesis")
     core_progress = ensure_text(proposal.get("core_progress_expected"), "core_progress_expected")
+    lease_phase = proposal.get("lease_phase")
+    if lease_phase not in {"preparation", "workload", "postflight", "synchronous"}:
+        raise GuardError("lease_phase must be preparation, workload, postflight, or synchronous")
+    existing_evidence = validate_existing_evidence(project, proposal.get("existing_evidence"))
+    lease_mutations = validate_lease_mutations(project, proposal.get("lease_mutations"))
+    for evidence in existing_evidence:
+        if any(mutation_allows(evidence["path"], operation, lease_mutations) for operation in ("add", "update", "delete", "move")):
+            raise GuardError(f"existing evidence cannot also be mutable under the lease: {evidence['path']}")
+    checkpoint_artifacts = validate_checkpoint_artifacts(project, proposal.get("checkpoint_artifacts"), lease_mutations)
+    pre_run_gates = validate_pre_run_gates(proposal.get("pre_run_gates"), {item["id"] for item in checkpoint_artifacts})
+    bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates)
     reviewer = validate_review_attestation(proposal.get("review"))
     parent = proposal.get("parent_chain")
     if parent is not None:
@@ -312,18 +567,6 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         ensure_text(next_paths["positive"], "next_paths.positive")
         ensure_text(next_paths["other"], "next_paths.other")
 
-    raw_paths = proposal.get("allowed_paths")
-    if not isinstance(raw_paths, list) or not raw_paths:
-        raise GuardError("allowed_paths must be a non-empty list")
-    allowed_paths = sorted(set(normalize_relative(project, item) for item in raw_paths))
-    raw_prefixes = proposal.get("allowed_command_prefixes")
-    if not isinstance(raw_prefixes, list) or not raw_prefixes:
-        raise GuardError("allowed_command_prefixes must be a non-empty list")
-    prefixes = [ensure_text(item, "allowed_command_prefix", maximum=240) for item in raw_prefixes]
-    if any(re.search(r"[\n;&|`<>]|\$\(", item) for item in prefixes):
-        raise GuardError("allowed command prefixes must be single-command prefixes")
-    if any(re.match(r"^(?:ba|z|c|fi)?sh\b|^env\b|^python3?\s+-c\b", item) for item in prefixes):
-        raise GuardError("shell interpreters, env, and inline Python cannot be allowed command prefixes")
     raw_tools = proposal.get("allowed_tool_names", [])
     if not isinstance(raw_tools, list):
         raise GuardError("allowed_tool_names must be a list")
@@ -355,8 +598,14 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "causal_bottleneck": bottleneck,
         "hypothesis": hypothesis,
         "core_progress_expected": core_progress,
-        "allowed_paths": allowed_paths,
-        "allowed_command_prefixes": prefixes,
+        "proposal_schema_version": PROPOSAL_SCHEMA_VERSION,
+        "lease_phase": lease_phase,
+        "existing_evidence": existing_evidence,
+        "lease_mutations": lease_mutations,
+        "checkpoint_artifacts": checkpoint_artifacts,
+        "pre_run_gates": pre_run_gates,
+        "pre_run_gate_results": None,
+        "bash_policies": bash_policies,
         "allowed_tool_names": [],
         "issued_at": iso_time(now),
         "expires_at": iso_time(now + timedelta(minutes=minutes)),
@@ -370,6 +619,7 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "review": reviewer,
         "goal_sha256": file_hash(project / GOAL_REL),
         "proposal_sha256": canonical_hash(proposal),
+        "proposal_file_sha256": file_hash(project / PROPOSAL_REL),
     }
 
 
@@ -384,6 +634,8 @@ def command_admit(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
+        if control["runtime"]["state"] != "ACTIVE":
+            raise GuardError("cannot admit while runtime is waiting for an external event")
         lease = validate_proposal(project, gate, control, proposal)
         chain = control["chains"].setdefault(lease["chain_id"], {
             "chain_kind": lease["chain_kind"], "parent_chain": lease["parent_chain"],
@@ -402,6 +654,185 @@ def command_admit(args: argparse.Namespace) -> int:
     return 0
 
 
+def verify_artifact_results(project: Path, lease: dict[str, Any], raw: Any, *, require_all: bool) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        raise GuardError("artifact_results must be a list")
+    contracts = {item["id"]: item for item in lease.get("checkpoint_artifacts", [])}
+    verified: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"artifact_results[{index}] must be an object")
+        artifact_id = ensure_id(item.get("id"), f"artifact_results[{index}].id")
+        if artifact_id in seen or artifact_id not in contracts:
+            raise GuardError(f"duplicate or unregistered checkpoint artifact: {artifact_id}")
+        seen.add(artifact_id)
+        path = normalize_project_path(project, item.get("path"))
+        if path != contracts[artifact_id]["path"]:
+            raise GuardError(f"checkpoint artifact path drifted for {artifact_id}")
+        digest = ensure_sha256(item.get("sha256"), f"artifact_results[{index}].sha256")
+        target = project / path
+        if target.is_symlink() or not target.is_file() or file_hash(target) != digest:
+            raise GuardError(f"checkpoint artifact missing, unsafe, or SHA-256 mismatched: {path}")
+        verified.append({"id": artifact_id, "path": path, "sha256": digest})
+    if require_all:
+        missing = sorted(item["id"] for item in contracts.values() if item["required"] and item["id"] not in seen)
+        if missing:
+            raise GuardError(f"required checkpoint artifacts are missing: {missing}")
+    return sorted(verified, key=lambda item: item["id"])
+
+
+def verify_gate_results(lease: dict[str, Any], raw: Any, artifacts: list[dict[str, str]]) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        raise GuardError("pre_run_gate_results must be a list")
+    contracts = {item["id"]: item for item in lease.get("pre_run_gates", [])}
+    artifact_ids = {item["id"] for item in artifacts}
+    verified: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"pre_run_gate_results[{index}] must be an object")
+        gate_id = ensure_id(item.get("id"), f"pre_run_gate_results[{index}].id")
+        if gate_id in seen or gate_id not in contracts:
+            raise GuardError(f"duplicate or unregistered pre-run gate result: {gate_id}")
+        seen.add(gate_id)
+        status = item.get("status")
+        if status not in {"PASS", "FAIL"}:
+            raise GuardError(f"pre-run gate {gate_id} status must be PASS or FAIL")
+        artifact_id = ensure_id(item.get("artifact_id"), f"pre_run_gate_results[{index}].artifact_id")
+        if artifact_id != contracts[gate_id]["artifact_id"] or artifact_id not in artifact_ids:
+            raise GuardError(f"pre-run gate {gate_id} lacks its preregistered verified artifact")
+        verified.append({"id": gate_id, "status": status, "artifact_id": artifact_id})
+    missing = sorted(item["id"] for item in contracts.values() if item["required"] and item["id"] not in seen)
+    failed = sorted(item["id"] for item in verified if contracts[item["id"]]["required"] and item["status"] != "PASS")
+    if missing or failed:
+        raise GuardError(f"required pre-run gates missing or failed: missing={missing}, failed={failed}")
+    return sorted(verified, key=lambda item: item["id"])
+
+
+def command_gates(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    results_path = Path(args.results).resolve()
+    if results_path != (project / PRE_RUN_RESULTS_REL).resolve():
+        raise GuardError("gate recording must use optimization/PRE_RUN_RESULTS.json")
+    payload = load_json(results_path)
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+            raise GuardError("cannot record pre-run gates while waiting for an external event")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict) or current_lease(control) is None:
+            raise GuardError("a live experiment lease is required")
+        verify_frozen_lease(project, lease)
+        if payload.get("schema_version") != RESULT_SCHEMA_VERSION or payload.get("experiment_id") != lease["experiment_id"]:
+            raise GuardError("pre-run result schema or experiment_id does not match active lease")
+        artifacts = verify_artifact_results(project, lease, payload.get("artifact_results"), require_all=False)
+        gates = verify_gate_results(lease, payload.get("pre_run_gate_results"), artifacts)
+        existing = lease.get("pre_run_gate_results")
+        if isinstance(existing, dict):
+            if canonical_hash({"gates": gates, "artifacts": artifacts}) != canonical_hash({"gates": existing.get("gates"), "artifacts": existing.get("artifacts")}):
+                raise GuardError("pre-run gate results are already frozen and a different replay is rejected")
+            print(json.dumps(existing, ensure_ascii=False, indent=2))
+            return 0
+        lease["pre_run_gate_results"] = {"gates": gates, "artifacts": artifacts, "recorded_at": iso_time(utc_now())}
+        control["active_lease"] = lease
+        save_control(project, control)
+    print(json.dumps(lease["pre_run_gate_results"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_wait(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+            raise GuardError("runtime is already waiting for an external event")
+        lease = current_lease(control)
+        if lease is None:
+            raise GuardError("a live experiment lease is required before waiting")
+        verify_frozen_lease(project, lease)
+        if lease.get("wake_event") is not None:
+            raise GuardError("this lease already consumed its one terminal wake event")
+        event_key = ensure_id(args.event_key, "event_key")
+        event_path = normalize_project_path(project, args.event_path)
+        event_contracts = {item["path"]: item for item in lease.get("checkpoint_artifacts", [])}
+        if event_path not in event_contracts or not event_contracts[event_path].get("required"):
+            raise GuardError("wait event path must be a required preregistered checkpoint artifact")
+        event_file = project / event_path
+        baseline = file_hash(event_file) if event_file.is_file() and not event_file.is_symlink() else None
+        remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
+        lease["suspended_at"] = iso_time(utc_now())
+        lease["remaining_seconds"] = remaining
+        control["active_lease"] = lease
+        control["runtime"]["state"] = "WAITING_EXTERNAL_EVENT"
+        control["runtime"]["wait"] = {
+            "event_key": event_key,
+            "event_path": event_path,
+            "baseline_sha256": baseline,
+            "entered_at": iso_time(utc_now()),
+        }
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(control["runtime"]["wait"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_wake(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        event_key = ensure_id(args.event_key, "event_key")
+        event_path = normalize_project_path(project, args.event_path)
+        event_file = project / event_path
+        if event_file.is_symlink() or not event_file.is_file():
+            raise GuardError("wake event file must be a regular file")
+        digest = file_hash(event_file)
+        seen = control["runtime"].get("seen_events", [])
+        if any(item.get("event_key") == event_key and item.get("sha256") == digest for item in seen if isinstance(item, dict)):
+            print("duplicate")
+            return 0
+        wait = control["runtime"].get("wait")
+        if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
+            raise GuardError("runtime is not waiting for an external event")
+        if event_key != wait.get("event_key") or event_path != wait.get("event_path"):
+            raise GuardError("wake event does not match the registered wait contract")
+        if digest == wait.get("baseline_sha256"):
+            raise GuardError("wake event is unchanged from the waiting baseline")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict):
+            raise GuardError("waiting runtime lost its active lease")
+        verify_frozen_lease(project, lease)
+        artifact_contract = next((item for item in lease.get("checkpoint_artifacts", []) if item.get("path") == event_path), None)
+        if not isinstance(artifact_contract, dict):
+            raise GuardError("wake event lost its checkpoint artifact contract")
+        lease["wake_event"] = {
+            "event_key": event_key,
+            "artifact_id": artifact_contract["id"],
+            "path": event_path,
+            "sha256": digest,
+            "time": iso_time(utc_now()),
+        }
+        remaining = int(lease.pop("remaining_seconds", 0))
+        lease.pop("suspended_at", None)
+        lease["expires_at"] = iso_time(utc_now() + timedelta(seconds=max(1, remaining)))
+        control["active_lease"] = lease
+        seen.append({"event_key": event_key, "path": event_path, "sha256": digest, "time": iso_time(utc_now())})
+        control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": seen[-32:]}
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(control["runtime"], ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_checkpoint(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     result_path = Path(args.result).resolve()
@@ -410,12 +841,39 @@ def command_checkpoint(args: argparse.Namespace) -> int:
     result = load_json(result_path)
     with state_lock(project):
         gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
         control = load_control(project)
+        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+            raise GuardError("wake the registered external event before checkpoint")
         lease = control.get("active_lease")
         if not isinstance(lease, dict):
             raise GuardError("no active lease to checkpoint")
-        if result.get("schema_version") != 1 or result.get("experiment_id") != lease["experiment_id"]:
+        verify_frozen_lease(project, lease)
+        structured = lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION
+        expected_result_schema = RESULT_SCHEMA_VERSION if structured else 1
+        if result.get("schema_version") != expected_result_schema or result.get("experiment_id") != lease["experiment_id"]:
             raise GuardError("result schema or experiment_id does not match active lease")
+        artifact_results: list[dict[str, str]] = []
+        gate_results: list[dict[str, str]] = []
+        if structured:
+            artifact_results = verify_artifact_results(project, lease, result.get("artifact_results"), require_all=True)
+            gate_results = verify_gate_results(lease, result.get("pre_run_gate_results"), artifact_results)
+            recorded_gates = lease.get("pre_run_gate_results")
+            if lease.get("pre_run_gates") and not isinstance(recorded_gates, dict):
+                raise GuardError("required pre-run gates were not recorded before workload execution")
+            if isinstance(recorded_gates, dict) and canonical_hash(gate_results) != canonical_hash(recorded_gates.get("gates")):
+                raise GuardError("checkpoint pre-run gate results drifted from the recorded gate decision")
+            if isinstance(recorded_gates, dict):
+                current_artifacts = {item["id"]: item for item in artifact_results}
+                for recorded in recorded_gates.get("artifacts", []):
+                    if current_artifacts.get(recorded["id"], {}).get("sha256") != recorded.get("sha256"):
+                        raise GuardError("pre-run gate evidence changed after gate recording")
+            wake_event = lease.get("wake_event")
+            if isinstance(wake_event, dict):
+                wake_artifact = next((item for item in artifact_results if item["id"] == wake_event.get("artifact_id")), None)
+                if not isinstance(wake_artifact, dict) or wake_artifact.get("path") != wake_event.get("path") or wake_artifact.get("sha256") != wake_event.get("sha256"):
+                    raise GuardError("checkpoint terminal artifact does not match the frozen wake event")
         decision = result.get("decision")
         outcome = result.get("outcome")
         if decision not in DECISIONS or outcome not in OUTCOMES:
@@ -433,7 +891,11 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         if lease.get("final_discriminator") and decision in {"CONTINUE", "REPLICATE"}:
             raise GuardError("a final discriminator must close or switch the diagnostic chain")
         ensure_text(result.get("metric_delta"), "metric_delta")
-        ensure_text(result.get("artifact"), "artifact")
+        primary_artifact = ensure_text(result.get("artifact"), "artifact")
+        if structured:
+            primary_artifact = normalize_project_path(project, primary_artifact)
+        if structured and primary_artifact not in {item["path"] for item in artifact_results}:
+            raise GuardError("primary artifact is not a verified preregistered checkpoint artifact")
         chain = control["chains"][lease["chain_id"]]
         if valid and core_progress:
             chain["no_progress_count"] = 0
@@ -454,7 +916,8 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         control["last_checkpoint"] = {
             "experiment_id": lease["experiment_id"], "chain_id": lease["chain_id"],
             "decision": decision, "outcome": outcome, "core_progress": core_progress,
-            "time": iso_time(utc_now()), "artifact": result["artifact"],
+            "time": iso_time(utc_now()), "artifact": primary_artifact,
+            "artifact_results": artifact_results, "pre_run_gate_results": gate_results,
         }
         control["active_lease"] = None
         control["poll"] = None
@@ -505,6 +968,7 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "lease_expires_at": lease.get("expires_at") if lease else None,
         "lease_valid": lease_valid if lease else None,
         "mutations": f"{lease.get('mutations_used')}/{lease.get('max_mutations')}" if lease else None,
+        "runtime": {"state": control.get("runtime", {}).get("state", "ACTIVE"), "wait": control.get("runtime", {}).get("wait")},
         "chains": {key: {field: value.get(field) for field in ("no_progress_count", "stopline_fired", "closed", "close_outcome")} for key, value in chains.items()},
         "last_checkpoint": control.get("last_checkpoint"),
     }
@@ -536,11 +1000,28 @@ def relative_tool_path(project: Path, cwd: Path, raw: str) -> Path:
     return relative
 
 
-def patch_paths(project: Path, cwd: Path, patch: str) -> list[Path]:
-    raw_paths = PATCH_PATH_RE.findall(patch) + PATCH_MOVE_RE.findall(patch)
-    if not raw_paths:
+def patch_mutations(project: Path, cwd: Path, patch: str) -> list[tuple[Path, str]]:
+    directives = list(PATCH_DIRECTIVE_RE.finditer(patch))
+    if not directives:
         raise GuardError("cannot determine apply_patch target paths")
-    return [relative_tool_path(project, cwd, raw) for raw in raw_paths]
+    mutations: list[tuple[Path, str]] = []
+    for index, directive in enumerate(directives):
+        action = directive.group(1).casefold()
+        source = relative_tool_path(project, cwd, directive.group(2))
+        end = directives[index + 1].start() if index + 1 < len(directives) else len(patch)
+        move = PATCH_MOVE_RE.search(patch, directive.end(), end)
+        if move:
+            if action != "update":
+                raise GuardError("apply_patch Move to is valid only with Update File")
+            mutations.append((source, "move"))
+            mutations.append((relative_tool_path(project, cwd, move.group(1)), "move"))
+        else:
+            mutations.append((source, action))
+    return mutations
+
+
+def patch_paths(project: Path, cwd: Path, patch: str) -> list[Path]:
+    return [path for path, _operation in patch_mutations(project, cwd, patch)]
 
 
 def path_allowed(path: Path, allowed: list[str]) -> bool:
@@ -549,6 +1030,46 @@ def path_allowed(path: Path, allowed: list[str]) -> bool:
         if path == base or base in path.parents:
             return True
     return False
+
+
+def verify_frozen_lease(project: Path, lease: dict[str, Any]) -> None:
+    if file_hash(project / GOAL_REL) != lease.get("goal_sha256"):
+        raise GuardError("GOAL.md changed after admission; the lease is invalid and must be reviewed again")
+    if lease.get("proposal_file_sha256") and file_hash(project / PROPOSAL_REL) != lease.get("proposal_file_sha256"):
+        raise GuardError("PROPOSAL.json changed after admission; the lease is invalid")
+    if lease.get("proposal_sha256") and canonical_hash(load_json(project / PROPOSAL_REL)) != lease.get("proposal_sha256"):
+        raise GuardError("PROPOSAL.json semantics changed after admission; the lease is invalid")
+    for evidence in lease.get("existing_evidence", []):
+        target = project / str(evidence["path"])
+        if target.is_symlink() or not target.is_file() or file_hash(target) != evidence.get("sha256"):
+            raise GuardError(f"frozen existing evidence changed after admission: {evidence.get('path')}")
+    recorded = lease.get("pre_run_gate_results")
+    if isinstance(recorded, dict):
+        for artifact in recorded.get("artifacts", []):
+            target = project / str(artifact["path"])
+            if target.is_symlink() or not target.is_file() or file_hash(target) != artifact.get("sha256"):
+                raise GuardError(f"recorded pre-run gate evidence changed: {artifact.get('path')}")
+    wake_event = lease.get("wake_event")
+    if isinstance(wake_event, dict):
+        target = project / str(wake_event["path"])
+        if target.is_symlink() or not target.is_file() or file_hash(target) != wake_event.get("sha256"):
+            raise GuardError(f"frozen wake event evidence changed: {wake_event.get('path')}")
+
+
+def matching_bash_policy(project: Path, cwd: Path, command: str, lease: dict[str, Any]) -> dict[str, Any] | None:
+    if re.search(r"[\n;&|`<>]|\$\(", command):
+        return None
+    try:
+        tokens = shlex.split(command)
+        actual_cwd = normalize_cwd(project, os.fspath(cwd))
+    except (ValueError, GuardError):
+        return None
+    if not tokens:
+        return None
+    for policy in lease.get("bash_policies", []):
+        if tokens == [policy["executable"], *policy["fixed_args"]] and actual_cwd == policy["cwd"]:
+            return policy
+    return None
 
 
 def is_controller_command(command: str) -> bool:
@@ -564,7 +1085,7 @@ def is_controller_command(command: str) -> bool:
         script = Path(tokens[1]).resolve(strict=True)
     except OSError:
         return False
-    return script == CONTROLLER_PATH and tokens[2] in {"status", "admit", "checkpoint", "activate", "deactivate"}
+    return script == CONTROLLER_PATH and tokens[2] in {"status", "admit", "gates", "wait", "wake", "checkpoint", "activate", "deactivate"}
 
 
 def is_read_only_mcp(tool_name: str) -> bool:
@@ -584,12 +1105,16 @@ def is_read_only_command(command: str) -> bool:
 
 
 def lease_error(project: Path, gate: dict[str, Any], control: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT":
+        return None, "runtime is WAITING_EXTERNAL_EVENT; do not mutate or poll until a deduplicated wake event arrives"
     raw = control.get("active_lease")
     lease = current_lease(control)
     if lease is None:
         return None, "experiment lease is missing or expired; obtain a fresh review-attested lease before mutating work"
-    if file_hash(project / GOAL_REL) != lease.get("goal_sha256"):
-        return None, "GOAL.md changed after admission; the lease is invalid and must be reviewed again"
+    try:
+        verify_frozen_lease(project, lease)
+    except GuardError as error:
+        return None, str(error)
     if state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
         return None, "STATE.md exceeds its cap; compact the frontier before more work"
     if int(lease.get("mutations_used", 0)) >= int(lease.get("max_mutations", 0)):
@@ -607,6 +1132,15 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
     else:
         command = str(tool_input.get("command", ""))
     cwd = Path(str(event.get("cwd", project)))
+    waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+    if waiting:
+        if tool == "Bash" and is_controller_command(command):
+            return None
+        if tool == "Bash" and is_read_only_command(command) and not POLL_RE.search(command):
+            return None
+        if isinstance(tool, str) and tool.startswith("mcp__") and is_read_only_mcp(tool):
+            return None
+        return deny("runtime is WAITING_EXTERNAL_EVENT; only non-polling inspection or the registered wake event is allowed")
     if tool == "Bash" and (is_controller_command(command) or is_read_only_command(command)):
         poll = control.get("poll")
         if poll and poll.get("blocked_command_sha256") == hashlib.sha256(command.strip().encode()).hexdigest():
@@ -616,7 +1150,8 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
         return None
     if tool == "apply_patch":
         try:
-            targets = patch_paths(project, cwd, command)
+            patch_targets = patch_mutations(project, cwd, command)
+            targets = [path for path, _operation in patch_targets]
         except GuardError as error:
             return deny(str(error))
         raw_lease = control.get("active_lease")
@@ -643,20 +1178,48 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
         return deny(error or "invalid experiment lease")
     if tool == "apply_patch":
         try:
-            targets = patch_paths(project, cwd, command)
+            patch_targets = patch_mutations(project, cwd, command)
+            targets = [path for path, _operation in patch_targets]
         except GuardError as exc:
             return deny(str(exc))
-        allowed = list(lease["allowed_paths"]) + [path.as_posix() for path in ALWAYS_LEASE_PATHS]
-        blocked = [path.as_posix() for path in targets if not path_allowed(path, allowed)]
+        if lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION:
+            blocked = [
+                f"{path.as_posix()}:{operation}"
+                for path, operation in patch_targets
+                if path not in ALWAYS_LEASE_PATHS and not mutation_allows(path.as_posix(), operation, lease.get("lease_mutations", []))
+            ]
+        else:
+            legacy_allowed = list(lease.get("allowed_paths", [])) + [path.as_posix() for path in ALWAYS_LEASE_PATHS]
+            blocked = [path.as_posix() for path in targets if not path_allowed(path, legacy_allowed)]
         if blocked:
             return deny(f"patch targets are outside the admitted lease: {blocked}")
         if any(path in PROTECTED_PATHS for path in targets):
             return deny("contract and gate-control files cannot be changed under an experiment lease")
+        recorded_gate_paths = {
+            Path(item["path"])
+            for item in (lease.get("pre_run_gate_results") or {}).get("artifacts", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
+        if any(path in recorded_gate_paths for path in targets):
+            return deny("recorded pre-run gate evidence is frozen for the remainder of the lease")
+        wake_event = lease.get("wake_event")
+        if isinstance(wake_event, dict) and any(path.as_posix() == wake_event.get("path") for path in targets):
+            return deny("terminal wake event evidence is frozen for the remainder of the lease")
     elif tool == "Bash":
-        if re.search(r"[\n;&|`<>]|\$\(", command):
-            return deny("compound shell commands and redirections are outside a bounded lease; use one reviewed wrapper command")
-        if not any(command.strip() == prefix or command.strip().startswith(prefix + " ") for prefix in lease["allowed_command_prefixes"]):
-            return deny("Bash command is outside the admitted command prefixes")
+        if lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION:
+            policy = matching_bash_policy(project, cwd, command, lease)
+            if policy is None:
+                return deny("Bash command, fixed arguments, or cwd is outside the structured lease policy")
+            required_gates = [gate for gate in lease.get("pre_run_gates", []) if gate.get("required")]
+            if policy["phase"] != "preparation" and required_gates and lease.get("pre_run_gate_results") is None:
+                return deny("required pre-run gates are not recorded; run the controller gates command before workload or postflight")
+            if policy["phase"] == "preparation" and lease.get("pre_run_gate_results") is not None:
+                return deny("preparation phase is closed after pre-run gates are recorded")
+            wake_event = lease.get("wake_event")
+            if isinstance(wake_event, dict) and wake_event.get("path") in policy.get("output_paths", []):
+                return deny("structured Bash output would overwrite frozen terminal wake evidence")
+        elif re.search(r"[\n;&|`<>]|\$\(", command) or not any(command.strip() == prefix or command.strip().startswith(prefix + " ") for prefix in lease.get("allowed_command_prefixes", [])):
+            return deny("Bash command is outside the legacy admitted command prefixes")
     elif isinstance(tool, str) and tool.startswith("mcp__"):
         return deny("mutating or unknown MCP tools fail closed; use apply_patch or an admitted Bash command with enforceable scope")
     lease["mutations_used"] = int(lease["mutations_used"]) + 1
@@ -703,7 +1266,9 @@ def command_hook() -> int:
             output: dict[str, Any] | None = None
             if name == "SessionStart":
                 status = compact_status(project, gate, control, session_frontier_only=True)
-                output = hook_context("Goal Guardrails enforcement is active. Current gate status: " + json.dumps(status, ensure_ascii=False, separators=(",", ":")) + ". Do not self-attest proposals; obtain a fresh subagent or user review before admission. The controller validates attestation shape, not reviewer identity.")
+                waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+                suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived." if waiting else ""
+                output = hook_context("Goal Guardrails enforcement is active. Current gate status: " + json.dumps(status, ensure_ascii=False, separators=(",", ":")) + ". Do not self-attest proposals; obtain a fresh subagent or user review before admission. The controller validates attestation shape, not reviewer identity." + suffix)
             elif name == "PreToolUse":
                 output = hook_pre_tool(project, event, gate, control)
             elif name == "PostToolUse":
@@ -733,6 +1298,17 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("result")
     checkpoint.add_argument("--project")
+    gates = sub.add_parser("gates")
+    gates.add_argument("results")
+    gates.add_argument("--project")
+    wait = sub.add_parser("wait")
+    wait.add_argument("--event-key", required=True)
+    wait.add_argument("--event-path", required=True)
+    wait.add_argument("--project")
+    wake = sub.add_parser("wake")
+    wake.add_argument("--event-key", required=True)
+    wake.add_argument("--event-path", required=True)
+    wake.add_argument("--project")
     for name in ("activate", "deactivate"):
         item = sub.add_parser(name)
         item.add_argument("--project")
@@ -750,6 +1326,12 @@ def main(argv: list[str] | None = None) -> int:
             return command_status(args)
         if args.command == "admit":
             return command_admit(args)
+        if args.command == "gates":
+            return command_gates(args)
+        if args.command == "wait":
+            return command_wait(args)
+        if args.command == "wake":
+            return command_wake(args)
         if args.command == "checkpoint":
             return command_checkpoint(args)
         if args.command == "activate":
