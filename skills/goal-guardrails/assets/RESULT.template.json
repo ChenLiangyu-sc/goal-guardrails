@@ -13,5 +13,6 @@
   ],
   "pre_run_gate_results": [
     {"id": "TODO", "status": "TODO: PASS | FAIL", "artifact_id": "TODO"}
-  ]
+  ],
+  "external_monitor_results": []
 }

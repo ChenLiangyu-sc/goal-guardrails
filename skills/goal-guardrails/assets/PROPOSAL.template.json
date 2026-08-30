@@ -20,9 +20,11 @@
   "pre_run_gates": [
     {"id": "zero-gpu", "kind": "resource", "description": "TODO", "required": true, "artifact_id": "TODO", "resource": "gpu", "operator": "max", "value": 0}
   ],
+  "runtime_bindings": [],
   "bash_policies": [
-    {"id": "prepare", "phase": "preparation", "executable": "TODO", "fixed_args": ["TODO"], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}}
+    {"id": "prepare", "phase": "preparation", "executable": "TODO", "argv": [{"literal": "TODO"}], "cwd": ".", "output_paths": ["TODO"], "resources": {"gpu": 0}}
   ],
+  "external_monitors": [],
   "expires_minutes": 60,
   "max_mutations": 12,
   "work_class": "core",
@@ -37,6 +39,7 @@
       "evidence_sufficient": true,
       "lease_mutations_bounded": true,
       "pre_run_gates_sufficient": true,
+      "preflight_failure_closure_reviewed": true,
       "mutation_not_required_before_admission": true
     }
   }

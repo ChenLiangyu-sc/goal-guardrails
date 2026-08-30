@@ -46,7 +46,7 @@ Rank candidates lexicographically instead of inventing precise confidence scores
 
 ## Obtain and enforce one lease
 
-Put the selected experiment in schema-v2 `optimization/PROPOSAL.json`. Declare and freeze `existing_evidence`, future `lease_mutations`, `checkpoint_artifacts`, `pre_run_gates`, and structured `bash_policies`. Every proposal requires one fresh read-only subagent or user review at the experiment boundary. The reviewer confirms evidence sufficiency, bounded lease mutations, sufficient pre-run gates, and that mutation is expected only after admission. The reviewer must not demand that planned mutations already exist. The controller records this as a behavioral attestation and validates its shape; it does not authenticate the reviewer identity.
+Put the selected experiment in schema-v2 `optimization/PROPOSAL.json`. Declare and freeze `existing_evidence`, future `lease_mutations`, `checkpoint_artifacts`, `pre_run_gates`, and structured `bash_policies`. Prefer ordered `argv` literal tokens; use binding tokens only for controller-frozen runtime values. Every proposal requires one fresh read-only subagent or user review at the experiment boundary. The reviewer confirms evidence sufficiency, bounded lease mutations, sufficient pre-run gates, and that mutation is expected only after admission. The reviewer must not demand that planned mutations already exist. The controller records this as a behavioral attestation and validates its shape; it does not authenticate the reviewer identity.
 
 After `ALLOW`, use the bundled controller to admit the proposal. A proposal is rejected deterministically when another lease is active, state exceeds its cap, the same causal bottleneck is renamed, a chain is closed, its stop line fired without an unused final discriminator, non-core allowance is exhausted, or the proposal attempts to authorize protected control files.
 
@@ -88,13 +88,68 @@ Keep the audit short:
 
 Update `STATE.md` by replacement, not accumulation, and keep it within the contract's nonblank-line cap. Append one concise fact row to `EXPERIMENTS.md`. Store raw metrics and logs in project artifacts, not in the state file. Repeated polling, recovery, identity checks, and unchanged status must not create narrative state growth or reset a no-progress counter.
 
-Before workload or postflight commands, record required gate results and their preregistered evidence through `PRE_RUN_RESULTS.json`. Write the machine-readable outcome to schema-v2 `RESULT.json`, including every required artifact's preregistered path, current SHA-256, and the unchanged gate results. The controller verifies the evidence contract and updates the chain counter; it does not infer whether a model or other business metric is good. Do not edit `CONTROL.json` manually. If Markdown evidence and controller state disagree, pause and reconcile from the frozen evaluator artifact rather than selecting the more favorable record.
+Before workload or postflight commands, record required gate results and their preregistered evidence through `PRE_RUN_RESULTS.json`. A required `FAIL` is frozen as a legitimate preflight outcome: workload and ordinary mutation stay denied, the evidence cannot be overwritten or replayed as `PASS`, and only `RESULT.json` may be staged or corrected. Only a checkpoint with exact `valid=false`, `evaluation_integrity=FAIL`, `core_progress=false`, `outcome=invalid`, and `decision=PAUSE_REQUIRED` fields may release the lease. A malformed result rejected by checkpoint may be corrected without a new review. The result may contain only the verified gate artifacts rather than future workload artifacts; a valid checkpoint keeps the causal chain open and requires a fresh review before another admission. On PASS, write the machine-readable outcome to schema-v2 `RESULT.json`, including every required artifact's preregistered path, current SHA-256, and the unchanged gate results. The controller verifies the evidence contract and updates the chain counter; it does not infer whether a model or other business metric is good. Do not edit `CONTROL.json` manually. If Markdown evidence and controller state disagree, pause and reconcile from the frozen evaluator artifact rather than selecting the more favorable record.
 
 ## Wait for an external event
 
 For a healthy asynchronous workload, use `WAITING_EXTERNAL_EVENT` after launch. Register a stable event key and a preregistered terminal artifact. The controller suspends the active lease clock, denies mutation and status polling, permits ordinary non-polling inspection, and instructs repeated Goal activations to end immediately. A wake is accepted only when the same artifact has a new SHA-256; repeated identical events are deduplicated. The accepted terminal SHA is then immutable and must match checkpoint. Wake the same lease for postflight and checkpoint instead of creating monitoring-only leases.
 
 This is a plugin execution state, not a Codex scheduler control API. It cannot disable generic Goal activation or configure an event bridge. If the surrounding runtime cannot honor the waiting instruction or deliver a terminal artifact, report that integration limitation rather than marking the optimization blocked or weakening the quality gate.
+
+### External monitor evidence
+
+Use an external monitor contract instead of a project relay when the monitor owns immutable evidence outside the repository. Admission must freeze:
+
+- one `slurm_job_id` runtime binding and its one-shot capture policy;
+- a monitor-start policy whose ordered argv contains that binding;
+- provider and contract version, state root, host, expected scheduler owner, job name, and partition.
+
+The fresh reviewer must additionally attest `external_monitor_contract_bounded=true`, covering the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary.
+
+The relevant proposal fields have this shape; keep the executable paths and literal arguments specific to the installed monitor:
+
+```json
+{
+  "runtime_bindings": [
+    {"id": "slurm-job", "kind": "slurm_job_id", "source_policy_id": "submit-slurm", "required": true}
+  ],
+  "bash_policies": [
+    {
+      "id": "submit-slurm", "phase": "workload", "executable": "sbatch",
+      "argv": [{"literal": "--parsable"}, {"literal": "train.sbatch"}],
+      "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+      "capture_binding": "slurm-job", "max_uses": 1, "timeout_seconds": 120
+    },
+    {
+      "id": "start-monitor", "phase": "workload", "executable": "python3",
+      "argv": [
+        {"literal": "/absolute/supervise_slurm_job.py"}, {"literal": "start"}, {"binding": "slurm-job"},
+        {"literal": "--host"}, {"literal": "hpc142"},
+        {"literal": "--state-dir"}, {"literal": "/home/USER/.cache/codex-hpc-monitor"},
+        {"literal": "--expected-owner"}, {"literal": "USER"},
+        {"literal": "--expected-job-name"}, {"literal": "JOB"},
+        {"literal": "--expected-partition"}, {"literal": "PARTITION"}
+      ],
+      "cwd": ".", "output_paths": [], "resources": {"gpu": 0}
+    }
+  ],
+  "external_monitors": [
+    {
+      "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": 1,
+      "binding_id": "slurm-job", "start_policy_id": "start-monitor",
+      "state_root": "/home/USER/.cache/codex-hpc-monitor", "host": "hpc142",
+      "expected_owner": "USER", "expected_job_name": "JOB", "expected_partition": "PARTITION",
+      "required": true
+    }
+  ]
+}
+```
+
+Invoke `submit-bind --policy <id>` once. The controller executes the reviewed argv without a shell, parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt; use a fresh reviewed proposal rather than submitting again. Only controller-frozen values may fill binding tokens.
+
+After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge may publish only its private receipt and a semantic notification. It must not write the project or decide the business outcome.
+
+On notification, invoke `wake-monitor --monitor <id>`. The controller verifies the private artifact ownership and path, bridge receipt and manifest, frozen Job ID and run ID, terminal SHA and `terminal_verified=true`, monitor manifest, watcher verification, and scheduler identity. It then materializes one protected project receipt below `optimization/.goal-guardrails/receipts/`. Include that receipt and SHA in `RESULT.json.external_monitor_results`. The receipt proves scheduler observation only; the project finalizer, validator, and evaluator still determine evaluation integrity and core progress.
 
 Treat the mechanism as exhausted when its declared experiment, wall-clock, or consecutive-no-progress limit is reached. One final discriminator is admissible only when it changes exactly one variable, has a frozen end-to-end evaluator, and names mutually exclusive next paths in advance. A positive result may enter a separately named verification/promotion chain limited to replication and contract-required independent validation. A negative or zero-progress result must enter the named switch or rollback path. An inconclusive result or failed evaluation integrity must enter the named switch, rollback, or pause path. Every outcome closes the original diagnostic/patch chain and cannot authorize another experiment in it.
 

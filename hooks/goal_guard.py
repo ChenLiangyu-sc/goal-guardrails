@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -29,6 +31,8 @@ STATE_REL = Path("optimization/STATE.md")
 PROPOSAL_REL = Path("optimization/PROPOSAL.json")
 RESULT_REL = Path("optimization/RESULT.json")
 PRE_RUN_RESULTS_REL = Path("optimization/PRE_RUN_RESULTS.json")
+CONTROLLER_STATE_REL = Path("optimization/.goal-guardrails")
+RECEIPTS_REL = CONTROLLER_STATE_REL / "receipts"
 EXPERIMENTS_REL = Path("optimization/EXPERIMENTS.md")
 BACKLOG_REL = Path("optimization/BACKLOG.md")
 ALWAYS_LEASE_PATHS = (STATE_REL, RESULT_REL, PRE_RUN_RESULTS_REL, EXPERIMENTS_REL, BACKLOG_REL)
@@ -41,6 +45,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 PATCH_DIRECTIVE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.MULTILINE)
 PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SLURM_JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_-]+$")
 GPU_COMMAND_RE = re.compile(r"(?:^|[/_-])(nvidia-smi|torchrun|deepspeed)(?:$|\s)|\baccelerate\s+launch\b|CUDA_VISIBLE_DEVICES", re.I)
 POLL_RE = re.compile(r"\b(squeue|sacct|qstat|kubectl\s+get|docker\s+ps|systemctl\s+status|nvidia-smi|tail\b|ps\b)", re.I)
 READ_ONLY_PREFIXES = (
@@ -216,6 +223,59 @@ def ensure_sha256(value: Any, name: str) -> str:
     return text
 
 
+def ensure_safe_token(value: Any, name: str, *, maximum: int = 240) -> str:
+    text = ensure_text(value, name, maximum=maximum)
+    if any(character in text for character in ("\x00", "\n", "\r")):
+        raise GuardError(f"{name} contains control characters")
+    return text
+
+
+def is_protected_path(path: Path) -> bool:
+    return path in PROTECTED_PATHS or path == CONTROLLER_STATE_REL or CONTROLLER_STATE_REL in path.parents
+
+
+def normalize_external_root(raw: Any) -> str:
+    text = ensure_safe_token(raw, "external monitor state_root", maximum=500)
+    candidate = Path(os.path.abspath(os.path.expanduser(text)))
+    if candidate == Path(candidate.anchor):
+        raise GuardError("external monitor state_root cannot be a filesystem root")
+    cursor = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise GuardError(f"external monitor state_root contains a symbolic link: {cursor}")
+        if not cursor.exists():
+            break
+    return os.fspath(candidate)
+
+
+def load_owned_external_json(path: Path, state_root: Path) -> dict[str, Any]:
+    try:
+        lexical_root = Path(os.path.abspath(os.fspath(state_root)))
+        lexical_target = Path(os.path.abspath(os.fspath(path)))
+        relative = lexical_target.relative_to(lexical_root)
+        cursor = lexical_root
+        if cursor.is_symlink():
+            raise GuardError(f"external monitor state root became a symbolic link: {cursor}")
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise GuardError(f"external monitor artifact path contains a symbolic link: {cursor}")
+        root = state_root.resolve(strict=True)
+        target = path.resolve(strict=True)
+        target.relative_to(root)
+        info = path.lstat()
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise GuardError(f"external monitor artifact is missing or escapes its frozen state root: {path}") from error
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise GuardError(f"external monitor artifact must be a regular non-symlink file: {path}")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise GuardError(f"external monitor artifact has an unexpected owner: {path}")
+    if info.st_mode & 0o022:
+        raise GuardError(f"external monitor artifact must not be group/world writable: {path}")
+    return load_json(path)
+
+
 def normalize_relative(project: Path, raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise GuardError("allowed paths must be non-empty strings")
@@ -228,7 +288,7 @@ def normalize_relative(project: Path, raw: str) -> str:
         raise GuardError(f"path escapes project: {raw}") from error
     if relative == Path(".") or ".." in relative.parts:
         raise GuardError(f"path is too broad or unsafe: {raw}")
-    if any(relative == protected for protected in PROTECTED_PATHS):
+    if is_protected_path(relative):
         raise GuardError(f"proposal cannot authorize protected path: {relative}")
     reject_symlink_escape(project, normalized)
     return relative.as_posix()
@@ -298,7 +358,12 @@ def current_lease(control: dict[str, Any]) -> dict[str, Any] | None:
     return None if expired else lease
 
 
-def validate_review_attestation(review: Any) -> dict[str, str]:
+def validate_review_attestation(
+    review: Any,
+    *,
+    require_external_monitor: bool = False,
+    require_preflight_failure: bool = False,
+) -> dict[str, Any]:
     if not isinstance(review, dict) or review.get("decision") != "ALLOW":
         raise GuardError("proposal requires an ALLOW review attestation")
     reviewer = ensure_text(review.get("reviewer"), "review.reviewer", maximum=120)
@@ -306,6 +371,10 @@ def validate_review_attestation(review: Any) -> dict[str, str]:
         raise GuardError("review attestation must identify a fresh subagent or user")
     checks = review.get("checks")
     required_checks = {"evidence_sufficient", "lease_mutations_bounded", "pre_run_gates_sufficient", "mutation_not_required_before_admission"}
+    if require_external_monitor:
+        required_checks.add("external_monitor_contract_bounded")
+    if require_preflight_failure:
+        required_checks.add("preflight_failure_closure_reviewed")
     if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required_checks):
         raise GuardError(f"review attestation must affirm checks: {sorted(required_checks)}")
     return {
@@ -392,7 +461,7 @@ def validate_checkpoint_artifacts(project: Path, raw: Any, mutations: list[dict[
             raise GuardError(f"duplicate checkpoint artifact id: {artifact_id}")
         seen.add(artifact_id)
         path = normalize_project_path(project, item.get("path"))
-        if Path(path) in PROTECTED_PATHS or Path(path) == RESULT_REL:
+        if is_protected_path(Path(path)) or Path(path) == RESULT_REL:
             raise GuardError(f"checkpoint artifact path is protected or recursive: {path}")
         if not (mutation_allows(path, "add", mutations) or mutation_allows(path, "update", mutations)):
             raise GuardError(f"checkpoint artifact is outside lease_mutations: {path}")
@@ -438,7 +507,65 @@ def validate_pre_run_gates(raw: Any, artifact_ids: set[str]) -> list[dict[str, A
     return gates
 
 
-def validate_bash_policies(project: Path, raw: Any, mutations: list[dict[str, Any]], gates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def validate_runtime_bindings(raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GuardError("runtime_bindings must be a list")
+    bindings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"runtime_bindings[{index}] must be an object")
+        binding_id = ensure_id(item.get("id"), f"runtime_bindings[{index}].id")
+        if binding_id in seen:
+            raise GuardError(f"duplicate runtime binding id: {binding_id}")
+        seen.add(binding_id)
+        kind = item.get("kind")
+        if kind != "slurm_job_id":
+            raise GuardError("runtime bindings currently support only slurm_job_id")
+        bindings.append({
+            "id": binding_id,
+            "kind": kind,
+            "source_policy_id": ensure_id(item.get("source_policy_id"), f"runtime_bindings[{index}].source_policy_id"),
+            "required": item.get("required") is not False,
+        })
+    return sorted(bindings, key=lambda item: item["id"])
+
+
+def validate_argv_template(raw: Any, fixed_args: Any, binding_ids: set[str], index: int) -> list[dict[str, str]]:
+    if raw is not None and fixed_args is not None:
+        raise GuardError(f"bash_policies[{index}] cannot declare both argv and fixed_args")
+    if raw is None:
+        if not isinstance(fixed_args, list):
+            raise GuardError(f"bash_policies[{index}] requires argv or fixed_args")
+        raw = [{"literal": value} for value in fixed_args]
+    if not isinstance(raw, list):
+        raise GuardError(f"bash_policies[{index}].argv must be a list")
+    tokens: list[dict[str, str]] = []
+    for token_index, token in enumerate(raw):
+        if not isinstance(token, dict) or set(token) not in ({"literal"}, {"binding"}):
+            raise GuardError(f"bash_policies[{index}].argv[{token_index}] must contain exactly literal or binding")
+        if "literal" in token:
+            value = ensure_safe_token(token["literal"], f"bash_policies[{index}].argv[{token_index}].literal")
+            if re.search(r"[;&|`<>]", value):
+                raise GuardError("Bash argv literals cannot contain shell control characters")
+            tokens.append({"literal": value})
+        else:
+            binding_id = ensure_id(token["binding"], f"bash_policies[{index}].argv[{token_index}].binding")
+            if binding_id not in binding_ids:
+                raise GuardError(f"Bash argv references unknown runtime binding: {binding_id}")
+            tokens.append({"binding": binding_id})
+    return tokens
+
+
+def validate_bash_policies(
+    project: Path,
+    raw: Any,
+    mutations: list[dict[str, Any]],
+    gates: list[dict[str, Any]],
+    bindings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not isinstance(raw, list) or not raw:
         raise GuardError("bash_policies must be a non-empty list")
     gpu_limits = [int(gate["value"]) for gate in gates if gate["required"] and gate["kind"] == "resource" and gate["resource"] == "gpu"]
@@ -455,12 +582,7 @@ def validate_bash_policies(project: Path, raw: Any, mutations: list[dict[str, An
         executable = ensure_text(item.get("executable"), f"bash_policies[{index}].executable", maximum=160)
         if re.search(r"\s|[;&|`<>]", executable) or Path(executable).name in {"sh", "bash", "zsh", "csh", "fish", "env"}:
             raise GuardError("Bash policy executable must be one exact non-shell executable token")
-        raw_args = item.get("fixed_args")
-        if not isinstance(raw_args, list):
-            raise GuardError(f"bash_policies[{index}].fixed_args must be a list")
-        fixed_args = [ensure_text(value, f"bash_policies[{index}].fixed_arg", maximum=240) for value in raw_args]
-        if any(re.search(r"[\n;&|`<>]", value) for value in fixed_args):
-            raise GuardError("Bash fixed arguments cannot contain shell control characters")
+        argv = validate_argv_template(item.get("argv"), item.get("fixed_args"), {binding["id"] for binding in bindings}, index)
         phase = item.get("phase")
         if phase not in {"preparation", "workload", "postflight", "evaluation"}:
             raise GuardError(f"bash_policies[{index}].phase is unsupported")
@@ -474,27 +596,134 @@ def validate_bash_policies(project: Path, raw: Any, mutations: list[dict[str, An
                 raise GuardError(f"Bash output path is outside lease_mutations: {output}")
             cwd_path = project if cwd == "." else project / cwd
             output_argument = os.path.relpath(project / output, cwd_path)
-            if not any(argument == output_argument or argument.endswith("=" + output_argument) for argument in fixed_args):
-                raise GuardError(f"Bash output path must be frozen in fixed_args: {output}")
+            literals = [token["literal"] for token in argv if "literal" in token]
+            if not any(argument == output_argument or argument.endswith("=" + output_argument) for argument in literals):
+                raise GuardError(f"Bash output path must be frozen as a literal argv token: {output}")
         resources = item.get("resources")
         if not isinstance(resources, dict):
             raise GuardError(f"bash_policies[{index}].resources must be an object")
         gpu = int(resources.get("gpu", 0))
         if not 0 <= gpu <= 64:
             raise GuardError("Bash policy GPU count must be 0..64")
-        command_text = " ".join([executable, *fixed_args])
+        command_text = " ".join([executable, *(token.get("literal", "") for token in argv)])
         if gpu_limit is not None and (gpu > gpu_limit or (gpu_limit == 0 and GPU_COMMAND_RE.search(command_text))):
             raise GuardError(f"Bash policy {policy_id} conflicts with the pre-run GPU gate")
+        capture_binding = item.get("capture_binding")
+        if capture_binding is not None:
+            capture_binding = ensure_id(capture_binding, f"bash_policies[{index}].capture_binding")
+            if capture_binding not in {binding["id"] for binding in bindings}:
+                raise GuardError(f"Bash policy captures unknown runtime binding: {capture_binding}")
+            if any("binding" in token for token in argv):
+                raise GuardError("a binding-capture policy cannot depend on runtime bindings")
+        max_uses = item.get("max_uses")
+        if max_uses is not None:
+            max_uses = int(max_uses)
+            if not 1 <= max_uses <= 100:
+                raise GuardError("Bash policy max_uses must be 1..100")
+        if capture_binding is not None and max_uses != 1:
+            raise GuardError("a binding-capture policy must declare max_uses=1")
+        timeout_seconds = int(item.get("timeout_seconds", 120))
+        if not 1 <= timeout_seconds <= 1800:
+            raise GuardError("Bash policy timeout_seconds must be 1..1800")
         policies.append({
             "id": policy_id,
             "phase": phase,
             "executable": executable,
-            "fixed_args": fixed_args,
+            "argv": argv,
             "cwd": cwd,
             "output_paths": outputs,
             "resources": {"gpu": gpu},
+            "capture_binding": capture_binding,
+            "max_uses": max_uses,
+            "timeout_seconds": timeout_seconds,
         })
     return sorted(policies, key=lambda item: item["id"])
+
+
+def validate_external_monitors(
+    raw: Any,
+    bindings: list[dict[str, Any]],
+    policies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GuardError("external_monitors must be a list")
+    binding_map = {item["id"]: item for item in bindings}
+    policy_map = {item["id"]: item for item in policies}
+    monitors: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"external_monitors[{index}] must be an object")
+        monitor_id = ensure_id(item.get("id"), f"external_monitors[{index}].id")
+        if monitor_id in seen:
+            raise GuardError(f"duplicate external monitor id: {monitor_id}")
+        seen.add(monitor_id)
+        if item.get("provider") != "codex-hpc-monitor" or item.get("contract_version") != 1:
+            raise GuardError("external monitors currently support codex-hpc-monitor contract_version 1")
+        binding_id = ensure_id(item.get("binding_id"), f"external_monitors[{index}].binding_id")
+        binding = binding_map.get(binding_id)
+        if binding is None or binding.get("kind") != "slurm_job_id":
+            raise GuardError("codex-hpc-monitor requires a slurm_job_id runtime binding")
+        start_policy_id = ensure_id(item.get("start_policy_id"), f"external_monitors[{index}].start_policy_id")
+        start_policy = policy_map.get(start_policy_id)
+        if start_policy is None or not any(token.get("binding") == binding_id for token in start_policy["argv"]):
+            raise GuardError("external monitor start policy must consume its runtime binding")
+        if start_policy.get("capture_binding") is not None:
+            raise GuardError("external monitor start policy cannot also capture a binding")
+        host = ensure_safe_token(item.get("host"), f"external_monitors[{index}].host", maximum=128)
+        if HOST_RE.fullmatch(host) is None:
+            raise GuardError("external monitor host has an invalid format")
+        state_root = normalize_external_root(item.get("state_root"))
+        expected_owner = ensure_safe_token(item.get("expected_owner"), f"external_monitors[{index}].expected_owner")
+        expected_job_name = ensure_safe_token(item.get("expected_job_name"), f"external_monitors[{index}].expected_job_name")
+        expected_partition = ensure_safe_token(item.get("expected_partition"), f"external_monitors[{index}].expected_partition")
+        template = start_policy["argv"]
+        literal_values = [token.get("literal") for token in template]
+        if "start" not in literal_values:
+            raise GuardError("external monitor start policy must invoke start")
+        required_pairs = {
+            "--host": host,
+            "--state-dir": state_root,
+            "--expected-owner": expected_owner,
+            "--expected-job-name": expected_job_name,
+            "--expected-partition": expected_partition,
+        }
+        for option, expected in required_pairs.items():
+            if not any(
+                token.get("literal") == option and next_token.get("literal") == expected
+                for token, next_token in zip(template, template[1:])
+            ):
+                raise GuardError(f"external monitor start policy must freeze {option} {expected}")
+        monitors.append({
+            "id": monitor_id,
+            "provider": "codex-hpc-monitor",
+            "contract_version": 1,
+            "binding_id": binding_id,
+            "start_policy_id": start_policy_id,
+            "state_root": state_root,
+            "host": host,
+            "expected_owner": expected_owner,
+            "expected_job_name": expected_job_name,
+            "expected_partition": expected_partition,
+            "required": item.get("required") is not False,
+        })
+    capture_pairs = [(policy["capture_binding"], policy["id"]) for policy in policies if policy.get("capture_binding")]
+    if len({binding_id for binding_id, _policy_id in capture_pairs}) != len(capture_pairs):
+        raise GuardError("each runtime binding must have exactly one capture policy")
+    capture_sources = dict(capture_pairs)
+    for binding in bindings:
+        if capture_sources.get(binding["id"]) != binding["source_policy_id"]:
+            raise GuardError(f"runtime binding {binding['id']} must have exactly its declared capture policy")
+        source_policy = policy_map.get(binding["source_policy_id"])
+        if not isinstance(source_policy, dict):
+            raise GuardError(f"runtime binding {binding['id']} source policy is missing")
+        if binding["kind"] == "slurm_job_id":
+            parsable_count = sum(token.get("literal") == "--parsable" for token in source_policy["argv"])
+            if Path(source_policy["executable"]).name != "sbatch" or parsable_count != 1:
+                raise GuardError("slurm_job_id capture policy must execute sbatch with exactly one literal --parsable")
+    return sorted(monitors, key=lambda item: item["id"])
 
 
 def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
@@ -525,8 +754,14 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
             raise GuardError(f"existing evidence cannot also be mutable under the lease: {evidence['path']}")
     checkpoint_artifacts = validate_checkpoint_artifacts(project, proposal.get("checkpoint_artifacts"), lease_mutations)
     pre_run_gates = validate_pre_run_gates(proposal.get("pre_run_gates"), {item["id"] for item in checkpoint_artifacts})
-    bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates)
-    reviewer = validate_review_attestation(proposal.get("review"))
+    runtime_bindings = validate_runtime_bindings(proposal.get("runtime_bindings"))
+    bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates, runtime_bindings)
+    external_monitors = validate_external_monitors(proposal.get("external_monitors"), runtime_bindings, bash_policies)
+    reviewer = validate_review_attestation(
+        proposal.get("review"),
+        require_external_monitor=bool(external_monitors),
+        require_preflight_failure=any(gate["required"] for gate in pre_run_gates),
+    )
     parent = proposal.get("parent_chain")
     if parent is not None:
         parent = ensure_id(parent, "parent_chain")
@@ -606,6 +841,11 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "pre_run_gates": pre_run_gates,
         "pre_run_gate_results": None,
         "bash_policies": bash_policies,
+        "runtime_bindings": runtime_bindings,
+        "binding_values": {},
+        "policy_runs": {},
+        "external_monitors": external_monitors,
+        "monitor_receipts": {},
         "allowed_tool_names": [],
         "issued_at": iso_time(now),
         "expires_at": iso_time(now + timedelta(minutes=minutes)),
@@ -682,7 +922,13 @@ def verify_artifact_results(project: Path, lease: dict[str, Any], raw: Any, *, r
     return sorted(verified, key=lambda item: item["id"])
 
 
-def verify_gate_results(lease: dict[str, Any], raw: Any, artifacts: list[dict[str, str]]) -> list[dict[str, str]]:
+def verify_gate_results(
+    lease: dict[str, Any],
+    raw: Any,
+    artifacts: list[dict[str, str]],
+    *,
+    allow_required_fail: bool = False,
+) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         raise GuardError("pre_run_gate_results must be a list")
     contracts = {item["id"]: item for item in lease.get("pre_run_gates", [])}
@@ -705,7 +951,7 @@ def verify_gate_results(lease: dict[str, Any], raw: Any, artifacts: list[dict[st
         verified.append({"id": gate_id, "status": status, "artifact_id": artifact_id})
     missing = sorted(item["id"] for item in contracts.values() if item["required"] and item["id"] not in seen)
     failed = sorted(item["id"] for item in verified if contracts[item["id"]]["required"] and item["status"] != "PASS")
-    if missing or failed:
+    if missing or (failed and not allow_required_fail):
         raise GuardError(f"required pre-run gates missing or failed: missing={missing}, failed={failed}")
     return sorted(verified, key=lambda item: item["id"])
 
@@ -730,17 +976,454 @@ def command_gates(args: argparse.Namespace) -> int:
         if payload.get("schema_version") != RESULT_SCHEMA_VERSION or payload.get("experiment_id") != lease["experiment_id"]:
             raise GuardError("pre-run result schema or experiment_id does not match active lease")
         artifacts = verify_artifact_results(project, lease, payload.get("artifact_results"), require_all=False)
-        gates = verify_gate_results(lease, payload.get("pre_run_gate_results"), artifacts)
+        gates = verify_gate_results(lease, payload.get("pre_run_gate_results"), artifacts, allow_required_fail=True)
         existing = lease.get("pre_run_gate_results")
         if isinstance(existing, dict):
             if canonical_hash({"gates": gates, "artifacts": artifacts}) != canonical_hash({"gates": existing.get("gates"), "artifacts": existing.get("artifacts")}):
                 raise GuardError("pre-run gate results are already frozen and a different replay is rejected")
             print(json.dumps(existing, ensure_ascii=False, indent=2))
             return 0
-        lease["pre_run_gate_results"] = {"gates": gates, "artifacts": artifacts, "recorded_at": iso_time(utc_now())}
+        required_gate_ids = {item["id"] for item in lease.get("pre_run_gates", []) if item.get("required")}
+        failed_required = sorted(item["id"] for item in gates if item["id"] in required_gate_ids and item["status"] == "FAIL")
+        lease["pre_run_gate_results"] = {
+            "gates": gates,
+            "artifacts": artifacts,
+            "recorded_at": iso_time(utc_now()),
+            "failed_required": failed_required,
+        }
+        lease["preflight_failed"] = bool(failed_required)
         control["active_lease"] = lease
         save_control(project, control)
     print(json.dumps(lease["pre_run_gate_results"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def render_policy_argv(policy: dict[str, Any], lease: dict[str, Any]) -> list[str]:
+    rendered = [policy["executable"]]
+    values = lease.get("binding_values") if isinstance(lease.get("binding_values"), dict) else {}
+    for token in policy.get("argv", []):
+        if "literal" in token:
+            rendered.append(str(token["literal"]))
+            continue
+        binding_id = token.get("binding")
+        binding = values.get(binding_id) if isinstance(values, dict) else None
+        if not isinstance(binding, dict) or binding.get("state") != "BOUND":
+            raise GuardError(f"runtime binding is not frozen yet: {binding_id}")
+        rendered.append(str(binding["value"]))
+    return rendered
+
+
+def enforce_policy_phase(lease: dict[str, Any], policy: dict[str, Any]) -> None:
+    if lease.get("preflight_failed"):
+        raise GuardError("required preflight gate failed; only an invalid checkpoint may release the lease")
+    required_gates = [gate for gate in lease.get("pre_run_gates", []) if gate.get("required")]
+    if policy["phase"] != "preparation" and required_gates and lease.get("pre_run_gate_results") is None:
+        raise GuardError("required pre-run gates are not recorded before this policy")
+    if policy["phase"] == "preparation" and lease.get("pre_run_gate_results") is not None:
+        raise GuardError("preparation phase is closed after pre-run gates are recorded")
+
+
+def command_submit_bind(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    policy_id = ensure_id(args.policy, "policy")
+    reservation = uuid.uuid4().hex
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control["runtime"]["state"] != "ACTIVE":
+            raise GuardError("cannot submit while waiting for an external event")
+        lease = current_lease(control)
+        if lease is None:
+            raise GuardError("a live experiment lease is required")
+        verify_frozen_lease(project, lease)
+        policy = next((item for item in lease.get("bash_policies", []) if item.get("id") == policy_id), None)
+        if not isinstance(policy, dict) or not policy.get("capture_binding"):
+            raise GuardError("submit-bind requires a binding-capture Bash policy")
+        binding_id = policy["capture_binding"]
+        binding_contract = next((item for item in lease.get("runtime_bindings", []) if item.get("id") == binding_id), None)
+        if not isinstance(binding_contract, dict) or binding_contract.get("source_policy_id") != policy_id:
+            raise GuardError("capture policy does not match the frozen runtime binding source")
+        if policy_id in lease.get("policy_runs", {}) or binding_id in lease.get("binding_values", {}):
+            raise GuardError("submission policy or runtime binding was already consumed")
+        enforce_policy_phase(lease, policy)
+        if int(lease.get("mutations_used", 0)) >= int(lease.get("max_mutations", 0)):
+            raise GuardError("experiment mutation allowance is exhausted")
+        argv = render_policy_argv(policy, lease)
+        cwd = project if policy["cwd"] == "." else project / policy["cwd"]
+        lease.setdefault("policy_runs", {})[policy_id] = {
+            "state": "RUNNING",
+            "reservation": reservation,
+            "started_at": iso_time(utc_now()),
+            "argv_sha256": canonical_hash(argv),
+        }
+        lease.setdefault("binding_values", {})[binding_id] = {
+            "state": "CAPTURING",
+            "reservation": reservation,
+        }
+        lease["mutations_used"] = int(lease.get("mutations_used", 0)) + 1
+        lease_id = lease["lease_id"]
+        control["active_lease"] = lease
+        control["poll"] = None
+        save_control(project, control)
+
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=int(policy["timeout_seconds"]),
+        )
+        lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        raw_value = lines[0] if len(lines) == 1 else ""
+        job_id = raw_value.split(";", 1)[0]
+        success = completed.returncode == 0 and SLURM_JOB_ID_RE.fullmatch(job_id) is not None
+        failure = None if success else "submission must exit 0 and emit exactly one parsable Slurm Job ID line"
+        exit_code = completed.returncode
+        stdout_sha256 = hashlib.sha256(completed.stdout.encode()).hexdigest()
+        stderr_sha256 = hashlib.sha256(completed.stderr.encode()).hexdigest()
+    except subprocess.TimeoutExpired as error:
+        success = False
+        failure = "submission timed out; outcome is uncertain and the one-shot policy remains consumed"
+        exit_code = None
+        stdout_sha256 = hashlib.sha256((error.stdout or "").encode() if isinstance(error.stdout, str) else (error.stdout or b"")).hexdigest()
+        stderr_sha256 = hashlib.sha256((error.stderr or "").encode() if isinstance(error.stderr, str) else (error.stderr or b"")).hexdigest()
+        job_id = ""
+
+    with state_lock(project):
+        control = load_control(project)
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
+            raise GuardError("active lease changed while the one-shot submission was running")
+        run = lease.get("policy_runs", {}).get(policy_id)
+        binding = lease.get("binding_values", {}).get(binding_id)
+        if not isinstance(run, dict) or not isinstance(binding, dict) or run.get("reservation") != reservation or binding.get("reservation") != reservation:
+            raise GuardError("submission reservation changed unexpectedly")
+        finished_at = iso_time(utc_now())
+        run.update({
+            "state": "SUCCEEDED" if success else "FAILED",
+            "finished_at": finished_at,
+            "exit_code": exit_code,
+            "stdout_sha256": stdout_sha256,
+            "stderr_sha256": stderr_sha256,
+        })
+        run.pop("reservation", None)
+        if success:
+            binding.clear()
+            binding.update({
+                "state": "BOUND",
+                "kind": binding_contract["kind"],
+                "value": job_id,
+                "source_policy_id": policy_id,
+                "bound_at": finished_at,
+                "submission_stdout_sha256": stdout_sha256,
+            })
+        else:
+            binding.clear()
+            binding.update({"state": "FAILED", "source_policy_id": policy_id, "failed_at": finished_at})
+        control["active_lease"] = lease
+        save_control(project, control)
+    if not success:
+        raise GuardError(failure or "submission binding failed")
+    print(json.dumps(lease["binding_values"][binding_id], ensure_ascii=False, indent=2))
+    return 0
+
+
+def argv_option(argv: list[Any], option: str) -> str | None:
+    for index, token in enumerate(argv[:-1]):
+        if token == option and isinstance(argv[index + 1], str):
+            return argv[index + 1]
+    return None
+
+
+def monitor_contract(lease: dict[str, Any], monitor_id: str) -> dict[str, Any]:
+    monitor = next((item for item in lease.get("external_monitors", []) if item.get("id") == monitor_id), None)
+    if not isinstance(monitor, dict):
+        raise GuardError(f"unknown external monitor: {monitor_id}")
+    return monitor
+
+
+def verify_monitor_run(lease: dict[str, Any], monitor: dict[str, Any]) -> dict[str, Any]:
+    binding = lease.get("binding_values", {}).get(monitor["binding_id"])
+    if not isinstance(binding, dict) or binding.get("state") != "BOUND":
+        raise GuardError("external monitor runtime binding is not frozen")
+    job_id = str(binding.get("value", ""))
+    if SLURM_JOB_ID_RE.fullmatch(job_id) is None:
+        raise GuardError("external monitor has an invalid frozen Slurm Job ID")
+    root = Path(monitor["state_root"])
+    base = root / "supervisors" / f"{monitor['host']}-{job_id}"
+    current = load_owned_external_json(base / "current.json", root)
+    run_id = current.get("run_id")
+    if (
+        current.get("schema_version") != "codex-hpc-monitor.current/v1"
+        or current.get("host") != monitor["host"]
+        or current.get("job_id") != job_id
+        or not isinstance(run_id, str)
+        or RUN_ID_RE.fullmatch(run_id) is None
+    ):
+        raise GuardError("external monitor current pointer does not match its frozen contract")
+    run_dir = base / "runs" / run_id
+    manifest_path = run_dir / "manifest.json"
+    manifest = load_owned_external_json(manifest_path, root)
+    try:
+        manifest_created = parse_time(str(manifest.get("created_at")))
+        binding_time = parse_time(str(binding.get("bound_at")))
+    except (TypeError, ValueError) as error:
+        raise GuardError("external monitor manifest or binding timestamp is invalid") from error
+    if (
+        manifest.get("schema_version") != "codex-hpc-monitor.manifest/v1"
+        or manifest.get("run_id") != run_id
+        or manifest.get("host") != monitor["host"]
+        or manifest.get("job_id") != job_id
+        or manifest.get("scope") != "slurm_only"
+        or manifest.get("project_gate_evaluated") is not False
+        or manifest.get("state_dir") != os.fspath(root)
+        or manifest_created < binding_time
+    ):
+        raise GuardError("external monitor manifest does not match its frozen contract")
+    watcher_argv = manifest.get("watcher_argv")
+    if not isinstance(watcher_argv, list) or not all(isinstance(token, str) for token in watcher_argv):
+        raise GuardError("external monitor watcher argv is invalid")
+    if len(watcher_argv) < 3 or watcher_argv[2] != job_id:
+        raise GuardError("external monitor watcher argv has the wrong Job ID")
+    expected_options = {
+        "--host": monitor["host"],
+        "--state-dir": os.fspath(root),
+        "--expected-owner": monitor["expected_owner"],
+        "--expected-job-name": monitor["expected_job_name"],
+        "--expected-partition": monitor["expected_partition"],
+    }
+    for option, expected in expected_options.items():
+        if argv_option(watcher_argv, option) != expected:
+            raise GuardError(f"external monitor watcher argv drifted for {option}")
+    return {
+        "job_id": job_id,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "manifest_path": manifest_path,
+        "manifest_sha256": file_hash(manifest_path),
+    }
+
+
+def command_wait_monitor(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    monitor_id = ensure_id(args.monitor, "monitor")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+            raise GuardError("runtime is already waiting for an external event")
+        lease = current_lease(control)
+        if lease is None:
+            raise GuardError("a live experiment lease is required before waiting")
+        verify_frozen_lease(project, lease)
+        if lease.get("wake_event") is not None:
+            raise GuardError("this lease already consumed its one terminal wake event")
+        monitor = monitor_contract(lease, monitor_id)
+        run = verify_monitor_run(lease, monitor)
+        terminal_path = run["run_dir"] / "terminal.json"
+        baseline = file_hash(terminal_path) if terminal_path.is_file() and not terminal_path.is_symlink() else None
+        remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
+        lease["suspended_at"] = iso_time(utc_now())
+        lease["remaining_seconds"] = remaining
+        control["active_lease"] = lease
+        control["runtime"]["state"] = "WAITING_EXTERNAL_EVENT"
+        control["runtime"]["wait"] = {
+            "kind": "external_monitor",
+            "monitor_id": monitor_id,
+            "provider": monitor["provider"],
+            "job_id": run["job_id"],
+            "run_id": run["run_id"],
+            "manifest_sha256": run["manifest_sha256"],
+            "baseline_terminal_sha256": baseline,
+            "entered_at": iso_time(utc_now()),
+        }
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(control["runtime"]["wait"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def verify_monitor_terminal(
+    lease: dict[str, Any],
+    monitor: dict[str, Any],
+    wait: dict[str, Any],
+) -> dict[str, Any]:
+    root = Path(monitor["state_root"])
+    run_dir = root / "supervisors" / f"{monitor['host']}-{wait['job_id']}" / "runs" / wait["run_id"]
+    manifest_path = run_dir / "manifest.json"
+    manifest = load_owned_external_json(manifest_path, root)
+    if file_hash(manifest_path) != wait.get("manifest_sha256") or manifest.get("job_id") != wait["job_id"]:
+        raise GuardError("external monitor manifest changed while waiting")
+    bridge_path = root / "bridges" / f"{monitor['host']}-{wait['job_id']}" / wait["run_id"] / "receipt.json"
+    bridge = load_owned_external_json(bridge_path, root)
+    if (
+        bridge.get("schema_version") != "codex-hpc-monitor.bridge.receipt/v1"
+        or bridge.get("state") != "terminal"
+        or bridge.get("host") != monitor["host"]
+        or bridge.get("job_id") != wait["job_id"]
+        or bridge.get("run_id") != wait["run_id"]
+        or bridge.get("scope") != "local_terminal_notification_only"
+        or bridge.get("project_gate_evaluated") is not False
+        or bridge.get("problems") != []
+        or bridge.get("wait_exit_code") not in {0, 3}
+    ):
+        raise GuardError("external monitor bridge receipt is not a verified terminal receipt")
+    bridge_manifest_path = bridge_path.with_name("manifest.json")
+    bridge_manifest = load_owned_external_json(bridge_manifest_path, root)
+    if (
+        bridge_manifest.get("schema_version") != "codex-hpc-monitor.bridge.manifest/v1"
+        or bridge_manifest.get("host") != monitor["host"]
+        or bridge_manifest.get("job_id") != wait["job_id"]
+        or bridge_manifest.get("run_id") != wait["run_id"]
+        or bridge_manifest.get("scope") != "local_terminal_notification_only"
+        or bridge_manifest.get("project_gate_evaluated") is not False
+        or bridge.get("manifest_sha256") != file_hash(bridge_manifest_path)
+    ):
+        raise GuardError("external monitor bridge manifest is missing or drifted")
+    payload = bridge.get("wait_payload")
+    if not isinstance(payload, dict) or (
+        payload.get("schema_version") != "codex-hpc-monitor.wait/v1"
+        or payload.get("state") != "terminal"
+        or payload.get("host") != monitor["host"]
+        or payload.get("job_id") != wait["job_id"]
+        or payload.get("run_id") != wait["run_id"]
+        or payload.get("terminal_verified") is not True
+    ):
+        raise GuardError("external monitor wait envelope is not terminal_verified")
+    terminal_sha256 = ensure_sha256(payload.get("terminal_sha256"), "external terminal SHA-256")
+    terminal_path = run_dir / "terminal.json"
+    terminal = load_owned_external_json(terminal_path, root)
+    if file_hash(terminal_path) != terminal_sha256:
+        raise GuardError("external terminal SHA-256 does not match the verified wait envelope")
+    watcher_result = terminal.get("watcher_result")
+    watcher_payload = watcher_result.get("payload") if isinstance(watcher_result, dict) else None
+    if (
+        terminal.get("schema_version") != "codex-hpc-monitor.terminal/v1"
+        or terminal.get("host") != monitor["host"]
+        or terminal.get("job_id") != wait["job_id"]
+        or terminal.get("run_id") != wait["run_id"]
+        or terminal.get("scope") != "slurm_only"
+        or terminal.get("project_gate_evaluated") is not False
+        or terminal.get("manifest_sha256") != wait.get("manifest_sha256")
+        or terminal.get("watcher_exit_code") != bridge.get("wait_exit_code")
+        or payload.get("watcher_exit_code") != terminal.get("watcher_exit_code")
+        or not isinstance(watcher_result, dict)
+        or watcher_result.get("verified") is not True
+        or not isinstance(watcher_payload, dict)
+    ):
+        raise GuardError("external terminal does not preserve the verified monitor evidence chain")
+    expected_identity = {
+        "job_id": wait["job_id"],
+        "owner": monitor["expected_owner"],
+        "job_name": monitor["expected_job_name"],
+        "partition": monitor["expected_partition"],
+    }
+    for key, expected in expected_identity.items():
+        if watcher_payload.get(key) != expected:
+            raise GuardError(f"external terminal scheduler identity drifted for {key}")
+    return {
+        "bridge_path": bridge_path,
+        "bridge_sha256": file_hash(bridge_path),
+        "terminal_path": terminal_path,
+        "terminal_sha256": terminal_sha256,
+        "terminal": terminal,
+        "watcher_payload": watcher_payload,
+    }
+
+
+def command_wake_monitor(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    monitor_id = ensure_id(args.monitor, "monitor")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        wait = control["runtime"].get("wait")
+        if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
+            raise GuardError("runtime is not waiting for an external event")
+        if wait.get("kind") != "external_monitor" or wait.get("monitor_id") != monitor_id:
+            raise GuardError("wake-monitor does not match the registered external monitor wait")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict):
+            raise GuardError("waiting runtime lost its active lease")
+        verify_frozen_lease(project, lease)
+        monitor = monitor_contract(lease, monitor_id)
+        evidence = verify_monitor_terminal(lease, monitor, wait)
+        receipt_rel = RECEIPTS_REL / lease["lease_id"] / f"{monitor_id}.json"
+        receipt_path = project / receipt_rel
+        if receipt_path.exists() or receipt_path.is_symlink():
+            raise GuardError("controller monitor receipt already exists; refusing overwrite")
+        watcher_payload = evidence["watcher_payload"]
+        project_receipt = {
+            "schema_version": "goal-guardrails.external-monitor-receipt/v1",
+            "lease_id": lease["lease_id"],
+            "experiment_id": lease["experiment_id"],
+            "monitor_id": monitor_id,
+            "provider": monitor["provider"],
+            "binding": {
+                "id": monitor["binding_id"],
+                "value": wait["job_id"],
+                "source_policy_id": lease["binding_values"][monitor["binding_id"]]["source_policy_id"],
+            },
+            "monitor": {
+                "host": monitor["host"],
+                "run_id": wait["run_id"],
+                "manifest_sha256": wait["manifest_sha256"],
+            },
+            "source": {
+                "bridge_receipt_sha256": evidence["bridge_sha256"],
+                "terminal_sha256": evidence["terminal_sha256"],
+                "watcher_exit_code": evidence["terminal"].get("watcher_exit_code"),
+                "slurm_classification": watcher_payload.get("slurm_classification"),
+                "scheduler_state": watcher_payload.get("state"),
+                "scheduler_exit_code": watcher_payload.get("exit_code"),
+                "owner": watcher_payload.get("owner"),
+                "job_name": watcher_payload.get("job_name"),
+                "partition": watcher_payload.get("partition"),
+            },
+            "scope": "scheduler_only",
+            "project_gate_evaluated": False,
+            "business_verdict": "pending",
+            "materialized_at": iso_time(utc_now()),
+        }
+        atomic_json(receipt_path, project_receipt)
+        receipt_sha256 = file_hash(receipt_path)
+        lease.setdefault("monitor_receipts", {})[monitor_id] = {
+            "path": receipt_rel.as_posix(),
+            "sha256": receipt_sha256,
+            "source_terminal_sha256": evidence["terminal_sha256"],
+            "source_bridge_sha256": evidence["bridge_sha256"],
+        }
+        lease["wake_event"] = {
+            "event_key": f"monitor:{monitor_id}:{wait['job_id']}:{wait['run_id']}",
+            "monitor_id": monitor_id,
+            "path": receipt_rel.as_posix(),
+            "sha256": receipt_sha256,
+            "time": iso_time(utc_now()),
+        }
+        remaining = int(lease.pop("remaining_seconds", 0))
+        lease.pop("suspended_at", None)
+        lease["expires_at"] = iso_time(utc_now() + timedelta(seconds=max(1, remaining)))
+        seen = control["runtime"].get("seen_events", [])
+        seen.append({
+            "event_key": lease["wake_event"]["event_key"],
+            "path": receipt_rel.as_posix(),
+            "sha256": receipt_sha256,
+            "source_sha256": evidence["bridge_sha256"],
+            "time": iso_time(utc_now()),
+        })
+        control["active_lease"] = lease
+        control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": seen[-32:]}
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(lease["monitor_receipts"][monitor_id], ensure_ascii=False, indent=2))
     return 0
 
 
@@ -772,6 +1455,7 @@ def command_wait(args: argparse.Namespace) -> int:
         control["active_lease"] = lease
         control["runtime"]["state"] = "WAITING_EXTERNAL_EVENT"
         control["runtime"]["wait"] = {
+            "kind": "project_artifact",
             "event_key": event_key,
             "event_path": event_path,
             "baseline_sha256": baseline,
@@ -803,6 +1487,8 @@ def command_wake(args: argparse.Namespace) -> int:
         wait = control["runtime"].get("wait")
         if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
             raise GuardError("runtime is not waiting for an external event")
+        if wait.get("kind", "project_artifact") != "project_artifact":
+            raise GuardError("registered wait requires wake-monitor, not project-artifact wake")
         if event_key != wait.get("event_key") or event_path != wait.get("event_path"):
             raise GuardError("wake event does not match the registered wait contract")
         if digest == wait.get("baseline_sha256"):
@@ -833,6 +1519,39 @@ def command_wake(args: argparse.Namespace) -> int:
     return 0
 
 
+def verify_external_monitor_results(project: Path, lease: dict[str, Any], raw: Any) -> list[dict[str, str]]:
+    monitors = {item["id"]: item for item in lease.get("external_monitors", [])}
+    if raw is None and not monitors:
+        return []
+    if not isinstance(raw, list):
+        raise GuardError("external_monitor_results must be a list")
+    receipts = lease.get("monitor_receipts") if isinstance(lease.get("monitor_receipts"), dict) else {}
+    verified: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"external_monitor_results[{index}] must be an object")
+        monitor_id = ensure_id(item.get("id"), f"external_monitor_results[{index}].id")
+        if monitor_id in seen or monitor_id not in monitors:
+            raise GuardError(f"duplicate or unregistered external monitor result: {monitor_id}")
+        seen.add(monitor_id)
+        receipt = receipts.get(monitor_id) if isinstance(receipts, dict) else None
+        if not isinstance(receipt, dict):
+            raise GuardError(f"external monitor did not materialize a project receipt: {monitor_id}")
+        path = normalize_project_path(project, item.get("path"))
+        digest = ensure_sha256(item.get("sha256"), f"external_monitor_results[{index}].sha256")
+        target = project / path
+        if path != receipt.get("path") or digest != receipt.get("sha256"):
+            raise GuardError(f"external monitor result drifted from the controller receipt: {monitor_id}")
+        if target.is_symlink() or not target.is_file() or file_hash(target) != digest:
+            raise GuardError(f"external monitor project receipt is missing or changed: {path}")
+        verified.append({"id": monitor_id, "path": path, "sha256": digest})
+    missing = sorted(monitor_id for monitor_id, monitor in monitors.items() if monitor.get("required") and monitor_id not in seen)
+    if missing:
+        raise GuardError(f"required external monitor results are missing: {missing}")
+    return sorted(verified, key=lambda item: item["id"])
+
+
 def command_checkpoint(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     result_path = Path(args.result).resolve()
@@ -854,11 +1573,37 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         expected_result_schema = RESULT_SCHEMA_VERSION if structured else 1
         if result.get("schema_version") != expected_result_schema or result.get("experiment_id") != lease["experiment_id"]:
             raise GuardError("result schema or experiment_id does not match active lease")
+        decision = result.get("decision")
+        outcome = result.get("outcome")
+        if decision not in DECISIONS or outcome not in OUTCOMES:
+            raise GuardError("result decision or outcome is invalid")
+        valid = result.get("valid") is True and result.get("evaluation_integrity") == "PASS"
+        core_progress = result.get("core_progress") is True
+        preflight_failed = bool(lease.get("preflight_failed"))
+        if preflight_failed and (
+            result.get("valid") is not False
+            or result.get("evaluation_integrity") != "FAIL"
+            or result.get("core_progress") is not False
+            or outcome != "invalid"
+            or decision != "PAUSE_REQUIRED"
+        ):
+            raise GuardError(
+                "failed required preflight requires valid=false, evaluation_integrity=FAIL, "
+                "core_progress=false, outcome=invalid, and decision=PAUSE_REQUIRED"
+            )
         artifact_results: list[dict[str, str]] = []
         gate_results: list[dict[str, str]] = []
+        external_monitor_results: list[dict[str, str]] = []
         if structured:
-            artifact_results = verify_artifact_results(project, lease, result.get("artifact_results"), require_all=True)
-            gate_results = verify_gate_results(lease, result.get("pre_run_gate_results"), artifact_results)
+            artifact_results = verify_artifact_results(project, lease, result.get("artifact_results"), require_all=not preflight_failed)
+            gate_results = verify_gate_results(
+                lease, result.get("pre_run_gate_results"), artifact_results, allow_required_fail=preflight_failed,
+            )
+            if preflight_failed:
+                if result.get("external_monitor_results") not in (None, []):
+                    raise GuardError("failed preflight cannot claim external monitor results")
+            else:
+                external_monitor_results = verify_external_monitor_results(project, lease, result.get("external_monitor_results"))
             recorded_gates = lease.get("pre_run_gate_results")
             if lease.get("pre_run_gates") and not isinstance(recorded_gates, dict):
                 raise GuardError("required pre-run gates were not recorded before workload execution")
@@ -871,15 +1616,14 @@ def command_checkpoint(args: argparse.Namespace) -> int:
                         raise GuardError("pre-run gate evidence changed after gate recording")
             wake_event = lease.get("wake_event")
             if isinstance(wake_event, dict):
-                wake_artifact = next((item for item in artifact_results if item["id"] == wake_event.get("artifact_id")), None)
-                if not isinstance(wake_artifact, dict) or wake_artifact.get("path") != wake_event.get("path") or wake_artifact.get("sha256") != wake_event.get("sha256"):
-                    raise GuardError("checkpoint terminal artifact does not match the frozen wake event")
-        decision = result.get("decision")
-        outcome = result.get("outcome")
-        if decision not in DECISIONS or outcome not in OUTCOMES:
-            raise GuardError("result decision or outcome is invalid")
-        valid = result.get("valid") is True and result.get("evaluation_integrity") == "PASS"
-        core_progress = result.get("core_progress") is True
+                if wake_event.get("monitor_id"):
+                    wake_receipt = next((item for item in external_monitor_results if item["id"] == wake_event.get("monitor_id")), None)
+                    if not isinstance(wake_receipt, dict) or wake_receipt.get("path") != wake_event.get("path") or wake_receipt.get("sha256") != wake_event.get("sha256"):
+                        raise GuardError("checkpoint external monitor receipt does not match the frozen wake event")
+                else:
+                    wake_artifact = next((item for item in artifact_results if item["id"] == wake_event.get("artifact_id")), None)
+                    if not isinstance(wake_artifact, dict) or wake_artifact.get("path") != wake_event.get("path") or wake_artifact.get("sha256") != wake_event.get("sha256"):
+                        raise GuardError("checkpoint terminal artifact does not match the frozen wake event")
         if not valid and outcome != "invalid":
             raise GuardError("failed evaluation integrity requires outcome invalid")
         if valid and not core_progress and outcome == "positive":
@@ -905,8 +1649,8 @@ def command_checkpoint(args: argparse.Namespace) -> int:
             chain["stopline_fired"] = True
             if decision in {"CONTINUE", "REPLICATE"}:
                 raise GuardError("no-progress stop line fired; decision must switch, rollback, pause, or complete")
-        closes = bool(lease["final_discriminator"]) or decision in {"SWITCH", "ROLLBACK", "COMPLETE"}
-        if decision == "PAUSE_REQUIRED" and not chain.get("stopline_fired"):
+        closes = False if preflight_failed else bool(lease["final_discriminator"]) or decision in {"SWITCH", "ROLLBACK", "COMPLETE"}
+        if not preflight_failed and decision == "PAUSE_REQUIRED" and not chain.get("stopline_fired"):
             closes = True
         if chain.get("chain_kind") == "verification" and chain.get("stopline_fired"):
             closes = True
@@ -916,8 +1660,10 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         control["last_checkpoint"] = {
             "experiment_id": lease["experiment_id"], "chain_id": lease["chain_id"],
             "decision": decision, "outcome": outcome, "core_progress": core_progress,
+            "preflight_failed": preflight_failed,
             "time": iso_time(utc_now()), "artifact": primary_artifact,
             "artifact_results": artifact_results, "pre_run_gate_results": gate_results,
+            "external_monitor_results": external_monitor_results,
         }
         control["active_lease"] = None
         control["poll"] = None
@@ -968,6 +1714,8 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "lease_expires_at": lease.get("expires_at") if lease else None,
         "lease_valid": lease_valid if lease else None,
         "mutations": f"{lease.get('mutations_used')}/{lease.get('max_mutations')}" if lease else None,
+        "runtime_bindings": lease.get("binding_values", {}) if lease else {},
+        "external_monitor_receipts": lease.get("monitor_receipts", {}) if lease else {},
         "runtime": {"state": control.get("runtime", {}).get("state", "ACTIVE"), "wait": control.get("runtime", {}).get("wait")},
         "chains": {key: {field: value.get(field) for field in ("no_progress_count", "stopline_fired", "closed", "close_outcome")} for key, value in chains.items()},
         "last_checkpoint": control.get("last_checkpoint"),
@@ -1067,7 +1815,11 @@ def matching_bash_policy(project: Path, cwd: Path, command: str, lease: dict[str
     if not tokens:
         return None
     for policy in lease.get("bash_policies", []):
-        if tokens == [policy["executable"], *policy["fixed_args"]] and actual_cwd == policy["cwd"]:
+        try:
+            expected = render_policy_argv(policy, lease)
+        except GuardError:
+            continue
+        if tokens == expected and actual_cwd == policy["cwd"]:
             return policy
     return None
 
@@ -1085,7 +1837,10 @@ def is_controller_command(command: str) -> bool:
         script = Path(tokens[1]).resolve(strict=True)
     except OSError:
         return False
-    return script == CONTROLLER_PATH and tokens[2] in {"status", "admit", "gates", "wait", "wake", "checkpoint", "activate", "deactivate"}
+    return script == CONTROLLER_PATH and tokens[2] in {
+        "status", "admit", "gates", "submit-bind", "wait", "wake", "wait-monitor", "wake-monitor",
+        "checkpoint", "activate", "deactivate",
+    }
 
 
 def is_read_only_mcp(tool_name: str) -> bool:
@@ -1115,6 +1870,8 @@ def lease_error(project: Path, gate: dict[str, Any], control: dict[str, Any]) ->
         verify_frozen_lease(project, lease)
     except GuardError as error:
         return None, str(error)
+    if lease.get("preflight_failed"):
+        return None, "required preflight gate failed; freeze the invalid result and checkpoint before more work"
     if state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
         return None, "STATE.md exceeds its cap; compact the frontier before more work"
     if int(lease.get("mutations_used", 0)) >= int(lease.get("max_mutations", 0)):
@@ -1169,7 +1926,19 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
         return deny(str(exc))
     if (error or lease is None) and tool == "apply_patch":
         raw_lease = control.get("active_lease")
-        if isinstance(raw_lease, dict) and all(path in FINALIZATION_PATHS for path in targets) and not raw_lease.get("finalization_used"):
+        preflight_failure_result = (
+            isinstance(raw_lease, dict)
+            and raw_lease.get("preflight_failed")
+            and all(path == RESULT_REL for path in targets)
+        )
+        ordinary_finalization = (
+            isinstance(raw_lease, dict)
+            and not raw_lease.get("preflight_failed")
+            and all(path in FINALIZATION_PATHS for path in targets)
+        )
+        if preflight_failure_result:
+            return None
+        if ordinary_finalization and not raw_lease.get("finalization_used"):
             raw_lease["finalization_used"] = True
             control["active_lease"] = raw_lease
             save_control(project, control)
@@ -1193,7 +1962,7 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
             blocked = [path.as_posix() for path in targets if not path_allowed(path, legacy_allowed)]
         if blocked:
             return deny(f"patch targets are outside the admitted lease: {blocked}")
-        if any(path in PROTECTED_PATHS for path in targets):
+        if any(is_protected_path(path) for path in targets):
             return deny("contract and gate-control files cannot be changed under an experiment lease")
         recorded_gate_paths = {
             Path(item["path"])
@@ -1210,11 +1979,12 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
             policy = matching_bash_policy(project, cwd, command, lease)
             if policy is None:
                 return deny("Bash command, fixed arguments, or cwd is outside the structured lease policy")
-            required_gates = [gate for gate in lease.get("pre_run_gates", []) if gate.get("required")]
-            if policy["phase"] != "preparation" and required_gates and lease.get("pre_run_gate_results") is None:
-                return deny("required pre-run gates are not recorded; run the controller gates command before workload or postflight")
-            if policy["phase"] == "preparation" and lease.get("pre_run_gate_results") is not None:
-                return deny("preparation phase is closed after pre-run gates are recorded")
+            if policy.get("capture_binding"):
+                return deny("binding-capture policies must run through controller submit-bind")
+            try:
+                enforce_policy_phase(lease, policy)
+            except GuardError as error:
+                return deny(str(error))
             wake_event = lease.get("wake_event")
             if isinstance(wake_event, dict) and wake_event.get("path") in policy.get("output_paths", []):
                 return deny("structured Bash output would overwrite frozen terminal wake evidence")
@@ -1301,6 +2071,9 @@ def build_parser() -> argparse.ArgumentParser:
     gates = sub.add_parser("gates")
     gates.add_argument("results")
     gates.add_argument("--project")
+    submit_bind = sub.add_parser("submit-bind")
+    submit_bind.add_argument("--policy", required=True)
+    submit_bind.add_argument("--project")
     wait = sub.add_parser("wait")
     wait.add_argument("--event-key", required=True)
     wait.add_argument("--event-path", required=True)
@@ -1309,6 +2082,12 @@ def build_parser() -> argparse.ArgumentParser:
     wake.add_argument("--event-key", required=True)
     wake.add_argument("--event-path", required=True)
     wake.add_argument("--project")
+    wait_monitor = sub.add_parser("wait-monitor")
+    wait_monitor.add_argument("--monitor", required=True)
+    wait_monitor.add_argument("--project")
+    wake_monitor = sub.add_parser("wake-monitor")
+    wake_monitor.add_argument("--monitor", required=True)
+    wake_monitor.add_argument("--project")
     for name in ("activate", "deactivate"):
         item = sub.add_parser(name)
         item.add_argument("--project")
@@ -1328,10 +2107,16 @@ def main(argv: list[str] | None = None) -> int:
             return command_admit(args)
         if args.command == "gates":
             return command_gates(args)
+        if args.command == "submit-bind":
+            return command_submit_bind(args)
         if args.command == "wait":
             return command_wait(args)
         if args.command == "wake":
             return command_wake(args)
+        if args.command == "wait-monitor":
+            return command_wait_monitor(args)
+        if args.command == "wake-monitor":
+            return command_wake_monitor(args)
         if args.command == "checkpoint":
             return command_checkpoint(args)
         if args.command == "activate":

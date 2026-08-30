@@ -44,13 +44,13 @@ Never claim enforcement is active when only the standalone Skill is installed. R
 
 Before selecting work, read `GOAL.md`, `STATE.md`, the recent relevant experiment rows, and the backlog only to avoid repeating deferred work. Keep at most three candidates and select exactly one experiment.
 
-Write a schema-v2 bounded proposal to `optimization/PROPOSAL.json`. Freeze existing evidence with its current SHA-256, future lease mutations by path/scope/operation, preregistered checkpoint artifacts, pre-run gates, and exact Bash executable/argv/cwd/output/resource policies. Obtain one fresh read-only reviewer decision before every admission; this is deliberately once per experiment rather than once per tool call. Use a subagent when available and give it only the contract, frontier, recent evidence, and proposal; do not reveal a desired verdict. It must return exactly one of:
+Write a schema-v2 bounded proposal to `optimization/PROPOSAL.json`. Freeze existing evidence with its current SHA-256, future lease mutations by path/scope/operation, preregistered checkpoint artifacts, pre-run gates, and exact Bash executable/ordered-argv/cwd/output/resource policies. Use `argv` literal tokens for static commands; add reviewed runtime bindings only when an external system produces an identifier after admission. Obtain one fresh read-only reviewer decision before every admission; this is deliberately once per experiment rather than once per tool call. Use a subagent when available and give it only the contract, frontier, recent evidence, and proposal; do not reveal a desired verdict. It must return exactly one of:
 
 ```text
 ALLOW | REJECT_TO_BACKLOG | SWITCH_CHAIN | PAUSE_REQUIRED
 ```
 
-The reviewer checks that the evidence supports admission, lease mutations are bounded, pre-run gates are sufficient, and the proposed mutation happens only after admission. Do not require planned files or mutations to exist before review; the reviewer evaluates the frozen authorization contract. If no reviewer independent of the main agent is available, ask the user instead of self-approving. Record an allowed reviewer as `subagent:<id>` or `user:<id>` with a short reason and all four review checks. This is a behavioral attestation: the controller validates its shape but cannot authenticate its author.
+The reviewer checks that the evidence supports admission, lease mutations are bounded, pre-run gates are sufficient, and the proposed mutation happens only after admission. If required gates exist, it also affirms `preflight_failure_closure_reviewed=true`: every FAIL has preregistered immutable evidence, prohibits workload, and can exit through one invalid checkpoint without another review. For an external monitor, it additionally affirms `external_monitor_contract_bounded=true` after checking the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary. Do not require planned files or mutations to exist before review; the reviewer evaluates the frozen authorization contract. If no reviewer independent of the main agent is available, ask the user instead of self-approving. Record an allowed reviewer as `subagent:<id>` or `user:<id>` with a short reason and all required review checks. This is a behavioral attestation: the controller validates its shape but cannot authenticate its author.
 
 Admit an allowed proposal through the controller:
 
@@ -65,6 +65,8 @@ After preparation produces gate evidence, write `optimization/PRE_RUN_RESULTS.js
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py gates optimization/PRE_RUN_RESULTS.json --project .
 ```
+
+A genuine required-gate `FAIL` is valid evidence, not a controller error. It is frozen exactly once, all further workload and ordinary mutation remain denied, and the same `PASS` cannot be substituted later. Only `RESULT.json` may be staged or corrected; record explicit `valid=false`, `evaluation_integrity=FAIL`, `core_progress=false`, `outcome=invalid`, and `decision=PAUSE_REQUIRED`, use the failed gate artifact as primary evidence, then checkpoint it. A rejected malformed result can be corrected without another review. A valid checkpoint clears the lease without closing or renaming the causal chain; another attempt requires a fresh proposal review.
 
 After evaluation, write `optimization/RESULT.json` with every required preregistered artifact path and actual SHA-256 plus the recorded gate results. The controller verifies evidence integrity and result consistency but does not decide whether a domain metric is good. Update concise Markdown evidence and checkpoint:
 
@@ -90,6 +92,8 @@ python3 <plugin-root>/hooks/goal_guard.py wake --event-key <same-id> --event-pat
 
 Wake events are deduplicated by key and artifact SHA-256. A successful wake freezes that terminal artifact into the lease; postflight cannot overwrite it and checkpoint must present the same SHA. Resume the same lease for postflight and checkpoint; do not create workload, monitoring, and postflight leases merely because the job waited. This state cannot pause Codex Goal scheduling itself, so never claim that the plugin disabled platform automatic continuation.
 
+When the terminal belongs in a deterministic monitor's private state directory, read the external-monitor section of [references/operating-protocol.md](references/operating-protocol.md). Do not add a project relay. Run the reviewed `sbatch --parsable` submission only through `submit-bind`; direct execution is denied before it runs and therefore does not consume the policy. Once the controller actually starts the one-shot submission, success, failure, malformed output, timeout, or uncertain outcome consumes it. Start the monitor with the resulting frozen argv binding, then use `wait-monitor` and `wake-monitor`. The bridge must remain project-read-only. Only the controller may verify the external evidence chain and materialize the protected project receipt. Include that receipt path and SHA under `external_monitor_results` at checkpoint, but never treat scheduler success as the business verdict.
+
 ## Stop unproductive chains
 
 Track the **core progress unit**, stable chain ID and causal bottleneck, and consecutive valid experiments with no core progress. A normally completed frozen evaluator reporting failure or zero yield is a valid no-progress result. Renaming a component or moving among internal contracts cannot reset the chain.
@@ -110,4 +114,4 @@ Waiting does not authorize cleanup. Repeated status recovery, identity/SHA check
 
 ## Enforcement boundary
 
-Hooks reduce accidental drift; they are not a security sandbox. Review and activation fields are attestations rather than authenticated identities. Structured Bash contracts freeze observable invocation fields but cannot infer every process side effect. Hosted tools may not pass through lifecycle hooks, MCP read-only classification is conservative and name-based, project/plugin hooks require trust, and plugin wait cannot reconfigure Codex Goal scheduling. If repeated intentional bypass remains, pause and ask the user before proposing managed hooks or an external orchestrator.
+Hooks reduce accidental drift; they are not a security sandbox. Review and activation fields are attestations rather than authenticated identities. Structured Bash contracts freeze observable invocation fields but cannot infer every process side effect. `submit-bind` inherits the controller process environment while avoiding a shell; keep secrets out of argv and output. Hosted tools may not pass through lifecycle hooks, MCP read-only classification is conservative and name-based, project/plugin hooks require trust, and plugin wait cannot reconfigure Codex Goal scheduling. If repeated intentional bypass remains, pause and ask the user before proposing managed hooks or an external orchestrator.

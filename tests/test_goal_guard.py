@@ -23,7 +23,9 @@ SPEC.loader.exec_module(goal_guard)
 class GoalGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.external_temporary = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary.name)
+        self.monitor_state = Path(self.external_temporary.name) / "codex-hpc-monitor"
         optimization = self.project / "optimization"
         optimization.mkdir()
         (optimization / "GOAL.md").write_text("# Goal\n\nPrimary metric: accepted outputs\n", encoding="utf-8")
@@ -48,6 +50,7 @@ class GoalGuardTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+        self.external_temporary.cleanup()
 
     def write_json(self, name: str, value: dict) -> Path:
         path = self.project / "optimization" / name
@@ -109,6 +112,125 @@ class GoalGuardTests(unittest.TestCase):
                 },
             },
         }
+
+    def external_monitor_proposal(self) -> dict:
+        proposal = self.proposal()
+        submit = self.project / "sbatch"
+        submit.write_text("#!/usr/bin/env python3\nprint('12345;cluster')\n", encoding="utf-8")
+        submit.chmod(0o700)
+        monitor = self.project / "monitor_fake.py"
+        monitor.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        proposal["lease_phase"] = "workload"
+        proposal["runtime_bindings"] = [{
+            "id": "slurm-job", "kind": "slurm_job_id", "source_policy_id": "submit-slurm", "required": True,
+        }]
+        proposal["bash_policies"] = [
+            {
+                "id": "submit-slurm", "phase": "workload", "executable": "./sbatch",
+                "argv": [{"literal": "--parsable"}, {"literal": "train.sbatch"}], "cwd": ".", "output_paths": [],
+                "resources": {"gpu": 0}, "capture_binding": "slurm-job", "max_uses": 1,
+                "timeout_seconds": 10,
+            },
+            {
+                "id": "start-monitor", "phase": "workload", "executable": sys.executable,
+                "argv": [
+                    {"literal": "monitor_fake.py"}, {"literal": "start"}, {"binding": "slurm-job"},
+                    {"literal": "--host"}, {"literal": "fakehost"},
+                    {"literal": "--state-dir"}, {"literal": str(self.monitor_state)},
+                    {"literal": "--expected-owner"}, {"literal": "alice"},
+                    {"literal": "--expected-job-name"}, {"literal": "H25"},
+                    {"literal": "--expected-partition"}, {"literal": "gpu"},
+                ],
+                "cwd": ".", "output_paths": [], "resources": {"gpu": 0}, "max_uses": 1,
+            },
+            {
+                "id": "postflight", "phase": "postflight", "executable": sys.executable,
+                "argv": [{"literal": "postflight.py"}, {"binding": "slurm-job"}],
+                "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
+            },
+        ]
+        proposal["external_monitors"] = [{
+            "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": 1,
+            "binding_id": "slurm-job", "start_policy_id": "start-monitor",
+            "state_root": str(self.monitor_state), "host": "fakehost", "expected_owner": "alice",
+            "expected_job_name": "H25", "expected_partition": "gpu", "required": True,
+        }]
+        proposal["review"]["checks"]["external_monitor_contract_bounded"] = True
+        return proposal
+
+    def write_external_monitor_terminal(self, *, terminal_verified: bool = True, owner: str = "alice") -> tuple[Path, Path]:
+        root = self.monitor_state
+        run_id = "run_test"
+        run = root / "supervisors/fakehost-12345/runs" / run_id
+        run.mkdir(parents=True, exist_ok=True)
+        watcher_argv = [
+            sys.executable, "/opt/codex-hpc-monitor/watch_slurm_job.py", "12345",
+            "--host", "fakehost", "--state-dir", str(root),
+            "--expected-owner", "alice", "--expected-job-name", "H25", "--expected-partition", "gpu",
+        ]
+        manifest = {
+            "schema_version": "codex-hpc-monitor.manifest/v1", "run_id": run_id,
+            "host": "fakehost", "job_id": "12345", "watcher_argv": watcher_argv,
+            "watcher_path_sha256": "1" * 64, "state_dir": str(root),
+            "scope": "slurm_only", "project_gate_evaluated": False,
+            "created_at": goal_guard.iso_time(goal_guard.utc_now()),
+        }
+        manifest_path = run / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        current = root / "supervisors/fakehost-12345/current.json"
+        current.write_text(json.dumps({
+            "schema_version": "codex-hpc-monitor.current/v1", "host": "fakehost",
+            "job_id": "12345", "run_id": run_id,
+        }) + "\n", encoding="utf-8")
+        terminal = {
+            "schema_version": "codex-hpc-monitor.terminal/v1", "run_id": run_id,
+            "host": "fakehost", "job_id": "12345", "scope": "slurm_only",
+            "project_gate_evaluated": False, "observer_state": "exited",
+            "observer_outcome": "watcher_exit_zero", "watcher_exit_code": 0,
+            "manifest_sha256": goal_guard.file_hash(manifest_path),
+            "watcher_result": {"verified": True, "payload": {
+                "job_id": "12345", "owner": owner, "job_name": "H25", "partition": "gpu",
+                "state": "COMPLETED", "exit_code": "0:0", "slurm_classification": "scheduler_success",
+            }},
+        }
+        terminal_path = run / "terminal.json"
+        terminal_path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+        bridge = root / "bridges/fakehost-12345" / run_id / "receipt.json"
+        bridge.parent.mkdir(parents=True, exist_ok=True)
+        bridge_manifest = bridge.with_name("manifest.json")
+        bridge_manifest.write_text(json.dumps({
+            "schema_version": "codex-hpc-monitor.bridge.manifest/v1", "host": "fakehost",
+            "job_id": "12345", "run_id": run_id, "scope": "local_terminal_notification_only",
+            "project_gate_evaluated": False,
+        }) + "\n", encoding="utf-8")
+        bridge.write_text(json.dumps({
+            "schema_version": "codex-hpc-monitor.bridge.receipt/v1", "state": "terminal",
+            "host": "fakehost", "job_id": "12345", "run_id": run_id,
+            "scope": "local_terminal_notification_only", "project_gate_evaluated": False,
+            "problems": [], "wait_exit_code": 0, "manifest_sha256": goal_guard.file_hash(bridge_manifest),
+            "wait_payload": {
+                "schema_version": "codex-hpc-monitor.wait/v1", "state": "terminal",
+                "host": "fakehost", "job_id": "12345", "run_id": run_id,
+                "terminal_verified": terminal_verified, "watcher_exit_code": 0,
+                "terminal_sha256": goal_guard.file_hash(terminal_path),
+            },
+        }) + "\n", encoding="utf-8")
+        return terminal_path, bridge
+
+    def submit_binding(self) -> int:
+        args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return goal_guard.command_submit_bind(args)
+
+    def wait_monitor(self) -> int:
+        args = argparse.Namespace(project=str(self.project), monitor="scheduler")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return goal_guard.command_wait_monitor(args)
+
+    def wake_monitor(self) -> int:
+        args = argparse.Namespace(project=str(self.project), monitor="scheduler")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return goal_guard.command_wake_monitor(args)
 
     def result(
         self,
@@ -296,6 +418,7 @@ class GoalGuardTests(unittest.TestCase):
             "id": "zero-gpu", "kind": "resource", "description": "preparation must use no GPU",
             "required": True, "artifact_id": "zero-gpu-proof", "resource": "gpu", "operator": "max", "value": 0,
         }]
+        proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
         proposal["bash_policies"] = [{
             "id": "gpu-run", "phase": "workload", "executable": "torchrun", "fixed_args": ["train.py"],
             "cwd": ".", "output_paths": [], "resources": {"gpu": 0},
@@ -321,6 +444,7 @@ class GoalGuardTests(unittest.TestCase):
             "id": "optional-audit", "kind": "manual", "description": "optional audit note",
             "required": False, "artifact_id": "zero-gpu-proof",
         }]
+        proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
         proposal["bash_policies"] = [
             {"id": "prepare", "phase": "preparation", "executable": "python3", "fixed_args": ["prepare.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
             {"id": "workload", "phase": "workload", "executable": "python3", "fixed_args": ["run_eval.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
@@ -350,6 +474,80 @@ class GoalGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(goal_guard.GuardError, "SHA-256 mismatched"):
             self.checkpoint(bad)
         self.checkpoint(result)
+
+    def test_required_gate_fail_has_frozen_invalid_checkpoint_and_fresh_review_reentry(self) -> None:
+        proposal = self.proposal()
+        proposal["checkpoint_artifacts"].append({"id": "preflight-proof", "path": "artifacts/preflight.json", "required": True})
+        proposal["pre_run_gates"] = [{
+            "id": "preflight", "kind": "manual", "description": "runtime access monitor must pass",
+            "required": True, "artifact_id": "preflight-proof",
+        }]
+        proposal["bash_policies"] = [
+            {"id": "prepare", "phase": "preparation", "executable": "python3", "fixed_args": ["prepare.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+            {"id": "workload", "phase": "workload", "executable": "python3", "fixed_args": ["run_eval.py"], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+        ]
+        with self.assertRaisesRegex(goal_guard.GuardError, "preflight_failure_closure_reviewed"):
+            self.admit(proposal)
+        proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
+        self.admit(proposal)
+        proof = self.project / "artifacts/preflight.json"
+        proof.write_text('{"runtime_access_monitor": "FAIL"}\n', encoding="utf-8")
+        proof_result = {"id": "preflight-proof", "path": "artifacts/preflight.json", "sha256": goal_guard.file_hash(proof)}
+        failed_gates = [{"id": "preflight", "status": "FAIL", "artifact_id": "preflight-proof"}]
+        gate_payload = {"schema_version": 2, "experiment_id": "E001", "artifact_results": [proof_result], "pre_run_gate_results": failed_gates}
+        self.record_gates(gate_payload)
+        control = goal_guard.load_control(self.project)
+        self.assertTrue(control["active_lease"]["preflight_failed"])
+        workload = self.pre("Bash", "python3 run_eval.py")
+        self.assertIn("preflight gate failed", workload["hookSpecificOutput"]["permissionDecisionReason"])
+        evidence_patch = "*** Begin Patch\n*** Update File: artifacts/preflight.json\n@@\n-FAIL\n+PASS\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", evidence_patch)["hookSpecificOutput"]["permissionDecision"])
+        changed = {**gate_payload, "pre_run_gate_results": [{"id": "preflight", "status": "PASS", "artifact_id": "preflight-proof"}]}
+        with self.assertRaisesRegex(goal_guard.GuardError, "different replay"):
+            self.record_gates(changed)
+
+        invalid = {
+            "schema_version": 2, "experiment_id": "E001", "valid": False,
+            "evaluation_integrity": "FAIL", "core_progress": False,
+            "metric_delta": "preflight failed before workload", "outcome": "invalid",
+            "decision": "PAUSE_REQUIRED", "artifact": "artifacts/preflight.json",
+            "artifact_results": [proof_result], "pre_run_gate_results": failed_gates,
+            "external_monitor_results": [],
+        }
+        state_patch = "*** Begin Patch\n*** Update File: optimization/STATE.md\n@@\n-old\n+changed\n*** End Patch"
+        experiments_patch = "*** Begin Patch\n*** Update File: optimization/EXPERIMENTS.md\n@@\n-old\n+changed\n*** End Patch"
+        result_patch = "*** Begin Patch\n*** Update File: optimization/RESULT.json\n@@\n-{}\n+{}\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", state_patch)["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", self.pre("apply_patch", experiments_patch)["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("apply_patch", result_patch))
+
+        for field, value in (
+            ("valid", "__missing__"),
+            ("valid", None),
+            ("evaluation_integrity", "__missing__"),
+            ("evaluation_integrity", "UNKNOWN"),
+            ("core_progress", "__missing__"),
+            ("core_progress", 0),
+        ):
+            with self.subTest(field=field, value=value):
+                malformed = json.loads(json.dumps(invalid))
+                if value == "__missing__":
+                    malformed.pop(field)
+                else:
+                    malformed[field] = value
+                with self.assertRaisesRegex(goal_guard.GuardError, "requires valid=false"):
+                    self.checkpoint(malformed)
+        self.assertIsNone(self.pre("apply_patch", result_patch))
+        self.checkpoint(invalid)
+        control = goal_guard.load_control(self.project)
+        self.assertIsNone(control["active_lease"])
+        self.assertFalse(control["chains"]["C-main"]["closed"])
+        self.assertTrue(control["last_checkpoint"]["preflight_failed"])
+
+        retry = self.proposal(experiment="E002")
+        retry["review"]["reviewer"] = "subagent:fresh-review-2"
+        self.admit(retry)
+        self.assertEqual("E002", goal_guard.load_control(self.project)["active_lease"]["experiment_id"])
 
     def test_waiting_external_event_preserves_lease_deduplicates_wake_and_stops_polling(self) -> None:
         proposal = self.proposal()
@@ -415,6 +613,113 @@ class GoalGuardTests(unittest.TestCase):
         self.checkpoint(result)
         denial = self.pre("Bash", "python3 postflight.py")
         self.assertIn("missing or expired", denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_external_monitor_binds_once_consumes_bound_argv_and_materializes_receipt(self) -> None:
+        proposal = self.external_monitor_proposal()
+        self.admit(proposal)
+        start_command = (
+            f"{sys.executable} monitor_fake.py start 12345 --host fakehost --state-dir {self.monitor_state} "
+            "--expected-owner alice --expected-job-name H25 --expected-partition gpu"
+        )
+        self.assertEqual("deny", self.pre("Bash", start_command)["hookSpecificOutput"]["permissionDecision"])
+        direct_submit = "./sbatch --parsable train.sbatch"
+        direct_denial = self.pre("Bash", direct_submit)
+        self.assertIn("submit-bind", direct_denial["hookSpecificOutput"]["permissionDecisionReason"])
+
+        self.submit_binding()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("12345", control["active_lease"]["binding_values"]["slurm-job"]["value"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "already consumed"):
+            self.submit_binding()
+        self.assertIsNone(self.pre("Bash", start_command))
+        wrong_job = start_command.replace(" 12345 ", " 99999 ")
+        self.assertEqual("deny", self.pre("Bash", wrong_job)["hookSpecificOutput"]["permissionDecision"])
+
+        terminal, bridge = self.write_external_monitor_terminal()
+        terminal.unlink()
+        bridge.unlink()
+        self.wait_monitor()
+        waiting = goal_guard.load_control(self.project)
+        self.assertEqual("external_monitor", waiting["runtime"]["wait"]["kind"])
+        self.assertEqual("12345", waiting["runtime"]["wait"]["job_id"])
+        self.write_external_monitor_terminal()
+        self.wake_monitor()
+        active = goal_guard.load_control(self.project)["active_lease"]
+        receipt = active["monitor_receipts"]["scheduler"]
+        receipt_path = self.project / receipt["path"]
+        self.assertTrue(receipt_path.is_file())
+        receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("pending", receipt_payload["business_verdict"])
+        self.assertFalse(receipt_payload["project_gate_evaluated"])
+        receipt_patch = f"*** Begin Patch\n*** Update File: {receipt['path']}\n@@\n-x\n+y\n*** End Patch"
+        self.assertEqual("deny", self.pre("apply_patch", receipt_patch)["hookSpecificOutput"]["permissionDecision"])
+
+        result = self.result("E001", core_progress=True, outcome="positive")
+        result["external_monitor_results"] = [{"id": "scheduler", "path": receipt["path"], "sha256": receipt["sha256"]}]
+        self.checkpoint(result)
+        self.assertIsNone(goal_guard.load_control(self.project)["active_lease"])
+
+    def test_external_monitor_rejects_unverified_or_identity_drifted_terminal(self) -> None:
+        for terminal_verified, owner, expected_error in (
+            (False, "alice", "terminal_verified"),
+            (True, "mallory", "identity drifted"),
+        ):
+            with self.subTest(terminal_verified=terminal_verified, owner=owner):
+                if goal_guard.load_control(self.project).get("active_lease") is not None:
+                    self.write_json("CONTROL.json", goal_guard.default_control())
+                self.monitor_state = Path(self.external_temporary.name) / f"monitor-{terminal_verified}-{owner}"
+                proposal = self.external_monitor_proposal()
+                self.admit(proposal)
+                self.submit_binding()
+                terminal, bridge = self.write_external_monitor_terminal()
+                terminal.unlink()
+                bridge.unlink()
+                self.wait_monitor()
+                self.write_external_monitor_terminal(terminal_verified=terminal_verified, owner=owner)
+                with self.assertRaisesRegex(goal_guard.GuardError, expected_error):
+                    self.wake_monitor()
+
+    def test_external_monitor_checkpoint_requires_controller_receipt(self) -> None:
+        proposal = self.external_monitor_proposal()
+        self.admit(proposal)
+        result = self.result("E001")
+        result["external_monitor_results"] = []
+        with self.assertRaisesRegex(goal_guard.GuardError, "required external monitor results"):
+            self.checkpoint(result)
+
+    def test_external_monitor_admission_requires_review_and_exact_start_identity(self) -> None:
+        proposal = self.external_monitor_proposal()
+        proposal["review"]["checks"].pop("external_monitor_contract_bounded")
+        with self.assertRaisesRegex(goal_guard.GuardError, "external_monitor_contract_bounded"):
+            self.admit(proposal)
+        proposal = self.external_monitor_proposal()
+        for token in proposal["bash_policies"][1]["argv"]:
+            if token.get("literal") == "alice":
+                token["literal"] = "mallory"
+        with self.assertRaisesRegex(goal_guard.GuardError, "--expected-owner alice"):
+            self.admit(proposal)
+
+    def test_slurm_runtime_binding_requires_sbatch_parsable_source(self) -> None:
+        proposal = self.external_monitor_proposal()
+        proposal["bash_policies"][0]["executable"] = sys.executable
+        with self.assertRaisesRegex(goal_guard.GuardError, "sbatch"):
+            self.admit(proposal)
+
+        proposal = self.external_monitor_proposal()
+        proposal["bash_policies"][0]["argv"] = [{"literal": "train.sbatch"}]
+        with self.assertRaisesRegex(goal_guard.GuardError, "--parsable"):
+            self.admit(proposal)
+
+    def test_submit_bind_malformed_output_consumes_one_shot_policy(self) -> None:
+        proposal = self.external_monitor_proposal()
+        (self.project / "sbatch").write_text("#!/usr/bin/env python3\nprint('not-a-job')\n", encoding="utf-8")
+        self.admit(proposal)
+        with self.assertRaisesRegex(goal_guard.GuardError, "parsable Slurm Job ID"):
+            self.submit_binding()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("FAILED", control["active_lease"]["binding_values"]["slurm-job"]["state"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "already consumed"):
+            self.submit_binding()
 
     def test_legacy_active_lease_remains_hook_and_checkpoint_compatible(self) -> None:
         legacy_proposal = {"schema_version": 1, "experiment_id": "LEGACY-1", "review": {"decision": "ALLOW"}}

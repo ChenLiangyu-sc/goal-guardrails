@@ -144,6 +144,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                 "final_discriminator": False, "next_paths": None,
                 "review": {"decision": "ALLOW", "reviewer": "subagent:e2e-review", "reason": "future mutations and gates are bounded", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
             }
+            proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
             proposal_path = optimization / "PROPOSAL.json"
             proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
             disabled = self.run_cli(GUARD, "admit", proposal_path, "--project", project, check=False)
@@ -193,6 +194,55 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             self.run_cli(GUARD, "checkpoint", result_path, "--project", project)
             old_lease = self.hook(project, "Bash", {"command": "python3 postflight.py"})
             self.assertEqual("deny", old_lease["hookSpecificOutput"]["permissionDecision"])
+
+    def test_cli_submit_bind_freezes_dynamic_argv_and_rejects_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            self.run_cli(INIT, project)
+            optimization = project / "optimization"
+            (optimization / "GOAL.md").write_text("# Goal\n\nMetric: completed work\n", encoding="utf-8")
+            (optimization / "STATE.md").write_text("# State\n\n- frontier: ready\n", encoding="utf-8")
+            reports = project / "reports"
+            reports.mkdir()
+            baseline = reports / "baseline.json"
+            baseline.write_text('{"completed": 0}\n', encoding="utf-8")
+            artifacts = project / "artifacts"
+            artifacts.mkdir()
+            sbatch = project / "sbatch"
+            sbatch.write_text("#!/usr/bin/env python3\nprint('24680;cluster')\n", encoding="utf-8")
+            sbatch.chmod(0o700)
+            proposal = {
+                "schema_version": 2, "experiment_id": "BIND-001", "chain_id": "C-bind",
+                "chain_kind": "optimization", "parent_chain": None,
+                "causal_bottleneck": "external workload not yet submitted",
+                "hypothesis": "one reviewed submission creates the intended job",
+                "core_progress_expected": "one completed project artifact", "lease_phase": "workload",
+                "existing_evidence": [{"id": "baseline", "path": "reports/baseline.json", "sha256": goal_hash(baseline), "claim": "no completed work"}],
+                "lease_mutations": [{"path": "artifacts", "scope": "tree", "operations": ["add", "update"]}],
+                "checkpoint_artifacts": [{"id": "primary-result", "path": "artifacts/final.json", "required": True}],
+                "pre_run_gates": [],
+                "runtime_bindings": [{"id": "job", "kind": "slurm_job_id", "source_policy_id": "submit", "required": True}],
+                "bash_policies": [
+                    {"id": "submit", "phase": "workload", "executable": "./sbatch", "argv": [{"literal": "--parsable"}, {"literal": "train.sbatch"}], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}, "capture_binding": "job", "max_uses": 1, "timeout_seconds": 10},
+                    {"id": "consume", "phase": "postflight", "executable": sys.executable, "argv": [{"literal": "consume.py"}, {"binding": "job"}], "cwd": ".", "output_paths": [], "resources": {"gpu": 0}},
+                ],
+                "external_monitors": [], "expires_minutes": 10, "max_mutations": 3,
+                "work_class": "core", "cost_units": 1, "final_discriminator": False, "next_paths": None,
+                "review": {"decision": "ALLOW", "reviewer": "subagent:bind-review", "reason": "one-shot submission is bounded", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
+            }
+            proposal_path = optimization / "PROPOSAL.json"
+            proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
+            self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)
+            self.run_cli(GUARD, "admit", proposal_path, "--project", project)
+            bound = self.run_cli(GUARD, "submit-bind", "--policy", "submit", "--project", project)
+            self.assertEqual("24680", json.loads(bound.stdout)["value"])
+            retry = self.run_cli(GUARD, "submit-bind", "--policy", "submit", "--project", project, check=False)
+            self.assertNotEqual(0, retry.returncode)
+            self.assertIn("already consumed", retry.stderr)
+            consume = f"{sys.executable} consume.py 24680"
+            self.assertIsNone(self.hook(project, "Bash", {"command": consume}))
+            wrong = f"{sys.executable} consume.py 13579"
+            self.assertEqual("deny", self.hook(project, "Bash", {"command": wrong})["hookSpecificOutput"]["permissionDecision"])
 
 
 if __name__ == "__main__":
