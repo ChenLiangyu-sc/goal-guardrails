@@ -4,7 +4,9 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.6.0 is fast by default:
+Version 0.6.1 keeps the fast-by-default workflow and repairs the external-monitor wake contract. `wake-monitor` now consumes the monitor's immutable semantic event plus canonical terminal directly; it no longer requires the unrelated legacy `bridges/.../receipt.json` tree.
+
+The fast workflow introduced in 0.6.0 is:
 
 ```text
 GOAL.md + STATE.md
@@ -102,7 +104,7 @@ Use `wait` only when a real bridge can invoke `wake`. Mutation stops until the r
 
 ### External monitor integration
 
-Use this path when a deterministic monitor correctly keeps its terminal evidence outside the project. Admission freezes a `runtime_binding`, a one-shot capture policy, an ordered-argv monitor-start policy, and the external monitor's provider, state root, host, scheduler identity, and binding.
+Use this path when a deterministic monitor correctly keeps its terminal evidence outside the project. Admission freezes a `runtime_binding`, a one-shot capture policy, an ordered-argv monitor-start policy (including event-binding/bridge-config paths and `--require-auto-resume`), and the external monitor's provider, state root, host, scheduler identity, and binding.
 
 Run the frozen submission through the controller rather than executing it directly:
 
@@ -116,10 +118,12 @@ The controller accepts one parsable Slurm Job ID, freezes it, and consumes the s
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py wait-monitor --monitor scheduler --project .
-python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --project .
+python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --event-id sha256:<event-id> --project .
 ```
 
-`wait-monitor` freezes the monitor run and manifest SHA. The event bridge continues to write only its private cache receipt and wake the thread; it never edits the project. `wake-monitor` resolves the canonical receipt path, verifies owner/mode/symlink safety, bridge manifest, Job ID, run ID, terminal SHA, `terminal_verified=true`, monitor manifest, and scheduler owner/name/partition. Only then does the controller create `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. That protected receipt remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
+The monitor start argv must freeze `--event-binding <private-binding.json>` (and normally `--bridge-config <private-config.json> --require-auto-resume`). `wait-monitor` freezes the run and manifest SHA. The event bridge publishes `codex-monitor.event/v1` to its private outbox and wakes the thread; it never edits the project. `wake-monitor` accepts the event ID from the fixed wake message, or derives it from the frozen run for v0.6.0 `CONTROL.json` compatibility. It verifies the immutable semantic event, event binding/workspace, event identity digest, terminal digest, Job ID, run ID, watcher result, and scheduler owner/name/partition before creating a `goal-guardrails.external-monitor-receipt/v2` file under `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. A repeated delivery of the same event ID returns `duplicate` without changing state.
+
+`delivery.json` is deliberately not terminal evidence: while the wake turn is running it may still be pending or leased. The immutable outbox event is notification identity; the independently verified terminal remains scheduler authority. The protected project receipt therefore remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
 
 ## What the hook blocks
 
@@ -161,7 +165,7 @@ This is a behavioral direction guardrail, not a security sandbox. Fast profile i
 
 Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, and users can disable non-managed hooks. Fast mode deliberately avoids pretending it can authorize every local command: it focuses on direction, a small protected boundary, and unattended continuation.
 
-`WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. It makes repeated Goal activations terminate cheaply through injected context and denied polling, but it cannot pause or reconfigure Codex Goal scheduling itself. A project-artifact bridge updates the preregistered file and invokes `wake`; an external-monitor bridge publishes its private immutable receipt, after which the controller invokes `wake-monitor` and materializes the project receipt.
+`WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. It makes repeated Goal activations terminate cheaply through injected context and denied polling, but it cannot pause or reconfigure Codex Goal scheduling itself. A project-artifact bridge updates the preregistered file and invokes `wake`; an external-monitor bridge delivers the immutable semantic event ID, after which the controller invokes `wake-monitor`, independently verifies the canonical terminal, and materializes the project receipt.
 
 Remote Slurm submission deliberately does not accept runtime argv after admission. A transport policy freezes the local SSH executable and digest, host, user, port, dedicated known-hosts file and digest, dedicated identity path and digest, remote helper path and digest, remote `sbatch` path, work directory, receipt root, and submitted file digests. The controller ignores ambient SSH configuration, proxy commands, jump hosts, and agents. `status` reports the controller budget plan: each one-shot submission costs one mutation; doctor, reconciliation, waiting, waking, and receipt materialization cost zero. OpenSSH still invokes the remote command through the remote user's shell, so the helper path is restricted to a safe absolute token; a forced-command SSH key is recommended for a stronger administrative boundary.
 

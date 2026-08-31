@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -141,6 +142,9 @@ class GoalGuardTests(unittest.TestCase):
                     {"literal": "--expected-owner"}, {"literal": "alice"},
                     {"literal": "--expected-job-name"}, {"literal": "H25"},
                     {"literal": "--expected-partition"}, {"literal": "gpu"},
+                    {"literal": "--event-binding"}, {"literal": str(self.monitor_state / "event-binding.json")},
+                    {"literal": "--bridge-config"}, {"literal": str(self.monitor_state / "bridge.json")},
+                    {"literal": "--require-auto-resume"},
                 ],
                 "cwd": ".", "output_paths": [], "resources": {"gpu": 0}, "max_uses": 1,
             },
@@ -196,11 +200,25 @@ class GoalGuardTests(unittest.TestCase):
         proposal["review"]["checks"]["remote_submission_contract_bounded"] = True
         return proposal
 
-    def write_external_monitor_terminal(self, *, terminal_verified: bool = True, owner: str = "alice") -> tuple[Path, Path]:
+    def write_external_monitor_terminal(
+        self,
+        *,
+        terminal_verified: bool = True,
+        owner: str = "alice",
+        workspace: str | None = None,
+    ) -> tuple[Path, Path]:
         root = self.monitor_state
         run_id = "run_test"
         run = root / "supervisors/fakehost-12345/runs" / run_id
         run.mkdir(parents=True, exist_ok=True)
+        event_binding = {
+            "schema": "codex-monitor.event-binding/v1",
+            "codex_home_id": "sha256:" + "a" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_test_1",
+            "workspace": workspace or str(self.project.resolve()),
+        }
+        binding_bytes = (json.dumps(event_binding, sort_keys=True, separators=(",", ":")) + "\n").encode()
         watcher_argv = [
             sys.executable, "/opt/codex-hpc-monitor/watch_slurm_job.py", "12345",
             "--host", "fakehost", "--state-dir", str(root),
@@ -211,6 +229,8 @@ class GoalGuardTests(unittest.TestCase):
             "host": "fakehost", "job_id": "12345", "watcher_argv": watcher_argv,
             "watcher_path_sha256": "1" * 64, "state_dir": str(root),
             "scope": "slurm_only", "project_gate_evaluated": False,
+            "event_binding": event_binding,
+            "event_binding_digest": "sha256:" + hashlib.sha256(binding_bytes).hexdigest(),
             "created_at": goal_guard.iso_time(goal_guard.utc_now()),
         }
         manifest_path = run / "manifest.json"
@@ -227,34 +247,39 @@ class GoalGuardTests(unittest.TestCase):
             "project_gate_evaluated": False, "observer_state": "exited",
             "observer_outcome": "watcher_exit_zero", "watcher_exit_code": 0,
             "manifest_sha256": goal_guard.file_hash(manifest_path),
-            "watcher_result": {"verified": True, "payload": {
+            "watcher_result": {"verified": terminal_verified, "payload": {
                 "job_id": "12345", "owner": owner, "job_name": "H25", "partition": "gpu",
                 "state": "COMPLETED", "exit_code": "0:0", "slurm_classification": "scheduler_success",
             }},
         }
         terminal_path = run / "terminal.json"
         terminal_path.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
-        bridge = root / "bridges/fakehost-12345" / run_id / "receipt.json"
-        bridge.parent.mkdir(parents=True, exist_ok=True)
-        bridge_manifest = bridge.with_name("manifest.json")
-        bridge_manifest.write_text(json.dumps({
-            "schema_version": "codex-hpc-monitor.bridge.manifest/v1", "host": "fakehost",
-            "job_id": "12345", "run_id": run_id, "scope": "local_terminal_notification_only",
-            "project_gate_evaluated": False,
+        event_name = "transport_success" if terminal_verified else "contract_violation"
+        event_monitor = {
+            "backend": "slurm", "handle": "fakehost-12345", "generation": run_id,
+            "terminal_digest": "sha256:" + goal_guard.file_hash(terminal_path),
+        }
+        identity = {
+            "schema": "codex-monitor.event/v1", "monitor": event_monitor,
+            "event": event_name, "binding": event_binding,
+        }
+        identity_bytes = (json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        event_id = "sha256:" + hashlib.sha256(identity_bytes).hexdigest()
+        event = {
+            "schema": "codex-monitor.event/v1", "event_id": event_id,
+            "created_at": goal_guard.iso_time(goal_guard.utc_now()), "monitor": event_monitor,
+            "event": event_name, "exit_code": 0, "business_verdict": "pending",
+            "binding": event_binding,
+        }
+        event_path = root / "outbox" / event_id.removeprefix("sha256:") / "event.json"
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        event_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        (run / "semantic_event.json").write_text(json.dumps({
+            "schema_version": "codex-hpc-monitor.semantic-event/v1", "run_id": run_id,
+            "event_id": event_id, "event": event_name, "state": "published",
+            "published_at": goal_guard.iso_time(goal_guard.utc_now()),
         }) + "\n", encoding="utf-8")
-        bridge.write_text(json.dumps({
-            "schema_version": "codex-hpc-monitor.bridge.receipt/v1", "state": "terminal",
-            "host": "fakehost", "job_id": "12345", "run_id": run_id,
-            "scope": "local_terminal_notification_only", "project_gate_evaluated": False,
-            "problems": [], "wait_exit_code": 0, "manifest_sha256": goal_guard.file_hash(bridge_manifest),
-            "wait_payload": {
-                "schema_version": "codex-hpc-monitor.wait/v1", "state": "terminal",
-                "host": "fakehost", "job_id": "12345", "run_id": run_id,
-                "terminal_verified": terminal_verified, "watcher_exit_code": 0,
-                "terminal_sha256": goal_guard.file_hash(terminal_path),
-            },
-        }) + "\n", encoding="utf-8")
-        return terminal_path, bridge
+        return terminal_path, event_path
 
     def submit_binding(self) -> int:
         args = argparse.Namespace(project=str(self.project), policy="submit-slurm")
@@ -266,8 +291,8 @@ class GoalGuardTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return goal_guard.command_wait_monitor(args)
 
-    def wake_monitor(self) -> int:
-        args = argparse.Namespace(project=str(self.project), monitor="scheduler")
+    def wake_monitor(self, event_id: str | None = None) -> int:
+        args = argparse.Namespace(project=str(self.project), monitor="scheduler", event_id=event_id)
         with contextlib.redirect_stdout(io.StringIO()):
             return goal_guard.command_wake_monitor(args)
 
@@ -725,7 +750,9 @@ class GoalGuardTests(unittest.TestCase):
         self.admit(proposal)
         start_command = (
             f"{sys.executable} monitor_fake.py start 12345 --host fakehost --state-dir {self.monitor_state} "
-            "--expected-owner alice --expected-job-name H25 --expected-partition gpu"
+            "--expected-owner alice --expected-job-name H25 --expected-partition gpu "
+            f"--event-binding {self.monitor_state / 'event-binding.json'} "
+            f"--bridge-config {self.monitor_state / 'bridge.json'} --require-auto-resume"
         )
         self.assertEqual("deny", self.pre("Bash", start_command)["hookSpecificOutput"]["permissionDecision"])
         direct_submit = "./sbatch --parsable train.sbatch"
@@ -741,20 +768,25 @@ class GoalGuardTests(unittest.TestCase):
         wrong_job = start_command.replace(" 12345 ", " 99999 ")
         self.assertEqual("deny", self.pre("Bash", wrong_job)["hookSpecificOutput"]["permissionDecision"])
 
-        terminal, bridge = self.write_external_monitor_terminal()
+        terminal, semantic_event = self.write_external_monitor_terminal()
         terminal.unlink()
-        bridge.unlink()
+        semantic_event.unlink()
         self.wait_monitor()
         waiting = goal_guard.load_control(self.project)
         self.assertEqual("external_monitor", waiting["runtime"]["wait"]["kind"])
         self.assertEqual("12345", waiting["runtime"]["wait"]["job_id"])
-        self.write_external_monitor_terminal()
-        self.wake_monitor()
+        _terminal, semantic_event = self.write_external_monitor_terminal()
+        event_id = "sha256:" + semantic_event.parent.name
+        self.assertFalse((self.monitor_state / "bridges").exists())
+        with self.assertRaisesRegex(goal_guard.GuardError, "requested semantic event"):
+            self.wake_monitor("sha256:" + "0" * 64)
+        self.wake_monitor(event_id)
         active = goal_guard.load_control(self.project)["active_lease"]
         receipt = active["monitor_receipts"]["scheduler"]
         receipt_path = self.project / receipt["path"]
         self.assertTrue(receipt_path.is_file())
         receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("goal-guardrails.external-monitor-receipt/v2", receipt_payload["schema_version"])
         self.assertEqual("pending", receipt_payload["business_verdict"])
         self.assertFalse(receipt_payload["project_gate_evaluated"])
         receipt_patch = f"*** Begin Patch\n*** Update File: {receipt['path']}\n@@\n-x\n+y\n*** End Patch"
@@ -767,7 +799,7 @@ class GoalGuardTests(unittest.TestCase):
 
     def test_external_monitor_rejects_unverified_or_identity_drifted_terminal(self) -> None:
         for terminal_verified, owner, expected_error in (
-            (False, "alice", "terminal_verified"),
+            (False, "alice", "verified monitor evidence chain"),
             (True, "mallory", "identity drifted"),
         ):
             with self.subTest(terminal_verified=terminal_verified, owner=owner):
@@ -777,13 +809,60 @@ class GoalGuardTests(unittest.TestCase):
                 proposal = self.external_monitor_proposal()
                 self.admit(proposal)
                 self.submit_binding()
-                terminal, bridge = self.write_external_monitor_terminal()
+                terminal, semantic_event = self.write_external_monitor_terminal()
                 terminal.unlink()
-                bridge.unlink()
+                semantic_event.unlink()
                 self.wait_monitor()
                 self.write_external_monitor_terminal(terminal_verified=terminal_verified, owner=owner)
                 with self.assertRaisesRegex(goal_guard.GuardError, expected_error):
                     self.wake_monitor()
+
+    def test_external_monitor_rejects_semantic_event_or_workspace_drift(self) -> None:
+        proposal = self.external_monitor_proposal()
+        self.admit(proposal)
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        self.wait_monitor()
+        _terminal, semantic_event = self.write_external_monitor_terminal()
+        event = json.loads(semantic_event.read_text(encoding="utf-8"))
+        event["monitor"]["terminal_digest"] = "sha256:" + "0" * 64
+        semantic_event.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(goal_guard.GuardError, "semantic event does not match"):
+            self.wake_monitor()
+
+        self.write_json("CONTROL.json", goal_guard.default_control())
+        self.monitor_state = Path(self.external_temporary.name) / "monitor-wrong-workspace"
+        proposal = self.external_monitor_proposal()
+        self.admit(proposal)
+        self.submit_binding()
+        wrong_workspace = str(Path(self.external_temporary.name).resolve())
+        terminal, semantic_event = self.write_external_monitor_terminal(workspace=wrong_workspace)
+        terminal.unlink()
+        semantic_event.unlink()
+        self.wait_monitor()
+        self.write_external_monitor_terminal(workspace=wrong_workspace)
+        with self.assertRaisesRegex(goal_guard.GuardError, "different project workspace"):
+            self.wake_monitor()
+
+    def test_external_monitor_wakes_v060_wait_without_event_id_or_delivery_receipt(self) -> None:
+        proposal = self.external_monitor_proposal()
+        self.admit(proposal)
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        self.wait_monitor()
+        self.write_external_monitor_terminal()
+        self.assertFalse((self.monitor_state / "bridges").exists())
+        self.assertFalse(any(self.monitor_state.glob("outbox/*/delivery.json")))
+        self.wake_monitor()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("ACTIVE", control["runtime"]["state"])
+        receipt = control["active_lease"]["monitor_receipts"]["scheduler"]
+        self.assertTrue(receipt["source_semantic_event_id"].startswith("sha256:"))
+        self.assertEqual(0, self.wake_monitor(receipt["source_semantic_event_id"]))
 
     def test_external_monitor_checkpoint_requires_controller_receipt(self) -> None:
         proposal = self.external_monitor_proposal()
@@ -1036,6 +1115,13 @@ class GoalGuardTests(unittest.TestCase):
             if token.get("literal") == "alice":
                 token["literal"] = "mallory"
         with self.assertRaisesRegex(goal_guard.GuardError, "--expected-owner alice"):
+            self.admit(proposal)
+        proposal = self.external_monitor_proposal()
+        proposal["bash_policies"][1]["argv"] = [
+            token for token in proposal["bash_policies"][1]["argv"]
+            if token.get("literal") != "--require-auto-resume"
+        ]
+        with self.assertRaisesRegex(goal_guard.GuardError, "--require-auto-resume"):
             self.admit(proposal)
 
     def test_slurm_runtime_binding_requires_sbatch_parsable_source(self) -> None:

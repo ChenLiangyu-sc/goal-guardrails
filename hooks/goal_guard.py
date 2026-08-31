@@ -50,8 +50,10 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 PATCH_DIRECTIVE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.MULTILINE)
 PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA256_PREFIX_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SLURM_JOB_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 REMOTE_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 REMOTE_SHELL_PATH_RE = re.compile(r"^/[A-Za-z0-9_./:+-]+$")
 RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_-]+$")
@@ -248,6 +250,13 @@ def ensure_sha256(value: Any, name: str) -> str:
     text = ensure_text(value, name, maximum=64).casefold()
     if SHA256_RE.fullmatch(text) is None:
         raise GuardError(f"{name} must be a lowercase SHA-256 digest")
+    return text
+
+
+def ensure_prefixed_sha256(value: Any, name: str) -> str:
+    text = ensure_text(value, name, maximum=71).casefold()
+    if SHA256_PREFIX_RE.fullmatch(text) is None:
+        raise GuardError(f"{name} must be a sha256:<lowercase digest> identifier")
     return text
 
 
@@ -849,6 +858,17 @@ def validate_external_monitors(
                 for token, next_token in zip(template, template[1:])
             ):
                 raise GuardError(f"external monitor start policy must freeze {option} {expected}")
+        for option in ("--event-binding", "--bridge-config"):
+            values = [
+                next_token.get("literal")
+                for token, next_token in zip(template, template[1:])
+                if token.get("literal") == option
+            ]
+            if len(values) != 1 or not isinstance(values[0], str) or not Path(values[0]).is_absolute():
+                raise GuardError(f"external monitor start policy must freeze one absolute {option} path")
+            ensure_safe_token(values[0], f"external monitor {option} path", maximum=500)
+        if not any(token.get("literal") == "--require-auto-resume" for token in template):
+            raise GuardError("external monitor start policy must freeze --require-auto-resume")
         monitors.append({
             "id": monitor_id,
             "provider": "codex-hpc-monitor",
@@ -1795,9 +1815,11 @@ def command_wait_monitor(args: argparse.Namespace) -> int:
 
 
 def verify_monitor_terminal(
+    project: Path,
     lease: dict[str, Any],
     monitor: dict[str, Any],
     wait: dict[str, Any],
+    requested_event_id: str | None = None,
 ) -> dict[str, Any]:
     root = Path(monitor["state_root"])
     run_dir = root / "supervisors" / f"{monitor['host']}-{wait['job_id']}" / "runs" / wait["run_id"]
@@ -1805,47 +1827,10 @@ def verify_monitor_terminal(
     manifest = load_owned_external_json(manifest_path, root)
     if file_hash(manifest_path) != wait.get("manifest_sha256") or manifest.get("job_id") != wait["job_id"]:
         raise GuardError("external monitor manifest changed while waiting")
-    bridge_path = root / "bridges" / f"{monitor['host']}-{wait['job_id']}" / wait["run_id"] / "receipt.json"
-    bridge = load_owned_external_json(bridge_path, root)
-    if (
-        bridge.get("schema_version") != "codex-hpc-monitor.bridge.receipt/v1"
-        or bridge.get("state") != "terminal"
-        or bridge.get("host") != monitor["host"]
-        or bridge.get("job_id") != wait["job_id"]
-        or bridge.get("run_id") != wait["run_id"]
-        or bridge.get("scope") != "local_terminal_notification_only"
-        or bridge.get("project_gate_evaluated") is not False
-        or bridge.get("problems") != []
-        or bridge.get("wait_exit_code") not in {0, 3}
-    ):
-        raise GuardError("external monitor bridge receipt is not a verified terminal receipt")
-    bridge_manifest_path = bridge_path.with_name("manifest.json")
-    bridge_manifest = load_owned_external_json(bridge_manifest_path, root)
-    if (
-        bridge_manifest.get("schema_version") != "codex-hpc-monitor.bridge.manifest/v1"
-        or bridge_manifest.get("host") != monitor["host"]
-        or bridge_manifest.get("job_id") != wait["job_id"]
-        or bridge_manifest.get("run_id") != wait["run_id"]
-        or bridge_manifest.get("scope") != "local_terminal_notification_only"
-        or bridge_manifest.get("project_gate_evaluated") is not False
-        or bridge.get("manifest_sha256") != file_hash(bridge_manifest_path)
-    ):
-        raise GuardError("external monitor bridge manifest is missing or drifted")
-    payload = bridge.get("wait_payload")
-    if not isinstance(payload, dict) or (
-        payload.get("schema_version") != "codex-hpc-monitor.wait/v1"
-        or payload.get("state") != "terminal"
-        or payload.get("host") != monitor["host"]
-        or payload.get("job_id") != wait["job_id"]
-        or payload.get("run_id") != wait["run_id"]
-        or payload.get("terminal_verified") is not True
-    ):
-        raise GuardError("external monitor wait envelope is not terminal_verified")
-    terminal_sha256 = ensure_sha256(payload.get("terminal_sha256"), "external terminal SHA-256")
     terminal_path = run_dir / "terminal.json"
     terminal = load_owned_external_json(terminal_path, root)
-    if file_hash(terminal_path) != terminal_sha256:
-        raise GuardError("external terminal SHA-256 does not match the verified wait envelope")
+    terminal_sha256 = file_hash(terminal_path)
+    watcher_exit_code = terminal.get("watcher_exit_code")
     watcher_result = terminal.get("watcher_result")
     watcher_payload = watcher_result.get("payload") if isinstance(watcher_result, dict) else None
     if (
@@ -1856,8 +1841,7 @@ def verify_monitor_terminal(
         or terminal.get("scope") != "slurm_only"
         or terminal.get("project_gate_evaluated") is not False
         or terminal.get("manifest_sha256") != wait.get("manifest_sha256")
-        or terminal.get("watcher_exit_code") != bridge.get("wait_exit_code")
-        or payload.get("watcher_exit_code") != terminal.get("watcher_exit_code")
+        or type(watcher_exit_code) is not int
         or not isinstance(watcher_result, dict)
         or watcher_result.get("verified") is not True
         or not isinstance(watcher_payload, dict)
@@ -1872,9 +1856,90 @@ def verify_monitor_terminal(
     for key, expected in expected_identity.items():
         if watcher_payload.get(key) != expected:
             raise GuardError(f"external terminal scheduler identity drifted for {key}")
+    publication_path = run_dir / "semantic_event.json"
+    publication = load_owned_external_json(publication_path, root)
+    event_id = ensure_prefixed_sha256(publication.get("event_id"), "external semantic event ID")
+    if requested_event_id is not None and event_id != ensure_prefixed_sha256(requested_event_id, "requested event ID"):
+        raise GuardError("requested semantic event does not match the frozen monitor run")
+    if (
+        set(publication) != {"schema_version", "run_id", "event_id", "event", "state", "published_at"}
+        or publication.get("schema_version") != "codex-hpc-monitor.semantic-event/v1"
+        or publication.get("run_id") != wait["run_id"]
+        or publication.get("state") not in {"published", "duplicate"}
+    ):
+        raise GuardError("external monitor semantic-event publication is invalid")
+    try:
+        parse_time(str(publication.get("published_at")))
+    except (TypeError, ValueError) as error:
+        raise GuardError("external monitor semantic-event timestamp is invalid") from error
+
+    event_path = root / "outbox" / event_id.removeprefix("sha256:") / "event.json"
+    event = load_owned_external_json(event_path, root)
+    expected_event_fields = {
+        "schema", "event_id", "created_at", "monitor", "event", "exit_code", "business_verdict", "binding",
+    }
+    event_monitor = event.get("monitor")
+    event_binding = event.get("binding")
+    manifest_binding = manifest.get("event_binding")
+    expected_binding_fields = {"schema", "codex_home_id", "app_server_instance", "thread_id", "workspace"}
+    if (
+        set(event) != expected_event_fields
+        or event.get("schema") != "codex-monitor.event/v1"
+        or event.get("event_id") != event_id
+        or event.get("event") != publication.get("event")
+        or event.get("business_verdict") != "pending"
+        or not isinstance(event_monitor, dict)
+        or set(event_monitor) != {"backend", "handle", "generation", "terminal_digest"}
+        or event_monitor.get("backend") != "slurm"
+        or event_monitor.get("handle") != f"{monitor['host']}-{wait['job_id']}"
+        or event_monitor.get("generation") != wait["run_id"]
+        or event_monitor.get("terminal_digest") != f"sha256:{terminal_sha256}"
+        or type(event.get("exit_code")) is not int
+        or event.get("exit_code") != watcher_exit_code
+        or not isinstance(event_binding, dict)
+        or set(event_binding) != expected_binding_fields
+        or event_binding != manifest_binding
+        or event_binding.get("schema") != "codex-monitor.event-binding/v1"
+        or not isinstance(event_binding.get("codex_home_id"), str)
+        or SHA256_PREFIX_RE.fullmatch(event_binding["codex_home_id"]) is None
+        or not isinstance(event_binding.get("app_server_instance"), str)
+        or HOST_RE.fullmatch(event_binding["app_server_instance"]) is None
+        or not isinstance(event_binding.get("thread_id"), str)
+        or THREAD_ID_RE.fullmatch(event_binding["thread_id"]) is None
+        or not isinstance(event_binding.get("workspace"), str)
+    ):
+        raise GuardError("external semantic event does not match the frozen monitor and terminal contract")
+    binding_bytes = (json.dumps(event_binding, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if manifest.get("event_binding_digest") != f"sha256:{hashlib.sha256(binding_bytes).hexdigest()}":
+        raise GuardError("external monitor event binding digest is missing or drifted")
+    try:
+        if Path(event_binding["workspace"]).resolve(strict=True) != project.resolve(strict=True):
+            raise GuardError("external semantic event is bound to a different project workspace")
+        parse_time(str(event.get("created_at")))
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise GuardError("external semantic event binding or timestamp is invalid") from error
+    event_identity = {
+        "schema": event.get("schema"),
+        "monitor": event_monitor,
+        "event": event.get("event"),
+        "binding": event_binding,
+    }
+    identity_bytes = (json.dumps(event_identity, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if event_id != f"sha256:{hashlib.sha256(identity_bytes).hexdigest()}":
+        raise GuardError("external semantic event ID does not match its immutable identity")
+    expected_events = {
+        0: "transport_success", 3: "transport_failure", 5: "lost_observability",
+        7: "contract_violation", 8: "lost_observability", 9: "contract_violation",
+        10: "deadline_exceeded",
+    }
+    if expected_events.get(watcher_exit_code) != event.get("event"):
+        raise GuardError("external semantic event does not match the verified watcher outcome")
     return {
-        "bridge_path": bridge_path,
-        "bridge_sha256": file_hash(bridge_path),
+        "event_id": event_id,
+        "event_path": event_path,
+        "event_sha256": file_hash(event_path),
+        "publication_path": publication_path,
+        "publication_sha256": file_hash(publication_path),
         "terminal_path": terminal_path,
         "terminal_sha256": terminal_sha256,
         "terminal": terminal,
@@ -1885,11 +1950,23 @@ def verify_monitor_terminal(
 def command_wake_monitor(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     monitor_id = ensure_id(args.monitor, "monitor")
+    requested_event_id = getattr(args, "event_id", None)
+    if requested_event_id is not None:
+        requested_event_id = ensure_prefixed_sha256(requested_event_id, "requested event ID")
     with state_lock(project):
         gate = load_gate(project)
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
+        seen_events = control["runtime"].get("seen_events", [])
+        if requested_event_id is not None and any(
+            isinstance(item, dict)
+            and item.get("event_key") == requested_event_id
+            and item.get("monitor_id") == monitor_id
+            for item in seen_events
+        ):
+            print("duplicate")
+            return 0
         wait = control["runtime"].get("wait")
         if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
             raise GuardError("runtime is not waiting for an external event")
@@ -1900,14 +1977,14 @@ def command_wake_monitor(args: argparse.Namespace) -> int:
             raise GuardError("waiting runtime lost its active lease")
         verify_frozen_lease(project, lease)
         monitor = monitor_contract(lease, monitor_id)
-        evidence = verify_monitor_terminal(lease, monitor, wait)
+        evidence = verify_monitor_terminal(project, lease, monitor, wait, requested_event_id)
         receipt_rel = RECEIPTS_REL / lease["lease_id"] / f"{monitor_id}.json"
         receipt_path = project / receipt_rel
         if receipt_path.exists() or receipt_path.is_symlink():
             raise GuardError("controller monitor receipt already exists; refusing overwrite")
         watcher_payload = evidence["watcher_payload"]
         project_receipt = {
-            "schema_version": "goal-guardrails.external-monitor-receipt/v1",
+            "schema_version": "goal-guardrails.external-monitor-receipt/v2",
             "lease_id": lease["lease_id"],
             "experiment_id": lease["experiment_id"],
             "monitor_id": monitor_id,
@@ -1923,7 +2000,9 @@ def command_wake_monitor(args: argparse.Namespace) -> int:
                 "manifest_sha256": wait["manifest_sha256"],
             },
             "source": {
-                "bridge_receipt_sha256": evidence["bridge_sha256"],
+                "semantic_event_id": evidence["event_id"],
+                "semantic_event_sha256": evidence["event_sha256"],
+                "semantic_publication_sha256": evidence["publication_sha256"],
                 "terminal_sha256": evidence["terminal_sha256"],
                 "watcher_exit_code": evidence["terminal"].get("watcher_exit_code"),
                 "slurm_classification": watcher_payload.get("slurm_classification"),
@@ -1944,10 +2023,11 @@ def command_wake_monitor(args: argparse.Namespace) -> int:
             "path": receipt_rel.as_posix(),
             "sha256": receipt_sha256,
             "source_terminal_sha256": evidence["terminal_sha256"],
-            "source_bridge_sha256": evidence["bridge_sha256"],
+            "source_semantic_event_id": evidence["event_id"],
+            "source_semantic_event_sha256": evidence["event_sha256"],
         }
         lease["wake_event"] = {
-            "event_key": f"monitor:{monitor_id}:{wait['job_id']}:{wait['run_id']}",
+            "event_key": evidence["event_id"],
             "monitor_id": monitor_id,
             "path": receipt_rel.as_posix(),
             "sha256": receipt_sha256,
@@ -1959,9 +2039,10 @@ def command_wake_monitor(args: argparse.Namespace) -> int:
         seen = control["runtime"].get("seen_events", [])
         seen.append({
             "event_key": lease["wake_event"]["event_key"],
+            "monitor_id": monitor_id,
             "path": receipt_rel.as_posix(),
             "sha256": receipt_sha256,
-            "source_sha256": evidence["bridge_sha256"],
+            "source_sha256": evidence["event_sha256"],
             "time": iso_time(utc_now()),
         })
         control["active_lease"] = lease
@@ -3161,6 +3242,7 @@ def build_parser() -> argparse.ArgumentParser:
     wait_monitor.add_argument("--project")
     wake_monitor = sub.add_parser("wake-monitor")
     wake_monitor.add_argument("--monitor", required=True)
+    wake_monitor.add_argument("--event-id")
     wake_monitor.add_argument("--project")
     for name in ("activate", "deactivate"):
         item = sub.add_parser(name)

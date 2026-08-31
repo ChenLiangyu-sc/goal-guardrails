@@ -104,9 +104,10 @@ Use an external monitor contract instead of a project relay when the monitor own
 
 - one `slurm_job_id` runtime binding and its one-shot capture policy;
 - a monitor-start policy whose ordered argv contains that binding;
-- provider and contract version, state root, host, expected scheduler owner, job name, and partition.
+- provider and contract version, state root, host, expected scheduler owner, job name, and partition;
+- the private event-binding and bridge-config paths in the frozen monitor-start argv.
 
-In strict profile, the fresh reviewer must additionally attest `external_monitor_contract_bounded=true`, covering the one-shot capture, binding consumers, state root, scheduler identity, and receipt boundary. Fast profile performs deterministic controller validation instead.
+In strict profile, the fresh reviewer must additionally attest `external_monitor_contract_bounded=true`, covering the one-shot capture, binding consumers, event binding, state root, scheduler identity, and controller receipt boundary. Fast profile performs deterministic controller validation instead.
 
 The relevant proposal fields have this shape; keep the executable paths and literal arguments specific to the installed monitor:
 
@@ -130,7 +131,10 @@ The relevant proposal fields have this shape; keep the executable paths and lite
         {"literal": "--state-dir"}, {"literal": "/home/USER/.cache/codex-hpc-monitor"},
         {"literal": "--expected-owner"}, {"literal": "USER"},
         {"literal": "--expected-job-name"}, {"literal": "JOB"},
-        {"literal": "--expected-partition"}, {"literal": "PARTITION"}
+        {"literal": "--expected-partition"}, {"literal": "PARTITION"},
+        {"literal": "--event-binding"}, {"literal": "/home/USER/.config/codex-monitor/event-binding.json"},
+        {"literal": "--bridge-config"}, {"literal": "/home/USER/.config/codex-monitor/bridge.json"},
+        {"literal": "--require-auto-resume"}
       ],
       "cwd": ".", "output_paths": [], "resources": {"gpu": 0}
     }
@@ -149,9 +153,9 @@ The relevant proposal fields have this shape; keep the executable paths and lite
 
 Invoke `submit-bind --policy <id>` once. For a local policy the controller executes the frozen argv without a shell. For `ssh-helper-v1`, run `doctor --policy <id>` first; the local controller sends a versioned JSON request to the pinned helper. It parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt. A definitive failure requires a fresh proposal (and fresh review only in strict profile); an uncertain remote result uses `reconcile-bind --policy <id>` against the same nonce and must never be resubmitted. Only controller-frozen values may fill binding tokens.
 
-After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge may publish only its private receipt and a semantic notification. It must not write the project or decide the business outcome.
+After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge publishes a versioned semantic event to its private outbox and delivers only a fixed notification. It must not write the project or decide the business outcome.
 
-On notification, invoke `wake-monitor --monitor <id>`. The controller verifies the private artifact ownership and path, bridge receipt and manifest, frozen Job ID and run ID, terminal SHA and `terminal_verified=true`, monitor manifest, watcher verification, and scheduler identity. It then materializes one protected project receipt below `optimization/.goal-guardrails/receipts/`. Include that receipt and SHA in `RESULT.json.external_monitor_results`. The receipt proves scheduler observation only; the project finalizer, validator, and evaluator still determine evaluation integrity and core progress.
+On notification, invoke `wake-monitor --monitor <id> --event-id <sha256:...from-wake...>`. The event ID argument is optional only for compatibility with an already-waiting v0.6.0 controller; when present it must match the frozen run's publication. The controller verifies private artifact ownership/path, semantic-event publication, immutable outbox event identity and binding, project workspace, frozen Job ID/run ID, terminal digest, monitor manifest, watcher verification, and scheduler identity. It then materializes one protected `goal-guardrails.external-monitor-receipt/v2` file below `optimization/.goal-guardrails/receipts/`. Repeated delivery of the same event ID is an idempotent `duplicate`. The controller does not require `delivery.json` to be delivered because that mutable transport record normally completes after the wake turn. Include the project receipt and SHA in `RESULT.json.external_monitor_results`. The receipt proves scheduler observation only; the project finalizer, validator, and evaluator still determine evaluation integrity and core progress.
 
 Treat the mechanism as exhausted when its declared experiment, wall-clock, or consecutive-no-progress limit is reached. One final discriminator is admissible only when it changes exactly one variable, has a frozen end-to-end evaluator, and names mutually exclusive next paths in advance. A positive result may enter a separately named verification/promotion chain limited to replication and contract-required independent validation. A negative or zero-progress result must enter the named switch or rollback path. An inconclusive result or failed evaluation integrity must enter the named switch, rollback, or pause path. Every outcome closes the original diagnostic/patch chain and cannot authorize another experiment in it.
 
