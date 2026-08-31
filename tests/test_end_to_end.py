@@ -18,6 +18,20 @@ def goal_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def attest_review(project: Path, proposal: dict, *, profile: str = "strict") -> None:
+    contract = dict(proposal)
+    contract.pop("review", None)
+    payload = {
+        "schema": "goal-guardrails.review-subject/v1",
+        "goal_sha256": goal_hash(project / "optimization/GOAL.md"),
+        "profile": profile,
+        "review_epoch": json.loads((project / "optimization/CONTROL.json").read_text(encoding="utf-8")).get("review_epoch", 0),
+        "proposal": contract,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    proposal["review"]["subject_sha256"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 class EndToEndLeaseFlowTests(unittest.TestCase):
     def run_cli(self, *args: object, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -101,9 +115,24 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                     "next_paths": None,
                     "review": {"decision": "ALLOW", "reviewer": f"subagent:r{index}", "reason": "bounded direct test", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
                 }
+                attest_review(project, proposal)
                 proposal_path = optimization / "PROPOSAL.json"
                 proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
                 self.run_cli(GUARD, "admit", proposal_path, "--project", project)
+                if index == 0:
+                    admitted = json.loads(self.run_cli(GUARD, "status", "--project", project).stdout)
+                    self.run_cli(
+                        GUARD, "release", "--expected-proposal-sha256", admitted["active_proposal_sha256"],
+                        "--reason", "correct an unconsumed output contract", "--project", project,
+                    )
+                    stale_review = self.run_cli(GUARD, "admit", proposal_path, "--project", project, check=False)
+                    self.assertNotEqual(0, stale_review.returncode)
+                    self.assertIn("fresh review attestation", stale_review.stderr)
+                    proposal["review"]["reviewer"] = "subagent:r0-fresh"
+                    proposal["review"]["reason"] = "fresh review after safe release"
+                    attest_review(project, proposal)
+                    proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
+                    self.run_cli(GUARD, "admit", proposal_path, "--project", project)
 
                 hook_event = {
                     "hook_event_name": "PreToolUse",
@@ -137,6 +166,16 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
             self.assertIsNone(status["active_experiment"])
             self.assertEqual(0, status["chains"]["C-e2e"]["no_progress_count"])
             self.assertEqual("E002", status["last_checkpoint"]["experiment_id"])
+            staged_goal = project / "GOAL.next.md"
+            staged_goal.write_text("# Goal\n\nMetric: accepted final output yield\n", encoding="utf-8")
+            self.run_cli(
+                GUARD, "update-goal", "--approved-by", "user",
+                "--expected-sha256", goal_hash(optimization / "GOAL.md"),
+                "--from-file", staged_goal, "--reason", "clarify the user-approved metric", "--project", project,
+            )
+            updated = json.loads(self.run_cli(GUARD, "status", "--project", project).stdout)
+            self.assertTrue(updated["enabled"])
+            self.assertEqual(1, updated["goal"]["revision"])
 
     def test_gated_async_lifecycle_from_disabled_admission_through_old_lease_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -174,6 +213,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                 "review": {"decision": "ALLOW", "reviewer": "subagent:e2e-review", "reason": "future mutations and gates are bounded", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
             }
             proposal["review"]["checks"]["preflight_failure_closure_reviewed"] = True
+            attest_review(project, proposal)
             proposal_path = optimization / "PROPOSAL.json"
             proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
             disabled = self.run_cli(GUARD, "admit", proposal_path, "--project", project, check=False)
@@ -260,6 +300,7 @@ class EndToEndLeaseFlowTests(unittest.TestCase):
                 "work_class": "core", "cost_units": 1, "final_discriminator": False, "next_paths": None,
                 "review": {"decision": "ALLOW", "reviewer": "subagent:bind-review", "reason": "one-shot submission is bounded", "checks": {"evidence_sufficient": True, "lease_mutations_bounded": True, "pre_run_gates_sufficient": True, "mutation_not_required_before_admission": True}},
             }
+            attest_review(project, proposal)
             proposal_path = optimization / "PROPOSAL.json"
             proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
             self.run_cli(GUARD, "activate", "--approved-by", "user", "--project", project)

@@ -33,6 +33,7 @@
   "next_paths": null,
   "review": {
     "decision": "TODO: ALLOW | REJECT_TO_BACKLOG | SWITCH_CHAIN | PAUSE_REQUIRED",
+    "subject_sha256": "TODO: output of goal_guard.py subject optimization/PROPOSAL.json --project .",
     "reviewer": "TODO: subagent:<id> | user:<id>",
     "reason": "TODO",
     "checks": {

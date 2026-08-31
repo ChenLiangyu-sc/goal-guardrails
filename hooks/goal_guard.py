@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-HOOK_VERSION = "0.6.3"
+HOOK_VERSION = "0.6.4"
 PROPOSAL_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 2
 MAX_LEASE_MINUTES = 7 * 24 * 60
@@ -38,6 +38,7 @@ PROPOSAL_REL = Path("optimization/PROPOSAL.json")
 RESULT_REL = Path("optimization/RESULT.json")
 PRE_RUN_RESULTS_REL = Path("optimization/PRE_RUN_RESULTS.json")
 CONTROLLER_STATE_REL = Path("optimization/.goal-guardrails")
+GOAL_UPDATE_REL = CONTROLLER_STATE_REL / "goal-update.json"
 RECEIPTS_REL = CONTROLLER_STATE_REL / "receipts"
 EXPERIMENTS_REL = Path("optimization/EXPERIMENTS.md")
 BACKLOG_REL = Path("optimization/BACKLOG.md")
@@ -127,6 +128,23 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def atomic_text(path: Path, value: str) -> None:
+    if path.is_symlink():
+        raise GuardError(f"refusing symbolic-link state path: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 @contextmanager
 def state_lock(project: Path) -> Iterator[None]:
     lock_path = project / "optimization/.goal-guardrails.lock"
@@ -191,6 +209,7 @@ def default_control() -> dict[str, Any]:
         "chains": {},
         "poll": None,
         "last_checkpoint": None,
+        "review_epoch": 0,
         "runtime": {"state": "ACTIVE", "wait": None, "seen_events": []},
     }
 
@@ -227,13 +246,19 @@ def load_control(project: Path) -> dict[str, Any]:
         raise GuardError("CONTROL.json chains must be an object")
     if not isinstance(control.get("runtime"), dict):
         control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": []}
+    control.setdefault("review_epoch", 0)
+    if isinstance(control["review_epoch"], bool) or not isinstance(control["review_epoch"], int) or control["review_epoch"] < 0:
+        raise GuardError("CONTROL.json review_epoch must be a nonnegative integer")
     runtime = control["runtime"]
     runtime.setdefault("state", "ACTIVE")
     runtime.setdefault("wait", None)
     runtime.setdefault("seen_events", [])
     if runtime["state"] not in {"ACTIVE", "WAITING_EXTERNAL_EVENT"} or not isinstance(runtime["seen_events"], list):
         raise GuardError("CONTROL.json runtime state is invalid")
-    migrate_control(control)
+    migrated = migrate_control(control)
+    recovery_persisted_control = recover_goal_update(project, control)
+    if migrated and not recovery_persisted_control:
+        save_control(project, control)
     return control
 
 
@@ -246,6 +271,44 @@ def persist_control_migration(project: Path, control: dict[str, Any]) -> bool:
     if path.exists() and load_json(path).get("controller") == control.get("controller"):
         return False
     save_control(project, control)
+    return True
+
+
+def recover_goal_update(project: Path, control: dict[str, Any]) -> bool:
+    transaction_path = project / GOAL_UPDATE_REL
+    if not transaction_path.exists():
+        return False
+    transaction = load_json(transaction_path)
+    if transaction.get("schema_version") != 1:
+        raise GuardError("unsupported goal update transaction schema")
+    state = transaction.get("state")
+    if state in {"COMMITTED", "ABORTED"}:
+        return False
+    if state != "PREPARED":
+        raise GuardError("goal update transaction state is invalid")
+    goal_path = project / GOAL_REL
+    if goal_path.is_symlink() or not goal_path.is_file():
+        raise GuardError("cannot recover goal update because GOAL.md is missing or unsafe")
+    current_sha256 = file_hash(goal_path)
+    old_sha256 = ensure_sha256(transaction.get("old_sha256"), "goal update old_sha256")
+    new_sha256 = ensure_sha256(transaction.get("new_sha256"), "goal update new_sha256")
+    if current_sha256 == old_sha256:
+        transaction["state"] = "ABORTED"
+        transaction["recovered_at"] = iso_time(utc_now())
+        atomic_json(transaction_path, transaction)
+        return False
+    if current_sha256 != new_sha256:
+        raise GuardError("GOAL.md matches neither side of the prepared controller transaction")
+    metadata = transaction.get("goal_metadata")
+    if not isinstance(metadata, dict) or metadata.get("sha256") != new_sha256:
+        raise GuardError("prepared goal update metadata is invalid")
+    control["goal"] = metadata
+    # CONTROL is the durable roll-forward target. Keep the journal PREPARED
+    # until this write succeeds so a crash can retry recovery idempotently.
+    save_control(project, control)
+    transaction["state"] = "COMMITTED"
+    transaction["recovered_at"] = iso_time(utc_now())
+    atomic_json(transaction_path, transaction)
     return True
 
 
@@ -281,6 +344,33 @@ def ensure_prefixed_sha256(value: Any, name: str) -> str:
     if SHA256_PREFIX_RE.fullmatch(text) is None:
         raise GuardError(f"{name} must be a sha256:<lowercase digest> identifier")
     return text
+
+
+def normalize_sha256(value: Any, name: str) -> str:
+    text = ensure_text(value, name, maximum=71).casefold()
+    if text.startswith("sha256:"):
+        text = text.removeprefix("sha256:")
+    if SHA256_RE.fullmatch(text) is None:
+        raise GuardError(f"{name} must be a lowercase SHA-256 digest, with optional sha256: prefix")
+    return text
+
+
+def review_subject_sha256(
+    project: Path,
+    proposal: dict[str, Any],
+    *,
+    profile: str = "strict",
+    review_epoch: int = 0,
+) -> str:
+    proposal_contract = dict(proposal)
+    proposal_contract.pop("review", None)
+    return "sha256:" + canonical_hash({
+        "schema": "goal-guardrails.review-subject/v1",
+        "goal_sha256": file_hash(project / GOAL_REL),
+        "profile": profile,
+        "review_epoch": review_epoch,
+        "proposal": proposal_contract,
+    })
 
 
 def ensure_safe_token(value: Any, name: str, *, maximum: int = 240) -> str:
@@ -421,12 +511,19 @@ def current_lease(control: dict[str, Any]) -> dict[str, Any] | None:
 def validate_review_attestation(
     review: Any,
     *,
+    expected_subject_sha256: str,
     require_external_monitor: bool = False,
     require_preflight_failure: bool = False,
     require_remote_submission: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(review, dict) or review.get("decision") != "ALLOW":
         raise GuardError("proposal requires an ALLOW review attestation")
+    subject_sha256 = ensure_prefixed_sha256(review.get("subject_sha256"), "review.subject_sha256")
+    if subject_sha256 != expected_subject_sha256:
+        raise GuardError(
+            "review subject does not match the current GOAL/proposal/review-epoch contract; "
+            f"obtain a fresh review attestation for {expected_subject_sha256}"
+        )
     reviewer = ensure_text(review.get("reviewer"), "review.reviewer", maximum=120)
     if not reviewer.startswith(("subagent:", "user:")):
         raise GuardError("review attestation must identify a fresh subagent or user")
@@ -442,6 +539,7 @@ def validate_review_attestation(
         raise GuardError(f"review attestation must affirm checks: {sorted(required_checks)}")
     return {
         "decision": "ALLOW",
+        "subject_sha256": subject_sha256,
         "reviewer": reviewer,
         "reason": ensure_text(review.get("reason"), "review.reason"),
         "checks": {name: True for name in sorted(required_checks)},
@@ -450,6 +548,7 @@ def validate_review_attestation(
 
 def automatic_fast_review_attestation(
     *,
+    subject_sha256: str,
     require_external_monitor: bool = False,
     require_preflight_failure: bool = False,
     require_remote_submission: bool = False,
@@ -468,6 +567,7 @@ def automatic_fast_review_attestation(
         checks.add("remote_submission_contract_bounded")
     return {
         "decision": "ALLOW",
+        "subject_sha256": subject_sha256,
         "reviewer": "controller:fast",
         "reason": "fast profile uses deterministic proposal validation without an external admission review",
         "checks": {name: True for name in sorted(checks)},
@@ -961,6 +1061,12 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
     runtime_bindings = validate_runtime_bindings(proposal.get("runtime_bindings"))
     bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates, runtime_bindings)
     external_monitors = validate_external_monitors(proposal.get("external_monitors"), runtime_bindings, bash_policies)
+    review_epoch = int(control.get("review_epoch", 0))
+    if review_epoch < 0:
+        raise GuardError("CONTROL.json review_epoch is invalid")
+    subject_sha256 = review_subject_sha256(
+        project, proposal, profile=gate_profile(gate), review_epoch=review_epoch
+    )
     review_requirements = {
         "require_external_monitor": bool(external_monitors),
         "require_preflight_failure": any(item["required"] for item in pre_run_gates),
@@ -969,9 +1075,11 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         ),
     }
     if gate_profile(gate) == "fast":
-        reviewer = automatic_fast_review_attestation(**review_requirements)
+        reviewer = automatic_fast_review_attestation(subject_sha256=subject_sha256, **review_requirements)
     else:
-        reviewer = validate_review_attestation(proposal.get("review"), **review_requirements)
+        reviewer = validate_review_attestation(
+            proposal.get("review"), expected_subject_sha256=subject_sha256, **review_requirements
+        )
     parent = proposal.get("parent_chain")
     if parent is not None:
         parent = ensure_id(parent, "parent_chain")
@@ -1081,6 +1189,8 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "final_discriminator": final_discriminator,
         "next_paths": next_paths,
         "review": reviewer,
+        "review_subject_sha256": subject_sha256,
+        "review_epoch": review_epoch,
         "goal_sha256": file_hash(project / GOAL_REL),
         "proposal_sha256": canonical_hash(proposal),
         "proposal_file_sha256": file_hash(project / PROPOSAL_REL),
@@ -2390,6 +2500,160 @@ def command_abort_preflight(args: argparse.Namespace) -> int:
     return command_checkpoint(argparse.Namespace(project=str(project), result=str(project / RESULT_REL)))
 
 
+def command_review_subject(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    proposal_path = Path(args.proposal).resolve()
+    if proposal_path != (project / PROPOSAL_REL).resolve():
+        raise GuardError("review subject must use optimization/PROPOSAL.json from the guarded project")
+    proposal = load_json(proposal_path)
+    with state_lock(project):
+        gate = load_gate(project)
+        control = load_control(project)
+        subject_sha256 = review_subject_sha256(
+            project,
+            proposal,
+            profile=gate_profile(gate),
+            review_epoch=int(control.get("review_epoch", 0)),
+        )
+    print(subject_sha256)
+    return 0
+
+
+def release_blockers(lease: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if int(lease.get("mutations_used", 0)) != 0:
+        blockers.append("mutations_used")
+    for field in ("binding_values", "policy_runs", "transport_doctors", "monitor_receipts"):
+        if lease.get(field):
+            blockers.append(field)
+    if lease.get("pre_run_gate_results") is not None:
+        blockers.append("pre_run_gate_results")
+    for field in ("preflight_failed", "finalization_used", "wake_event", "suspended_at", "remaining_seconds"):
+        if lease.get(field):
+            blockers.append(field)
+    return blockers
+
+
+def command_release_lease(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    expected_proposal_sha256 = normalize_sha256(
+        args.expected_proposal_sha256, "expected proposal SHA-256"
+    )
+    reason = ensure_text(args.reason, "reason")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control.get("runtime", {}).get("state") != "ACTIVE":
+            raise GuardError("cannot release a lease while waiting for an external event")
+        lease = control.get("active_lease")
+        if not isinstance(lease, dict):
+            raise GuardError("there is no active lease to release")
+        if lease.get("proposal_sha256") != expected_proposal_sha256:
+            raise GuardError("expected proposal SHA-256 does not match the active lease")
+        blockers = release_blockers(lease)
+        if blockers:
+            raise GuardError(f"lease authority was already consumed and cannot be released: {sorted(blockers)}")
+        chain = control.get("chains", {}).get(lease.get("chain_id"))
+        if isinstance(chain, dict):
+            if lease.get("work_class") == "non_core":
+                chain["non_core_cost_units"] = max(
+                    0, int(chain.get("non_core_cost_units", 0)) - int(lease.get("cost_units", 0))
+                )
+            if lease.get("final_discriminator"):
+                chain["final_discriminator_used"] = False
+        previous_review_epoch = int(control.get("review_epoch", 0))
+        control["review_epoch"] = previous_review_epoch + 1
+        control["last_lease_release"] = {
+            "schema_version": 1,
+            "lease_id": lease.get("lease_id"),
+            "experiment_id": lease.get("experiment_id"),
+            "chain_id": lease.get("chain_id"),
+            "proposal_sha256": lease.get("proposal_sha256"),
+            "review_subject_sha256": lease.get("review_subject_sha256"),
+            "review_attestation_sha256": canonical_hash(lease.get("review")),
+            "previous_review_epoch": previous_review_epoch,
+            "next_review_epoch": control["review_epoch"],
+            "reason": reason,
+            "released_at": iso_time(utc_now()),
+        }
+        control["active_lease"] = None
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(control["last_lease_release"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_update_goal(args: argparse.Namespace) -> int:
+    if args.approved_by != "user":
+        raise GuardError("goal updates require --approved-by user")
+    project = explicit_project(args.project)
+    source_lexical = Path(os.path.abspath(os.fspath(Path(args.from_file).expanduser())))
+    if source_lexical.is_symlink() or not source_lexical.is_file():
+        raise GuardError("goal update source must be a regular non-symbolic-link file")
+    if source_lexical.resolve() == (project / GOAL_REL).resolve():
+        raise GuardError("goal update source must be a separate staging file")
+    payload = source_lexical.read_bytes()
+    if len(payload) > 1024 * 1024:
+        raise GuardError("goal update source exceeds the 1 MiB limit")
+    try:
+        new_text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise GuardError("goal update source must be UTF-8") from error
+    if not new_text.strip():
+        raise GuardError("goal update source cannot be empty")
+    expected_sha256 = normalize_sha256(args.expected_sha256, "expected GOAL SHA-256")
+    reason = ensure_text(args.reason, "reason")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        if control.get("runtime", {}).get("state") != "ACTIVE":
+            raise GuardError("cannot update GOAL.md while waiting for an external event")
+        if isinstance(control.get("active_lease"), dict):
+            raise GuardError("cannot update GOAL.md while an experiment lease is active")
+        goal_path = project / GOAL_REL
+        if goal_path.is_symlink() or not goal_path.is_file():
+            raise GuardError("GOAL.md is missing or unsafe")
+        old_sha256 = file_hash(goal_path)
+        if old_sha256 != expected_sha256:
+            raise GuardError("expected GOAL SHA-256 does not match the current file")
+        new_sha256 = hashlib.sha256(payload).hexdigest()
+        if new_sha256 == old_sha256:
+            raise GuardError("goal update does not change GOAL.md")
+        previous = control.get("goal") if isinstance(control.get("goal"), dict) else {}
+        metadata = {
+            "schema_version": 1,
+            "revision": int(previous.get("revision", 0)) + 1,
+            "sha256": new_sha256,
+            "previous_sha256": old_sha256,
+            "approved_by": "user",
+            "reason": reason,
+            "updated_at": iso_time(utc_now()),
+        }
+        transaction = {
+            "schema_version": 1,
+            "transaction_id": uuid.uuid4().hex,
+            "state": "PREPARED",
+            "old_sha256": old_sha256,
+            "new_sha256": new_sha256,
+            "goal_metadata": metadata,
+            "prepared_at": iso_time(utc_now()),
+        }
+        transaction_path = project / GOAL_UPDATE_REL
+        atomic_json(transaction_path, transaction)
+        atomic_text(goal_path, new_text)
+        control["goal"] = metadata
+        save_control(project, control)
+        transaction["state"] = "COMMITTED"
+        transaction["committed_at"] = iso_time(utc_now())
+        atomic_json(transaction_path, transaction)
+    print(json.dumps(metadata, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_toggle(args: argparse.Namespace, enabled: bool) -> int:
     if args.approved_by != "user":
         raise GuardError("activation changes require --approved-by user")
@@ -2590,6 +2854,16 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
     }
     if not session_frontier_only:
         status["controller"] = control.get("controller", controller_metadata())
+        status["active_lease_id"] = lease.get("lease_id") if lease else None
+        status["active_proposal_sha256"] = lease.get("proposal_sha256") if lease else None
+        status["mutation_accounting"] = {
+            "routine_local_actions": "not_counted" if gate_profile(gate) == "fast" else "lease_counted",
+            "controller_one_shot_actions": "lease_counted",
+            "release_eligible": not release_blockers(lease) if lease else False,
+        }
+        status["last_lease_release"] = control.get("last_lease_release")
+        status["goal"] = control.get("goal")
+        status["review_epoch"] = int(control.get("review_epoch", 0))
     return status
 
 
@@ -2878,7 +3152,8 @@ def is_controller_command(command: str) -> bool:
         return False
     return script == CONTROLLER_PATH and tokens[2] in {
         "status", "admit", "gates", "doctor", "submit-bind", "reconcile-bind", "wait", "wake", "wait-monitor", "wake-monitor",
-        "checkpoint", "abort", "abort-preflight", "activate", "deactivate", "mode",
+        "checkpoint", "abort", "abort-preflight", "activate", "deactivate", "mode", "subject", "review-subject",
+        "release", "release-lease", "update-goal",
     }
 
 
@@ -2961,9 +3236,11 @@ def option_present(tokens: list[str], *options: str) -> bool:
 
 def git_read_only(tokens: list[str]) -> bool:
     index = 1
+    no_pager = False
     while index < len(tokens) and tokens[index].startswith("-"):
         token = tokens[index]
         if token == "--no-pager":
+            no_pager = True
             index += 1
         elif token == "-C" and index + 1 < len(tokens):
             index += 2
@@ -2977,7 +3254,33 @@ def git_read_only(tokens: list[str]) -> bool:
         return False
     if subcommand == "branch" and args != ["--show-current"]:
         return False
-    return not option_present(args, "--output", "--ext-diff", "--textconv")
+    if option_present(
+        args,
+        "--output", "--ext-diff", "--textconv", "--show-signature", "--verify-signatures",
+        "--format", "--pretty",
+    ):
+        return False
+    if subcommand in {"diff", "log", "show"}:
+        return (
+            no_pager
+            and option_present(args, "--no-ext-diff")
+            and option_present(args, "--no-textconv")
+        )
+    return True
+
+
+def date_read_only(tokens: list[str]) -> bool:
+    args = tokens[1:]
+    utc_seen = False
+    format_seen = False
+    for token in args:
+        if token in {"-u", "--utc", "--universal"} and not utc_seen:
+            utc_seen = True
+        elif token.startswith("+") and len(token) > 1 and not format_seen:
+            format_seen = True
+        else:
+            return False
+    return True
 
 
 def sed_read_only(tokens: list[str]) -> bool:
@@ -3018,8 +3321,10 @@ def simple_command_is_read_only(tokens: list[str]) -> bool:
     if "/" in executable:
         return False
     args = tokens[1:]
-    if executable in {"pwd", "ls", "cat", "echo", "printf", "head", "tail", "wc", "stat", "sha256sum", "jq"}:
+    if executable in {"pwd", "ls", "cat", "echo", "head", "tail", "wc", "stat", "sha256sum", "jq"}:
         return True
+    if executable == "date":
+        return date_read_only(tokens)
     if executable in {"rg", "grep"}:
         return not option_present(args, "--pre", "--pre-glob")
     if executable == "sed":
@@ -3479,6 +3784,19 @@ def build_parser() -> argparse.ArgumentParser:
     wake_monitor.add_argument("--monitor", required=True)
     wake_monitor.add_argument("--event-id")
     wake_monitor.add_argument("--project")
+    subject = sub.add_parser("subject", aliases=["review-subject"])
+    subject.add_argument("proposal")
+    subject.add_argument("--project")
+    release = sub.add_parser("release", aliases=["release-lease"])
+    release.add_argument("--expected-proposal-sha256", required=True)
+    release.add_argument("--reason", required=True)
+    release.add_argument("--project")
+    update_goal = sub.add_parser("update-goal")
+    update_goal.add_argument("--approved-by", required=True)
+    update_goal.add_argument("--expected-sha256", required=True)
+    update_goal.add_argument("--from-file", required=True)
+    update_goal.add_argument("--reason", required=True)
+    update_goal.add_argument("--project")
     for name in ("activate", "deactivate"):
         item = sub.add_parser(name)
         item.add_argument("--project")
@@ -3516,6 +3834,12 @@ def main(argv: list[str] | None = None) -> int:
             return command_wait_monitor(args)
         if args.command == "wake-monitor":
             return command_wake_monitor(args)
+        if args.command in {"subject", "review-subject"}:
+            return command_review_subject(args)
+        if args.command in {"release", "release-lease"}:
+            return command_release_lease(args)
+        if args.command == "update-goal":
+            return command_update_goal(args)
         if args.command == "checkpoint":
             return command_checkpoint(args)
         if args.command in {"abort", "abort-preflight"}:

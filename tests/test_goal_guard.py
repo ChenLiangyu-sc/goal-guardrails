@@ -323,6 +323,15 @@ class GoalGuardTests(unittest.TestCase):
         }
 
     def admit(self, proposal: dict) -> int:
+        review = proposal.get("review")
+        if isinstance(review, dict) and review.get("decision") == "ALLOW":
+            control = goal_guard.load_control(self.project)
+            review["subject_sha256"] = goal_guard.review_subject_sha256(
+                self.project,
+                proposal,
+                profile=goal_guard.gate_profile(goal_guard.load_gate(self.project)),
+                review_epoch=int(control.get("review_epoch", 0)),
+            )
         path = self.write_json("PROPOSAL.json", proposal)
         args = argparse.Namespace(project=str(self.project), proposal=str(path))
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1306,7 +1315,7 @@ class GoalGuardTests(unittest.TestCase):
         protected_python = self.pre("Bash", "python3 -c \"open('optimization/GOAL.md','w').write('x')\"")
         self.assertEqual("deny", protected_python["hookSpecificOutput"]["permissionDecision"])
         self.assertIsNone(self.pre("Bash", "echo optimization/GOAL.md"))
-        self.assertIsNone(self.pre("Bash", "printf '%s\\n' optimization/GATE.json"))
+        self.assertIsNone(self.pre("Bash", "echo optimization/GATE.json"))
         self.assertIsNone(self.pre("Bash", "git status --short; python3 run_eval.py"))
 
     def test_fast_admission_needs_no_external_review_and_does_not_scope_routine_work(self) -> None:
@@ -1379,6 +1388,9 @@ class GoalGuardTests(unittest.TestCase):
 
         self.assertIsNone(self.pre("Bash", "tail -f artifacts/job.log"))
         self.assertIsNone(self.pre("Bash", "squeue -j 12345 | tail -n 1"))
+        self.assertIsNone(self.pre("Bash", "wc -l optimization/GOAL.md"))
+        self.assertIsNone(self.pre("Bash", "cat optimization/GOAL.md | rg 'Primary metric'"))
+        self.assertIsNone(self.pre("Bash", "date -u +%Y-%m-%dT%H:%M:%SZ"))
         compound_poll = self.pre("Bash", "squeue -j 12345; python3 mutate.py")
         self.assertEqual("deny", compound_poll["hookSpecificOutput"]["permissionDecision"])
         redirected_poll = self.pre("Bash", "squeue -j 12345 >/tmp/status")
@@ -1451,11 +1463,13 @@ class GoalGuardTests(unittest.TestCase):
     def test_read_only_shell_semantics_allow_compound_inspection_only(self) -> None:
         allowed = (
             "cat optimization/GOAL.md | rg 'Primary metric'; git status && sed -n '1,25p' optimization/STATE.md",
+            "wc -l optimization/GOAL.md; date -u +%Y-%m-%dT%H:%M:%SZ",
             "find reports -type f | head -n 3",
             "find reports -name '*.json' -type f",
             "squeue -j 12345 | tail -n 1 || sacct -j 12345",
             "nvidia-smi --query-gpu=name --format=csv,noheader",
             "rg 'rm -rf is text' optimization/GOAL.md",
+            "git --no-pager show --no-textconv --no-ext-diff HEAD",
         )
         denied = (
             "cat optimization/GOAL.md >/tmp/goal",
@@ -1467,6 +1481,14 @@ class GoalGuardTests(unittest.TestCase):
             "sed -n '1w /tmp/copy' optimization/GOAL.md",
             "git diff --output=/tmp/diff optimization/GOAL.md",
             "git show --textconv HEAD",
+            "git show HEAD",
+            "git show --no-textconv --no-ext-diff HEAD",
+            "git --no-pager show --no-textconv --no-ext-diff --show-signature HEAD",
+            "git --no-pager log --no-textconv --no-ext-diff --verify-signatures HEAD",
+            "git --no-pager log --no-textconv --no-ext-diff --format='%G?' HEAD",
+            "git --no-pager log --no-textconv --no-ext-diff --pretty=custom HEAD",
+            "printf '%s\\n' optimization/GOAL.md",
+            "date -s 2030-01-01",
             "MODE=inspect cat optimization/GOAL.md",
             "/bin/cat optimization/GOAL.md",
             "cat optimization/GOAL.md &",
@@ -1482,6 +1504,279 @@ class GoalGuardTests(unittest.TestCase):
         for command in denied:
             with self.subTest(command=command):
                 self.assertFalse(goal_guard.is_read_only_command(command))
+
+    def test_strict_waiting_denies_git_external_signature_helpers(self) -> None:
+        control = goal_guard.load_control(self.project)
+        control["runtime"] = {
+            "state": "WAITING_EXTERNAL_EVENT", "wait": {"kind": "artifact"}, "seen_events": [],
+        }
+        self.write_json("CONTROL.json", control)
+        for command in (
+            "git --no-pager show --no-textconv --no-ext-diff --show-signature HEAD",
+            "git --no-pager log --no-textconv --no-ext-diff --verify-signatures HEAD",
+            "git show --no-textconv --no-ext-diff HEAD",
+        ):
+            with self.subTest(command=command):
+                denial = self.pre("Bash", command)
+                self.assertEqual("deny", denial["hookSpecificOutput"]["permissionDecision"])
+        self.assertIsNone(self.pre("Bash", "git status --short"))
+        self.assertIsNone(self.pre("Bash", "git --no-pager show --no-textconv --no-ext-diff HEAD"))
+
+    def test_strict_review_is_bound_to_current_goal_and_proposal(self) -> None:
+        proposal = self.proposal()
+        proposal["review"]["subject_sha256"] = goal_guard.review_subject_sha256(self.project, proposal)
+        proposal["hypothesis"] = "changed after the reviewer inspected the proposal"
+        path = self.write_json("PROPOSAL.json", proposal)
+        with self.assertRaisesRegex(goal_guard.GuardError, "review subject does not match"):
+            goal_guard.command_admit(argparse.Namespace(project=str(self.project), proposal=str(path)))
+
+        proposal = self.proposal()
+        proposal["review"]["subject_sha256"] = goal_guard.review_subject_sha256(self.project, proposal)
+        (self.project / "optimization/GOAL.md").write_text("# Goal\n\nPrimary metric: different\n", encoding="utf-8")
+        path = self.write_json("PROPOSAL.json", proposal)
+        with self.assertRaisesRegex(goal_guard.GuardError, "review subject does not match"):
+            goal_guard.command_admit(argparse.Namespace(project=str(self.project), proposal=str(path)))
+
+    def test_unconsumed_lease_can_be_released_without_disabling_gate(self) -> None:
+        proposal = self.proposal()
+        self.admit(proposal)
+        lease = goal_guard.load_control(self.project)["active_lease"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project), expected_proposal_sha256=lease["proposal_sha256"],
+                reason="output root contract needs correction",
+            ))
+        control = goal_guard.load_control(self.project)
+        self.assertIsNone(control["active_lease"])
+        self.assertTrue(goal_guard.load_gate(self.project)["enabled"])
+        self.assertEqual("C-main", control["last_lease_release"]["chain_id"])
+        stale_path = self.write_json("PROPOSAL.json", proposal)
+        with self.assertRaisesRegex(goal_guard.GuardError, "fresh review attestation"):
+            goal_guard.command_admit(argparse.Namespace(project=str(self.project), proposal=str(stale_path)))
+        proposal["review"]["reviewer"] = "subagent:review-2"
+        proposal["review"]["reason"] = "fresh review after authority release"
+        self.admit(proposal)
+
+    def test_consumed_lease_cannot_use_safe_release(self) -> None:
+        self.admit(self.proposal())
+        self.assertIsNone(self.pre("Bash", "python3 run_eval.py"))
+        lease = goal_guard.load_control(self.project)["active_lease"]
+        with self.assertRaisesRegex(goal_guard.GuardError, "already consumed"):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project), expected_proposal_sha256=lease["proposal_sha256"],
+                reason="too late",
+            ))
+
+    def test_release_blockers_cover_every_controller_effect_and_restore_reservations(self) -> None:
+        base = {
+            "mutations_used": 0, "binding_values": {}, "policy_runs": {}, "transport_doctors": {},
+            "monitor_receipts": {}, "pre_run_gate_results": None, "preflight_failed": False,
+            "finalization_used": False, "wake_event": None,
+        }
+        cases = {
+            "mutations_used": 1,
+            "binding_values": {"job": {"state": "BOUND"}},
+            "policy_runs": {"submit": {"state": "FAILED"}},
+            "transport_doctors": {"submit": {"state": "READY"}},
+            "monitor_receipts": {"scheduler": {"path": "receipt.json"}},
+            "pre_run_gate_results": {"gates": []},
+            "preflight_failed": True,
+            "finalization_used": True,
+            "wake_event": {"path": "terminal.json"},
+            "suspended_at": "2026-08-31T00:00:00Z",
+            "remaining_seconds": 10,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                lease = dict(base)
+                lease[field] = value
+                self.assertIn(field, goal_guard.release_blockers(lease))
+
+        proposal = self.proposal(final=True, work_class="non_core")
+        self.admit(proposal)
+        lease = goal_guard.load_control(self.project)["active_lease"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project), expected_proposal_sha256=lease["proposal_sha256"],
+                reason="restore unused reservations",
+            ))
+        chain = goal_guard.load_control(self.project)["chains"]["C-main"]
+        self.assertEqual(0, chain["non_core_cost_units"])
+        self.assertFalse(chain["final_discriminator_used"])
+
+    def test_subject_command_reports_the_review_binding(self) -> None:
+        proposal = self.proposal()
+        path = self.write_json("PROPOSAL.json", proposal)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            goal_guard.command_review_subject(argparse.Namespace(project=str(self.project), proposal=str(path)))
+        self.assertEqual(goal_guard.review_subject_sha256(self.project, proposal), output.getvalue().strip())
+
+    def test_update_goal_keeps_gate_enabled_and_uses_compare_and_swap(self) -> None:
+        old_sha256 = goal_guard.file_hash(self.project / "optimization/GOAL.md")
+        staged = self.project / "NEW_GOAL.md"
+        staged.write_text("# Goal\n\nPrimary metric: accepted final documents\n", encoding="utf-8")
+        with self.assertRaisesRegex(goal_guard.GuardError, "approved-by user"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="agent", expected_sha256=old_sha256,
+                from_file=str(staged), reason="user requested metric clarification",
+            ))
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256="sha256:" + old_sha256,
+                from_file=str(staged), reason="user requested metric clarification",
+            ))
+        self.assertTrue(goal_guard.load_gate(self.project)["enabled"])
+        self.assertEqual(staged.read_text(encoding="utf-8"), (self.project / "optimization/GOAL.md").read_text(encoding="utf-8"))
+        control = goal_guard.load_control(self.project)
+        self.assertEqual(1, control["goal"]["revision"])
+        transaction = goal_guard.load_json(self.project / goal_guard.GOAL_UPDATE_REL)
+        self.assertEqual("COMMITTED", transaction["state"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "does not match"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256=old_sha256,
+                from_file=str(self.project / "optimization/STATE.md"), reason="stale update",
+            ))
+
+    def test_update_goal_refuses_active_lease_and_recovers_prepared_commit(self) -> None:
+        original_sha256 = goal_guard.file_hash(self.project / "optimization/GOAL.md")
+        staged = self.project / "NEW_GOAL.md"
+        staged.write_text("# Goal\n\nPrimary metric: recovered goal\n", encoding="utf-8")
+        self.admit(self.proposal())
+        with self.assertRaisesRegex(goal_guard.GuardError, "lease is active"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256=original_sha256,
+                from_file=str(staged), reason="must release first",
+            ))
+
+        control = goal_guard.load_control(self.project)
+        control["active_lease"] = None
+        self.write_json("CONTROL.json", control)
+        payload = staged.read_bytes()
+        new_sha256 = hashlib.sha256(payload).hexdigest()
+        metadata = {
+            "schema_version": 1, "revision": 1, "sha256": new_sha256,
+            "previous_sha256": original_sha256, "approved_by": "user",
+            "reason": "recover interrupted update", "updated_at": goal_guard.iso_time(goal_guard.utc_now()),
+        }
+        goal_guard.atomic_json(self.project / goal_guard.GOAL_UPDATE_REL, {
+            "schema_version": 1, "transaction_id": "tx-test", "state": "PREPARED",
+            "old_sha256": original_sha256, "new_sha256": new_sha256,
+            "goal_metadata": metadata, "prepared_at": goal_guard.iso_time(goal_guard.utc_now()),
+        })
+        goal_guard.atomic_text(self.project / "optimization/GOAL.md", staged.read_text(encoding="utf-8"))
+        recovered = goal_guard.load_control(self.project)
+        self.assertEqual(new_sha256, recovered["goal"]["sha256"])
+        self.assertEqual("COMMITTED", goal_guard.load_json(self.project / goal_guard.GOAL_UPDATE_REL)["state"])
+
+    def test_goal_update_recovery_keeps_journal_prepared_when_control_save_fails(self) -> None:
+        goal_path = self.project / "optimization/GOAL.md"
+        old_sha256 = goal_guard.file_hash(goal_path)
+        new_text = "# Goal\n\nPrimary metric: crash recovery\n"
+        new_sha256 = hashlib.sha256(new_text.encode()).hexdigest()
+        metadata = {
+            "schema_version": 1, "revision": 1, "sha256": new_sha256,
+            "previous_sha256": old_sha256, "approved_by": "user", "reason": "fault injection",
+            "updated_at": goal_guard.iso_time(goal_guard.utc_now()),
+        }
+        goal_guard.atomic_json(self.project / goal_guard.GOAL_UPDATE_REL, {
+            "schema_version": 1, "transaction_id": "tx-fault", "state": "PREPARED",
+            "old_sha256": old_sha256, "new_sha256": new_sha256,
+            "goal_metadata": metadata, "prepared_at": goal_guard.iso_time(goal_guard.utc_now()),
+        })
+        goal_guard.atomic_text(goal_path, new_text)
+        with mock.patch.object(goal_guard, "save_control", side_effect=OSError("simulated crash")):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                goal_guard.load_control(self.project)
+        self.assertEqual("PREPARED", goal_guard.load_json(self.project / goal_guard.GOAL_UPDATE_REL)["state"])
+        recovered = goal_guard.load_control(self.project)
+        self.assertEqual(new_sha256, recovered["goal"]["sha256"])
+        self.assertEqual("COMMITTED", goal_guard.load_json(self.project / goal_guard.GOAL_UPDATE_REL)["state"])
+
+    def test_review_epoch_prevents_alternating_attestation_replay(self) -> None:
+        proposal_a = self.proposal()
+        self.admit(proposal_a)
+        lease_a = goal_guard.load_control(self.project)["active_lease"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project), expected_proposal_sha256=lease_a["proposal_sha256"], reason="release A",
+            ))
+
+        proposal_b = self.proposal()
+        proposal_b["review"]["reviewer"] = "subagent:review-B"
+        proposal_b["review"]["reason"] = "fresh B review"
+        self.admit(proposal_b)
+        lease_b = goal_guard.load_control(self.project)["active_lease"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project), expected_proposal_sha256=lease_b["proposal_sha256"], reason="release B",
+            ))
+
+        stale_path = self.write_json("PROPOSAL.json", proposal_a)
+        with self.assertRaisesRegex(goal_guard.GuardError, "review subject does not match"):
+            goal_guard.command_admit(argparse.Namespace(project=str(self.project), proposal=str(stale_path)))
+        self.assertEqual(2, goal_guard.load_control(self.project)["review_epoch"])
+
+    def test_goal_update_recovery_aborts_before_write_and_rejects_ambiguous_state(self) -> None:
+        goal_path = self.project / "optimization/GOAL.md"
+        old_sha256 = goal_guard.file_hash(goal_path)
+        new_sha256 = hashlib.sha256(b"# Goal\n\nnew\n").hexdigest()
+        metadata = {
+            "schema_version": 1, "revision": 1, "sha256": new_sha256,
+            "previous_sha256": old_sha256, "approved_by": "user", "reason": "test",
+            "updated_at": goal_guard.iso_time(goal_guard.utc_now()),
+        }
+        transaction = {
+            "schema_version": 1, "transaction_id": "tx-before", "state": "PREPARED",
+            "old_sha256": old_sha256, "new_sha256": new_sha256,
+            "goal_metadata": metadata, "prepared_at": goal_guard.iso_time(goal_guard.utc_now()),
+        }
+        goal_guard.atomic_json(self.project / goal_guard.GOAL_UPDATE_REL, transaction)
+        control = goal_guard.load_control(self.project)
+        self.assertNotIn("goal", control)
+        self.assertEqual("ABORTED", goal_guard.load_json(self.project / goal_guard.GOAL_UPDATE_REL)["state"])
+
+        transaction["transaction_id"] = "tx-ambiguous"
+        transaction["state"] = "PREPARED"
+        transaction["old_sha256"] = "a" * 64
+        transaction["new_sha256"] = "b" * 64
+        goal_guard.atomic_json(self.project / goal_guard.GOAL_UPDATE_REL, transaction)
+        with self.assertRaisesRegex(goal_guard.GuardError, "neither side"):
+            goal_guard.load_control(self.project)
+
+    def test_update_goal_refuses_waiting_disabled_and_symlink_source(self) -> None:
+        staged = self.project / "GOAL.next.md"
+        staged.write_text("# Goal\n\nnext\n", encoding="utf-8")
+        old_sha256 = goal_guard.file_hash(self.project / "optimization/GOAL.md")
+        control = goal_guard.load_control(self.project)
+        control["runtime"] = {"state": "WAITING_EXTERNAL_EVENT", "wait": {"kind": "artifact"}, "seen_events": []}
+        self.write_json("CONTROL.json", control)
+        with self.assertRaisesRegex(goal_guard.GuardError, "while waiting"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256=old_sha256,
+                from_file=str(staged), reason="wait first",
+            ))
+
+        control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": []}
+        self.write_json("CONTROL.json", control)
+        gate = goal_guard.load_gate(self.project)
+        gate["enabled"] = False
+        self.write_json("GATE.json", gate)
+        with self.assertRaisesRegex(goal_guard.GuardError, "not activated"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256=old_sha256,
+                from_file=str(staged), reason="disabled",
+            ))
+
+        gate["enabled"] = True
+        self.write_json("GATE.json", gate)
+        symlink = self.project / "GOAL.link.md"
+        symlink.symlink_to(staged)
+        with self.assertRaisesRegex(goal_guard.GuardError, "non-symbolic-link"):
+            goal_guard.command_update_goal(argparse.Namespace(
+                project=str(self.project), approved_by="user", expected_sha256=old_sha256,
+                from_file=str(symlink), reason="unsafe source",
+            ))
 
     def test_fast_profile_does_not_block_grouped_reads_of_protected_or_frozen_files(self) -> None:
         gate = goal_guard.load_gate(self.project)

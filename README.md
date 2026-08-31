@@ -4,7 +4,7 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.6.3 builds on the v0.6.2 external-monitor recovery fixes and removes common read-only hook false positives. Pipelines and grouped shell expressions made entirely of recognized inspection commands are allowed, while redirection, substitution, background execution, interpreter stages, and mutating command variants remain denied.
+Version 0.6.4 keeps the v0.6.3 fast path and adds three bounded recovery improvements: strict reviews are cryptographically bound to the current GOAL/proposal subject, an unconsumed lease can be released without disabling the gate, and an explicitly user-approved GOAL update can run as a recoverable compare-and-swap transaction while the gate stays enabled. Query-only `date`, `wc`, `cat`, `rg`, and recognized read pipelines remain available during waiting; write-capable interpreters and ambiguous Git pager, textconv, external-diff, and signature-helper paths stay fail-closed.
 
 The fast workflow introduced in 0.6.0 is:
 
@@ -84,6 +84,7 @@ Strict/external controller commands remain available but are not the normal fast
 
 ```bash
 python3 <plugin-root>/hooks/goal_guard.py status --project .
+python3 <plugin-root>/hooks/goal_guard.py subject optimization/PROPOSAL.json --project .
 python3 <plugin-root>/hooks/goal_guard.py admit optimization/PROPOSAL.json --project .
 python3 <plugin-root>/hooks/goal_guard.py gates optimization/PRE_RUN_RESULTS.json --project .
 python3 <plugin-root>/hooks/goal_guard.py doctor --policy submit-slurm --project .
@@ -92,6 +93,22 @@ python3 <plugin-root>/hooks/goal_guard.py reconcile-bind --policy submit-slurm -
 python3 <plugin-root>/hooks/goal_guard.py abort --project .
 python3 <plugin-root>/hooks/goal_guard.py checkpoint optimization/RESULT.json --project .
 ```
+
+In strict mode, freeze the completed proposal, run `subject`, and give that digest to the fresh reviewer. Admission rejects an attestation for any other GOAL/proposal/review-epoch contract. Every safe release advances a monotonic epoch, so every older subject remains invalid rather than becoming reusable after another release. If admission exposed a contract mistake before any lease-authorized action ran, use the proposal digest reported by `status` to remove authority safely:
+
+```bash
+python3 <plugin-root>/hooks/goal_guard.py release --expected-proposal-sha256 <digest> --reason "correct unconsumed contract" --project .
+```
+
+Release is refused after a mutation, gate result, doctor, binding, policy run, monitor receipt, wait, wake, or finalization effect. It preserves the causal chain and requires a fresh strict review before readmission.
+
+When the user explicitly changes the objective, stage the replacement in a separate UTF-8 file and use the controller instead of briefly deactivating the gate:
+
+```bash
+python3 <plugin-root>/hooks/goal_guard.py update-goal --approved-by user --expected-sha256 <current-goal-digest> --from-file GOAL.next.md --reason "user-approved objective change" --project .
+```
+
+This command requires an active gate, no active lease, no external wait, and an exact old digest. A bounded controller journal recovers an interrupted write; `GATE.json` is never disabled.
 
 For an asynchronous workload, keep the same lease while waiting for one preregistered terminal artifact:
 
@@ -161,7 +178,7 @@ In both profiles a denied tool call does not complete or block the Goal. In fast
 
 ## Boundaries
 
-This is a behavioral direction guardrail, not a security sandbox. Fast profile intentionally relies on the user's Codex YOLO/full-access authorization for ordinary in-scope execution. Its high-impact file checks cover direct `apply_patch`, recognizable Bash path references, and conventional visible MCP path/command fields; arbitrary scripts or opaque hosted tools can have side effects the hook cannot infer. Strict review fields are behavioral attestations; the controller validates their shape but cannot authenticate who produced them.
+This is a behavioral direction guardrail, not a security sandbox. Fast profile intentionally relies on the user's Codex YOLO/full-access authorization for ordinary in-scope execution. Its high-impact file checks cover direct `apply_patch`, recognizable Bash path references, and conventional visible MCP path/command fields; arbitrary scripts or opaque hosted tools can have side effects the hook cannot infer. Strict review fields are behavioral attestations; the controller validates their shape and subject digest but cannot authenticate who produced them.
 
 Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, and users can disable non-managed hooks. Fast mode deliberately avoids pretending it can authorize every local command: it focuses on direction, a small protected boundary, and unattended continuation.
 

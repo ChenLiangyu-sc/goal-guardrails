@@ -2,13 +2,14 @@
   "schema_version": 1,
   "controller": {
     "schema_version": "goal-guardrails.controller-metadata/v1",
-    "installed_plugin_version": "0.6.3",
-    "current_hook_version": "0.6.3"
+    "installed_plugin_version": "0.6.4",
+    "current_hook_version": "0.6.4"
   },
   "active_lease": null,
   "chains": {},
   "poll": null,
   "last_checkpoint": null,
+  "review_epoch": 0,
   "runtime": {
     "state": "ACTIVE",
     "wait": null,

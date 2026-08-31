@@ -54,6 +54,8 @@ In `fast` profile:
 
 Use a schema-v2 proposal and controller lease only when the run needs deterministic one-shot runtime binding, immutable external-monitor evidence, or the user explicitly selected `strict`. Fast admission performs deterministic validation and does not require an external reviewer. Strict profile retains the full review/lease/gates/checkpoint protocol in [references/operating-protocol.md](references/operating-protocol.md).
 
+For strict admission, run `goal_guard.py subject optimization/PROPOSAL.json --project .` after the proposal is complete and require the fresh reviewer to return that exact `subject_sha256`. If an admitted lease contract is wrong but no lease-authorized effect has occurred, use `goal_guard.py release --expected-proposal-sha256 <digest-from-status> --reason <reason> --project .`; never deactivate the gate merely to discard authority. The controller refuses release after any mutation, gate, transport, binding, monitor, wait/wake, or finalization effect, preserves the chain, and requires a fresh strict review.
+
 ## Wait for asynchronous work
 
 When a frozen external workload is running normally and no semantic event is available, enter `WAITING_EXTERNAL_EVENT` instead of returning `blocked`:
@@ -92,6 +94,7 @@ In fast profile, do not create leases for routine work. Keep long local processe
 - Budget exhaustion is `PAUSE_REQUIRED`, never `COMPLETE`.
 - Keep `STATE.md` as a replaceable frontier snapshot; raw detail belongs in artifacts.
 - Do not disable the gate, revise its limits, or deactivate hooks without explicit user approval.
+- For an explicit user-approved GOAL change, stage a separate UTF-8 file and use `goal_guard.py update-goal --approved-by user --expected-sha256 <current> --from-file <staged> --reason <reason> --project .`. It requires no active lease or wait and keeps the gate enabled through a recoverable compare-and-swap transaction.
 - Do not create or activate a Codex Goal unless the user explicitly asks.
 
 ## Enforcement boundary

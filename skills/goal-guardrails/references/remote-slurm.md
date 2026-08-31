@@ -75,6 +75,7 @@ The transport is allowed only on a one-shot policy that captures a required runt
   ],
   "review": {
     "decision": "ALLOW",
+    "subject_sha256": "sha256:<output-of-goal_guard.py-subject>",
     "reviewer": "subagent:<id>",
     "reason": "remote identity, inputs, one-shot receipt, and recovery are bounded",
     "checks": {
