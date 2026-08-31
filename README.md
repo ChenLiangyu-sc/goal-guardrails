@@ -4,7 +4,7 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.6.1 keeps the fast-by-default workflow and repairs the external-monitor wake contract. `wake-monitor` now consumes the monitor's immutable semantic event plus canonical terminal directly; it no longer requires the unrelated legacy `bridges/.../receipt.json` tree.
+Version 0.6.2 keeps the fast-by-default workflow and repairs the external-monitor wake contract. `wake-monitor` consumes the monitor's immutable semantic event plus canonical terminal directly; it no longer requires the unrelated legacy `bridges/.../receipt.json` tree. Required external monitors cannot fall back to project-artifact wait, and a dead-lettered bound delivery is surfaced as `PAUSE_REQUIRED` instead of waiting forever.
 
 The fast workflow introduced in 0.6.0 is:
 

@@ -134,6 +134,7 @@ The relevant proposal fields have this shape; keep the executable paths and lite
         {"literal": "--expected-partition"}, {"literal": "PARTITION"},
         {"literal": "--event-binding"}, {"literal": "/home/USER/.config/codex-monitor/event-binding.json"},
         {"literal": "--bridge-config"}, {"literal": "/home/USER/.config/codex-monitor/bridge.json"},
+        {"literal": "--bridge-service-name"}, {"literal": "codex-monitor-project-bridge"},
         {"literal": "--require-auto-resume"}
       ],
       "cwd": ".", "output_paths": [], "resources": {"gpu": 0}

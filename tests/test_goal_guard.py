@@ -144,6 +144,7 @@ class GoalGuardTests(unittest.TestCase):
                     {"literal": "--expected-partition"}, {"literal": "gpu"},
                     {"literal": "--event-binding"}, {"literal": str(self.monitor_state / "event-binding.json")},
                     {"literal": "--bridge-config"}, {"literal": str(self.monitor_state / "bridge.json")},
+                    {"literal": "--bridge-service-name"}, {"literal": "codex-monitor-test-bridge"},
                     {"literal": "--require-auto-resume"},
                 ],
                 "cwd": ".", "output_paths": [], "resources": {"gpu": 0}, "max_uses": 1,
@@ -752,7 +753,8 @@ class GoalGuardTests(unittest.TestCase):
             f"{sys.executable} monitor_fake.py start 12345 --host fakehost --state-dir {self.monitor_state} "
             "--expected-owner alice --expected-job-name H25 --expected-partition gpu "
             f"--event-binding {self.monitor_state / 'event-binding.json'} "
-            f"--bridge-config {self.monitor_state / 'bridge.json'} --require-auto-resume"
+            f"--bridge-config {self.monitor_state / 'bridge.json'} "
+            "--bridge-service-name codex-monitor-test-bridge --require-auto-resume"
         )
         self.assertEqual("deny", self.pre("Bash", start_command)["hookSpecificOutput"]["permissionDecision"])
         direct_submit = "./sbatch --parsable train.sbatch"
@@ -787,6 +789,8 @@ class GoalGuardTests(unittest.TestCase):
         self.assertTrue(receipt_path.is_file())
         receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         self.assertEqual("goal-guardrails.external-monitor-receipt/v2", receipt_payload["schema_version"])
+        self.assertEqual(event_id, receipt_payload["source"]["semantic_event_id"])
+        self.assertNotIn("bridge_receipt_sha256", receipt_payload["source"])
         self.assertEqual("pending", receipt_payload["business_verdict"])
         self.assertFalse(receipt_payload["project_gate_evaluated"])
         receipt_patch = f"*** Begin Patch\n*** Update File: {receipt['path']}\n@@\n-x\n+y\n*** End Patch"
@@ -863,6 +867,69 @@ class GoalGuardTests(unittest.TestCase):
         receipt = control["active_lease"]["monitor_receipts"]["scheduler"]
         self.assertTrue(receipt["source_semantic_event_id"].startswith("sha256:"))
         self.assertEqual(0, self.wake_monitor(receipt["source_semantic_event_id"]))
+
+    def test_required_external_monitor_rejects_project_artifact_wait(self) -> None:
+        self.admit(self.external_monitor_proposal())
+        args = argparse.Namespace(
+            project=str(self.project), event_key="job-12345",
+            event_path="artifacts/E001.json",
+        )
+        with self.assertRaisesRegex(goal_guard.GuardError, "must use wait-monitor"):
+            goal_guard.command_wait(args)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("ACTIVE", control["runtime"]["state"])
+        self.assertIsNone(control["runtime"]["wait"])
+
+    def test_waiting_external_monitor_reports_pending_then_dead_letter(self) -> None:
+        self.admit(self.external_monitor_proposal())
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        self.wait_monitor()
+        _terminal, semantic_event = self.write_external_monitor_terminal()
+        event_id = "sha256:" + semantic_event.parent.name
+        delivery_path = semantic_event.with_name("delivery.json")
+        delivery = {
+            "schema": "codex-monitor.delivery/v1",
+            "event_id": event_id,
+            "state": "pending",
+            "attempts": 1,
+            "last_error": {"code": None, "safe_message": None},
+        }
+        delivery_path.write_text(json.dumps(delivery) + "\n", encoding="utf-8")
+
+        control = goal_guard.load_control(self.project)
+        pending = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)
+        self.assertEqual("pending", pending["runtime"]["delivery"]["state"])
+        self.assertEqual("WAIT", pending["next_action"]["kind"])
+
+        delivery.update({
+            "state": "dead_letter",
+            "attempts": 2,
+            "last_error": {"code": "operator_interaction_required", "safe_message": "manual action required"},
+        })
+        delivery_path.write_text(json.dumps(delivery) + "\n", encoding="utf-8")
+        paused = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)
+        self.assertEqual("dead_letter", paused["runtime"]["delivery"]["state"])
+        self.assertEqual("PAUSE_REQUIRED", paused["next_action"]["kind"])
+        self.assertIn(event_id, paused["next_action"]["instruction"])
+        self.assertEqual("WAITING_EXTERNAL_EVENT", goal_guard.load_control(self.project)["runtime"]["state"])
+
+    def test_controller_state_migration_tracks_installed_and_current_hook_versions(self) -> None:
+        legacy = goal_guard.default_control()
+        legacy.pop("controller")
+        self.write_json(goal_guard.CONTROL_REL.name, legacy)
+        args = argparse.Namespace(project=str(self.project))
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_status(args)
+        migrated = goal_guard.load_control(self.project)
+        metadata = migrated["controller"]
+        manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], metadata["installed_plugin_version"])
+        self.assertEqual(goal_guard.HOOK_VERSION, metadata["current_hook_version"])
+        saved = json.loads((self.project / goal_guard.CONTROL_REL).read_text(encoding="utf-8"))
+        self.assertEqual(metadata, saved["controller"])
 
     def test_external_monitor_checkpoint_requires_controller_receipt(self) -> None:
         proposal = self.external_monitor_proposal()

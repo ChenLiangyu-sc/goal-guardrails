@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import unittest
@@ -12,13 +13,19 @@ class PackagingTests(unittest.TestCase):
     def test_manifest_points_to_canonical_skill_and_default_hook_exists(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
         self.assertEqual("goal-guardrails", manifest["name"])
-        self.assertEqual("0.6.1", manifest["version"])
+        self.assertEqual("0.6.2", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertTrue((ROOT / "skills/goal-guardrails/SKILL.md").is_file())
         self.assertTrue((ROOT / "hooks/hooks.json").is_file())
         helper = ROOT / "hooks/remote_submit_helper.py"
         self.assertTrue(helper.is_file())
         self.assertTrue(helper.stat().st_mode & 0o100)
+        spec = importlib.util.spec_from_file_location("goal_guard_packaging", ROOT / "hooks/goal_guard.py")
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(manifest["version"], module.HOOK_VERSION)
 
     def test_hook_handlers_use_plugin_root_and_supported_events(self) -> None:
         payload = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))

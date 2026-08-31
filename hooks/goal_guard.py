@@ -21,6 +21,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
+HOOK_VERSION = "0.6.2"
 PROPOSAL_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 2
 MAX_LEASE_MINUTES = 7 * 24 * 60
@@ -194,12 +195,34 @@ def gate_profile(gate: dict[str, Any]) -> str:
 def default_control() -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "controller": controller_metadata(),
         "active_lease": None,
         "chains": {},
         "poll": None,
         "last_checkpoint": None,
         "runtime": {"state": "ACTIVE", "wait": None, "seen_events": []},
     }
+
+
+def controller_metadata() -> dict[str, str]:
+    manifest_path = CONTROLLER_PATH.parent.parent / ".codex-plugin/plugin.json"
+    manifest = load_json(manifest_path)
+    installed = manifest.get("version")
+    if not isinstance(installed, str) or not installed:
+        raise GuardError("plugin manifest version is missing")
+    return {
+        "schema_version": "goal-guardrails.controller-metadata/v1",
+        "installed_plugin_version": installed,
+        "current_hook_version": HOOK_VERSION,
+    }
+
+
+def migrate_control(control: dict[str, Any]) -> bool:
+    expected = controller_metadata()
+    if control.get("controller") == expected:
+        return False
+    control["controller"] = expected
+    return True
 
 
 def load_control(project: Path) -> dict[str, Any]:
@@ -219,11 +242,20 @@ def load_control(project: Path) -> dict[str, Any]:
     runtime.setdefault("seen_events", [])
     if runtime["state"] not in {"ACTIVE", "WAITING_EXTERNAL_EVENT"} or not isinstance(runtime["seen_events"], list):
         raise GuardError("CONTROL.json runtime state is invalid")
+    migrate_control(control)
     return control
 
 
 def save_control(project: Path, control: dict[str, Any]) -> None:
     atomic_json(project / CONTROL_REL, control)
+
+
+def persist_control_migration(project: Path, control: dict[str, Any]) -> bool:
+    path = project / CONTROL_REL
+    if path.exists() and load_json(path).get("controller") == control.get("controller"):
+        return False
+    save_control(project, control)
+    return True
 
 
 def state_nonblank_lines(project: Path) -> int:
@@ -867,6 +899,14 @@ def validate_external_monitors(
             if len(values) != 1 or not isinstance(values[0], str) or not Path(values[0]).is_absolute():
                 raise GuardError(f"external monitor start policy must freeze one absolute {option} path")
             ensure_safe_token(values[0], f"external monitor {option} path", maximum=500)
+        service_names = [
+            next_token.get("literal")
+            for token, next_token in zip(template, template[1:])
+            if token.get("literal") == "--bridge-service-name"
+        ]
+        if len(service_names) != 1 or not isinstance(service_names[0], str):
+            raise GuardError("external monitor start policy must freeze one --bridge-service-name")
+        ensure_safe_token(service_names[0], "external monitor bridge service name", maximum=128)
         if not any(token.get("literal") == "--require-auto-resume" for token in template):
             raise GuardError("external monitor start policy must freeze --require-auto-resume")
         monitors.append({
@@ -2068,6 +2108,8 @@ def command_wait(args: argparse.Namespace) -> int:
         verify_frozen_lease(project, lease)
         if lease.get("wake_event") is not None:
             raise GuardError("this lease already consumed its one terminal wake event")
+        if any(item.get("required") is not False for item in lease.get("external_monitors", [])):
+            raise GuardError("a required external monitor must use wait-monitor, not project-artifact wait")
         event_key = ensure_id(args.event_key, "event_key")
         event_path = normalize_project_path(project, args.event_path)
         event_contracts = {item["path"]: item for item in lease.get("checkpoint_artifacts", [])}
@@ -2394,6 +2436,49 @@ def command_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def external_wait_delivery(control: dict[str, Any]) -> dict[str, Any] | None:
+    runtime = control.get("runtime")
+    wait = runtime.get("wait") if isinstance(runtime, dict) else None
+    lease = control.get("active_lease")
+    if not isinstance(wait, dict) or wait.get("kind") != "external_monitor" or not isinstance(lease, dict):
+        return None
+    monitor = next(
+        (item for item in lease.get("external_monitors", []) if item.get("id") == wait.get("monitor_id")),
+        None,
+    )
+    if not isinstance(monitor, dict):
+        return {"state": "contract_error", "detail": "registered external monitor is missing"}
+    root = Path(monitor["state_root"])
+    run_dir = root / "supervisors" / f"{monitor['host']}-{wait.get('job_id')}" / "runs" / str(wait.get("run_id"))
+    publication_path = run_dir / "semantic_event.json"
+    if not publication_path.exists():
+        return {"state": "pending", "event_id": None}
+    try:
+        publication = load_owned_external_json(publication_path, root)
+        event_id = ensure_prefixed_sha256(publication.get("event_id"), "external semantic event ID")
+        delivery_path = root / "outbox" / event_id.removeprefix("sha256:") / "delivery.json"
+        if not delivery_path.exists():
+            return {"state": "pending", "event_id": event_id}
+        delivery = load_owned_external_json(delivery_path, root)
+        state = delivery.get("state")
+        if (
+            delivery.get("schema") != "codex-monitor.delivery/v1"
+            or delivery.get("event_id") != event_id
+            or state not in {"pending", "leased", "delivered", "dead_letter"}
+        ):
+            raise GuardError("external monitor delivery record is invalid")
+        result = {"state": state, "event_id": event_id, "attempts": delivery.get("attempts")}
+        last_error = delivery.get("last_error")
+        if isinstance(last_error, dict):
+            result["last_error"] = {
+                "code": last_error.get("code"),
+                "safe_message": last_error.get("safe_message"),
+            }
+        return result
+    except GuardError as error:
+        return {"state": "contract_error", "detail": str(error)}
+
+
 def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> dict[str, str]:
     if not gate.get("enabled"):
         return {"kind": "ACTIVATE", "instruction": "Obtain explicit user approval and activate the project gate."}
@@ -2401,6 +2486,14 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
     if runtime.get("state") == "WAITING_EXTERNAL_EVENT":
         wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
         command = "wake-monitor" if wait.get("kind") == "external_monitor" else "wake"
+        delivery = external_wait_delivery(control)
+        if isinstance(delivery, dict) and delivery.get("state") in {"dead_letter", "contract_error"}:
+            event_id = delivery.get("event_id") or "unknown"
+            reason = delivery.get("last_error") or delivery.get("detail") or "transport failure"
+            return {
+                "kind": "PAUSE_REQUIRED",
+                "instruction": f"External monitor delivery {event_id} cannot wake the Goal: {reason}. Repair transport explicitly; do not wait forever or bypass the external monitor.",
+            }
         if gate_profile(gate) == "fast":
             return {
                 "kind": "WAIT",
@@ -2475,7 +2568,14 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         if isinstance(last, dict) and isinstance(last.get("chain_id"), str):
             frontier_ids.append(last["chain_id"])
         chains = {key: control["chains"][key] for key in dict.fromkeys(frontier_ids) if key in control["chains"]}
-    return {
+    runtime_status = {
+        "state": control.get("runtime", {}).get("state", "ACTIVE"),
+        "wait": control.get("runtime", {}).get("wait"),
+    }
+    delivery = external_wait_delivery(control)
+    if delivery is not None:
+        runtime_status["delivery"] = delivery
+    status = {
         "enabled": bool(gate.get("enabled")),
         "profile": gate_profile(gate),
         "active_experiment": lease.get("experiment_id") if lease else None,
@@ -2492,16 +2592,24 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "runtime_bindings": lease.get("binding_values", {}) if lease else {},
         "transport_doctors": lease.get("transport_doctors", {}) if lease else {},
         "external_monitor_receipts": lease.get("monitor_receipts", {}) if lease else {},
-        "runtime": {"state": control.get("runtime", {}).get("state", "ACTIVE"), "wait": control.get("runtime", {}).get("wait")},
+        "runtime": runtime_status,
         "next_action": recommended_next_action(gate, control),
         "chains": {key: {field: value.get(field) for field in ("no_progress_count", "stopline_fired", "closed", "close_outcome")} for key, value in chains.items()},
         "last_checkpoint": control.get("last_checkpoint"),
     }
+    if not session_frontier_only:
+        status["controller"] = control.get("controller", controller_metadata())
+    return status
 
 
 def command_status(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
-    print(json.dumps(compact_status(project, load_gate(project), load_control(project)), ensure_ascii=False, indent=2))
+    with state_lock(project):
+        gate = load_gate(project)
+        control = load_control(project)
+        persist_control_migration(project, control)
+        status = compact_status(project, gate, control)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -3151,15 +3259,20 @@ def command_hook() -> int:
         with state_lock(project):
             control = load_control(project)
             name = event.get("hook_event_name")
+            if name == "SessionStart":
+                persist_control_migration(project, control)
             output: dict[str, Any] | None = None
             if name == "SessionStart":
                 status = compact_status(project, gate, control, session_frontier_only=True)
                 waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+                transport_paused = status.get("next_action", {}).get("kind") == "PAUSE_REQUIRED"
                 if gate_profile(gate) == "fast":
-                    suffix = (
-                        " Runtime is WAITING_EXTERNAL_EVENT: read-only inspection and polling are allowed, but mutation must wait for the registered wake event."
-                        if waiting else ""
-                    )
+                    if transport_paused:
+                        suffix = " External-event delivery cannot wake this Goal; report PAUSE_REQUIRED/transport failure and do not remain in WAIT."
+                    elif waiting:
+                        suffix = " Runtime is WAITING_EXTERNAL_EVENT: read-only inspection and polling are allowed, but mutation must wait for the registered wake event."
+                    else:
+                        suffix = ""
                     output = hook_context(
                         "Goal Guardrails fast profile is active for unattended execution. Current status: "
                         + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
@@ -3170,7 +3283,12 @@ def command_hook() -> int:
                         + suffix
                     )
                 else:
-                    suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived." if waiting else ""
+                    if transport_paused:
+                        suffix = " External-event delivery cannot wake this Goal; report PAUSE_REQUIRED/transport failure instead of waiting."
+                    elif waiting:
+                        suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived."
+                    else:
+                        suffix = ""
                     output = hook_context(
                         "Goal Guardrails enforcement is active in strict profile. Current gate status: "
                         + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
