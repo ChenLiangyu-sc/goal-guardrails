@@ -52,6 +52,8 @@ After `ALLOW`, use the bundled controller to admit the proposal. A proposal is r
 
 The lease limits mutation paths/scopes/operations, exact Bash executable and argv, cwd, declared output paths, GPU resources, expiry, mutation count, work class, and cost. It stores both the canonical proposal SHA and exact proposal-file SHA. MCP mutation fails closed until a parameter-level scope adapter exists. Hook denial means return to admission or checkpoint. Never evade it with another tool, alternate command spelling, direct control-file edits, or gate deactivation. Non-polling read-only inspection does not need a mutation lease but is not a license for adjacent cleanup.
 
+The hook classifies shell inspection one simple command at a time. A pipeline or grouped expression is read-only only when every stage is a recognized inspection command. Redirection, background execution, command substitution, interpreters, external preprocessors, and write-capable command variants make the whole expression non-read-only. This keeps routine `cat`, `rg`, `git status`, and similar evidence inspection out of the lease/approval path without turning a read prefix into an escape hatch.
+
 ## Execute minimally
 
 - Start from the best verified candidate or an explicitly selected frontier, not automatically from `latest`.

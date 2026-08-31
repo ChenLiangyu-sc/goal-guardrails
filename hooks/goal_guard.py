@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-HOOK_VERSION = "0.6.2"
+HOOK_VERSION = "0.6.3"
 PROPOSAL_SCHEMA_VERSION = 2
 RESULT_SCHEMA_VERSION = 2
 MAX_LEASE_MINUTES = 7 * 24 * 60
@@ -60,15 +60,6 @@ REMOTE_SHELL_PATH_RE = re.compile(r"^/[A-Za-z0-9_./:+-]+$")
 RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_-]+$")
 GPU_COMMAND_RE = re.compile(r"(?:^|[/_-])(nvidia-smi|torchrun|deepspeed)(?:$|\s)|\baccelerate\s+launch\b|CUDA_VISIBLE_DEVICES", re.I)
 POLL_RE = re.compile(r"\b(squeue|sacct|qstat|kubectl\s+get|docker\s+ps|systemctl\s+status|nvidia-smi|tail\b|ps\b)", re.I)
-READ_ONLY_PREFIXES = (
-    "pwd", "ls", "cat", "echo", "printf", "rg", "grep", "sed -n", "head", "tail", "wc", "stat", "sha256sum",
-    "git status", "git diff", "git log", "git show", "git rev-parse", "git branch --show-current",
-    "jq",
-)
-MUTATING_SHELL_RE = re.compile(
-    r"(?:^|[;&|]\s*)(?:rm|mv|cp|install|chmod|chown|mkdir|touch|tee|truncate|dd|sed\s+-i|git\s+(?:add|commit|push|reset|checkout|switch|merge|rebase|clean))\b|(?:^|\s)(?:>|>>)(?:\s|$)",
-    re.I,
-)
 FAST_DESTRUCTIVE_RE = re.compile(
     r"(?:^|\s)(?:rm\s+(?:-[A-Za-z]*[rf][A-Za-z]*\s+)+(?:/|~|\$HOME|\.\.?)(?:\s|$)|"
     r"git\s+reset\s+--hard\b|git\s+clean\s+-[A-Za-z]*[fdx][A-Za-z]*\b|"
@@ -2693,7 +2684,7 @@ def command_mutates_fast_protected_path(command: str) -> bool:
         "optimization/.goal-guardrails",
     )
     mentions_protected = any(name in normalized for name in protected_names)
-    return mentions_protected and (MUTATING_SHELL_RE.search(command) is not None or not is_read_only_command(command))
+    return mentions_protected and not is_read_only_command(command)
 
 
 def fast_frozen_lease_paths(lease: dict[str, Any]) -> set[Path]:
@@ -2773,46 +2764,6 @@ def visible_mcp_commands(payload: dict[str, Any]) -> list[str]:
 
     visit(payload)
     return commands
-
-
-def is_fast_bounded_poll(command: str) -> bool:
-    stripped = command.strip()
-    if not stripped or not POLL_RE.search(stripped):
-        return False
-    if re.search(r"[\n;&`<>]|\$\(|\|\||&&", stripped):
-        return False
-    allowed_first = {"squeue", "sacct", "qstat", "kubectl", "docker", "systemctl", "nvidia-smi", "tail", "ps"}
-    allowed_filters = {"head", "tail", "grep", "rg", "jq", "wc"}
-    stages = stripped.split("|")
-    try:
-        tokens = [shlex.split(stage) for stage in stages]
-    except ValueError:
-        return False
-    if not tokens or any(not stage for stage in tokens):
-        return False
-    first = Path(tokens[0][0]).name
-    if first not in allowed_first:
-        return False
-    if first == "kubectl" and (len(tokens[0]) < 2 or tokens[0][1] != "get"):
-        return False
-    if first == "docker" and (len(tokens[0]) < 2 or tokens[0][1] != "ps"):
-        return False
-    if first == "systemctl" and (len(tokens[0]) < 2 or tokens[0][1] != "status"):
-        return False
-    if first == "nvidia-smi":
-        mutating_options = {
-            "--gpu-reset", "-r", "--reset-ecc-errors", "-pm", "--persistence-mode", "-pl", "--power-limit",
-            "-ac", "--applications-clocks",
-        }
-        if any(
-            token == option or token.startswith(option + "=")
-            for token in tokens[0][1:]
-            for option in mutating_options
-        ):
-            return False
-    if any(Path(stage[0]).name == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in stage[1:]) for stage in tokens[1:]):
-        return False
-    return all(Path(stage[0]).name in allowed_filters for stage in tokens[1:])
 
 
 def resembles_capture_policy(command: str, policy: dict[str, Any]) -> bool:
@@ -2938,13 +2889,179 @@ def is_read_only_mcp(tool_name: str) -> bool:
     return any(word in lowered for word in readable) and not any(word in lowered for word in mutating)
 
 
-def is_read_only_command(command: str) -> bool:
+def has_unquoted_shell_glob(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for character in command:
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in {"*", "?", "["}:
+            return True
+    return False
+
+
+def shell_read_stages(command: str) -> list[list[str]] | None:
+    """Split a small shell expression without executing or expanding it.
+
+    Sequential/conditional operators and ordinary pipes are acceptable only
+    when every resulting command is independently read-only. Redirections,
+    background execution, substitutions, and multiline shell are rejected.
+    """
     stripped = command.strip()
-    if not stripped or re.search(r"[\n;&|`<>]|\$\(", stripped) or MUTATING_SHELL_RE.search(stripped) or "--output" in stripped:
+    if (
+        not stripped
+        or "\n" in stripped
+        or "\r" in stripped
+        or "`" in stripped
+        or "$(" in stripped
+        or has_unquoted_shell_glob(stripped)
+    ):
+        return None
+    try:
+        lexer = shlex.shlex(stripped, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    separators = {";", "&&", "||", "|"}
+    stages: list[list[str]] = []
+    stage: list[str] = []
+    for token in tokens:
+        if token in separators:
+            if not stage:
+                return None
+            stages.append(stage)
+            stage = []
+            continue
+        if token and set(token) <= {";", "&", "|", "<", ">"}:
+            return None
+        stage.append(token)
+    if not stage:
+        return None
+    stages.append(stage)
+    return stages
+
+
+def option_present(tokens: list[str], *options: str) -> bool:
+    return any(token == option or token.startswith(option + "=") for token in tokens for option in options)
+
+
+def git_read_only(tokens: list[str]) -> bool:
+    index = 1
+    while index < len(tokens) and tokens[index].startswith("-"):
+        token = tokens[index]
+        if token == "--no-pager":
+            index += 1
+        elif token == "-C" and index + 1 < len(tokens):
+            index += 2
+        else:
+            return False
+    if index >= len(tokens):
         return False
-    if stripped.startswith("sed -n") and re.search(r"(?:^|\s)-i(?:\s|$)", stripped):
+    subcommand = tokens[index]
+    args = tokens[index + 1:]
+    if subcommand not in {"status", "diff", "log", "show", "rev-parse", "branch"}:
         return False
-    return any(stripped == prefix or stripped.startswith(prefix + " ") for prefix in READ_ONLY_PREFIXES)
+    if subcommand == "branch" and args != ["--show-current"]:
+        return False
+    return not option_present(args, "--output", "--ext-diff", "--textconv")
+
+
+def sed_read_only(tokens: list[str]) -> bool:
+    args = tokens[1:]
+    if not args or not option_present(args, "-n", "--quiet", "--silent"):
+        return False
+    if option_present(args, "-i", "--in-place"):
+        return False
+    # Keep the allowed sed surface intentionally small: numeric print ranges
+    # cover the controller/document inspection commands without sed's write or
+    # execute opcodes.
+    scripts: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"-n", "--quiet", "--silent"}:
+            index += 1
+        elif token in {"-e", "--expression"} and index + 1 < len(args):
+            scripts.append(args[index + 1])
+            index += 2
+        elif token.startswith("--expression="):
+            scripts.append(token.split("=", 1)[1])
+            index += 1
+        elif token.startswith("-"):
+            return False
+        elif not scripts:
+            scripts.append(token)
+            index += 1
+        else:
+            index += 1
+    return bool(scripts) and all(re.fullmatch(r"\s*(?:\d+|\$)(?:,(?:\d+|\$))?p\s*", script) for script in scripts)
+
+
+def simple_command_is_read_only(tokens: list[str]) -> bool:
+    if not tokens or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        return False
+    executable = tokens[0]
+    if "/" in executable:
+        return False
+    args = tokens[1:]
+    if executable in {"pwd", "ls", "cat", "echo", "printf", "head", "tail", "wc", "stat", "sha256sum", "jq"}:
+        return True
+    if executable in {"rg", "grep"}:
+        return not option_present(args, "--pre", "--pre-glob")
+    if executable == "sed":
+        return sed_read_only(tokens)
+    if executable == "find":
+        dangerous_actions = {
+            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprint0", "-fprintf",
+        }
+        return not any(token in dangerous_actions for token in args)
+    if executable == "git":
+        return git_read_only(tokens)
+    if executable in {"squeue", "sacct", "qstat", "ps"}:
+        return True
+    if executable == "systemctl":
+        return bool(args) and args[0] == "status"
+    if executable == "docker":
+        return bool(args) and args[0] == "ps"
+    if executable == "kubectl":
+        return bool(args) and args[0] == "get"
+    if executable == "nvidia-smi":
+        value_options = {"-i", "--id", "-l", "--loop", "-lms", "--loop-ms"}
+        flag_options = {
+            "-L", "--list-gpus", "-q", "--query", "-x", "--xml-format", "--dtd", "-h", "--help", "--version",
+        }
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token in flag_options or token.startswith("--query-") or token.startswith("--format="):
+                index += 1
+            elif token in value_options and index + 1 < len(args):
+                index += 2
+            elif any(token.startswith(option + "=") for option in value_options):
+                index += 1
+            else:
+                return False
+        return True
+    return False
+
+
+def is_read_only_command(command: str) -> bool:
+    stages = shell_read_stages(command)
+    return stages is not None and all(simple_command_is_read_only(stage) for stage in stages)
 
 
 def lease_error(project: Path, gate: dict[str, Any], control: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -2983,7 +3100,7 @@ def hook_pre_tool_fast(project: Path, event: dict[str, Any], control: dict[str, 
         return None
     if waiting:
         if tool == "Bash":
-            if is_read_only_command(command) or is_fast_bounded_poll(command):
+            if is_read_only_command(command):
                 return None
         if isinstance(tool, str) and tool.startswith("mcp__") and is_read_only_mcp(tool):
             return None

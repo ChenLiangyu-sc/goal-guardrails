@@ -13,7 +13,7 @@ class PackagingTests(unittest.TestCase):
     def test_manifest_points_to_canonical_skill_and_default_hook_exists(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
         self.assertEqual("goal-guardrails", manifest["name"])
-        self.assertEqual("0.6.2", manifest["version"])
+        self.assertEqual("0.6.3", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertTrue((ROOT / "skills/goal-guardrails/SKILL.md").is_file())
         self.assertTrue((ROOT / "hooks/hooks.json").is_file())

@@ -2,8 +2,8 @@
   "schema_version": 1,
   "controller": {
     "schema_version": "goal-guardrails.controller-metadata/v1",
-    "installed_plugin_version": "0.6.2",
-    "current_hook_version": "0.6.2"
+    "installed_plugin_version": "0.6.3",
+    "current_hook_version": "0.6.3"
   },
   "active_lease": null,
   "chains": {},

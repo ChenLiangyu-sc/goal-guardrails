@@ -1387,6 +1387,12 @@ class GoalGuardTests(unittest.TestCase):
         self.assertEqual("deny", gpu_mutation["hookSpecificOutput"]["permissionDecision"])
         gpu_assignment = self.pre("Bash", "nvidia-smi --power-limit=250")
         self.assertEqual("deny", gpu_assignment["hookSpecificOutput"]["permissionDecision"])
+        gpu_compute_mode = self.pre("Bash", "nvidia-smi -c 1")
+        self.assertEqual("deny", gpu_compute_mode["hookSpecificOutput"]["permissionDecision"])
+        git_textconv = self.pre("Bash", "git show --textconv HEAD")
+        self.assertEqual("deny", git_textconv["hookSpecificOutput"]["permissionDecision"])
+        glob_injection = self.pre("Bash", "find *")
+        self.assertEqual("deny", glob_injection["hookSpecificOutput"]["permissionDecision"])
         preprocessor_poll = self.pre("Bash", "squeue -j 12345 | rg --pre dangerous")
         self.assertEqual("deny", preprocessor_poll["hookSpecificOutput"]["permissionDecision"])
         status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
@@ -1441,6 +1447,56 @@ class GoalGuardTests(unittest.TestCase):
     def test_read_only_prefix_cannot_hide_a_compound_mutation(self) -> None:
         denial = self.pre("Bash", "git status; python3 train.py")
         self.assertEqual("deny", denial["hookSpecificOutput"]["permissionDecision"])
+
+    def test_read_only_shell_semantics_allow_compound_inspection_only(self) -> None:
+        allowed = (
+            "cat optimization/GOAL.md | rg 'Primary metric'; git status && sed -n '1,25p' optimization/STATE.md",
+            "find reports -type f | head -n 3",
+            "find reports -name '*.json' -type f",
+            "squeue -j 12345 | tail -n 1 || sacct -j 12345",
+            "nvidia-smi --query-gpu=name --format=csv,noheader",
+            "rg 'rm -rf is text' optimization/GOAL.md",
+        )
+        denied = (
+            "cat optimization/GOAL.md >/tmp/goal",
+            "cat optimization/GOAL.md 2>&1",
+            "cat optimization/GOAL.md | python3 mutate.py",
+            "rg --pre dangerous pattern optimization/GOAL.md",
+            "find optimization -type f -delete",
+            "find optimization -type f -fprintf /tmp/files '%p\\n'",
+            "sed -n '1w /tmp/copy' optimization/GOAL.md",
+            "git diff --output=/tmp/diff optimization/GOAL.md",
+            "git show --textconv HEAD",
+            "MODE=inspect cat optimization/GOAL.md",
+            "/bin/cat optimization/GOAL.md",
+            "cat optimization/GOAL.md &",
+            "find *",
+            "nvidia-smi *",
+            "nvidia-smi -c 1",
+            "nvidia-smi --compute-mode=1",
+            "nvidia-smi -lgc 1200",
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertTrue(goal_guard.is_read_only_command(command))
+        for command in denied:
+            with self.subTest(command=command):
+                self.assertFalse(goal_guard.is_read_only_command(command))
+
+    def test_fast_profile_does_not_block_grouped_reads_of_protected_or_frozen_files(self) -> None:
+        gate = goal_guard.load_gate(self.project)
+        gate["profile"] = "fast"
+        self.write_json("GATE.json", gate)
+        self.assertIsNone(self.pre("Bash", "cat optimization/GOAL.md | rg Goal; git status"))
+        denied = self.pre("Bash", "cat optimization/GOAL.md | python3 mutate.py")
+        self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
+
+        proposal = self.remote_submission_proposal()
+        proposal.pop("review")
+        self.admit(proposal)
+        self.assertIsNone(self.pre("Bash", "cat train.sbatch | sha256sum; stat train.sbatch"))
+        denied = self.pre("Bash", "cat train.sbatch | tee /tmp/train-copy")
+        self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
 
     def test_self_review_and_rejected_review_cannot_admit(self) -> None:
         proposal = self.proposal()
