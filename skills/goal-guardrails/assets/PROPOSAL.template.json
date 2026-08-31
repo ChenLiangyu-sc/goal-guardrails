@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "experiment_id": "TODO",
   "chain_id": "TODO",
   "chain_kind": "optimization",
@@ -8,6 +8,7 @@
   "hypothesis": "TODO",
   "core_progress_expected": "TODO",
   "lease_phase": "TODO: preparation | workload | postflight | synchronous",
+  "write_once_output_root": "TODO: fresh output file or directory for this attempt",
   "existing_evidence": [
     {"id": "baseline", "path": "TODO", "sha256": "TODO", "claim": "TODO"}
   ],
@@ -16,6 +17,15 @@
   ],
   "checkpoint_artifacts": [
     {"id": "primary-result", "path": "TODO", "required": true}
+  ],
+  "evaluation_contract": {
+    "expected_attempts": 1,
+    "minimum_result_rows": 1,
+    "evaluator_artifact_id": "primary-result",
+    "required_artifact_ids": ["primary-result"]
+  },
+  "recovery_paths": [
+    {"id": "repair-execution", "kind": "recovery", "description": "Repair a reversible execution failure and retry once", "max_attempts": 1, "write_once_output_root": "TODO: new successor output path"}
   ],
   "pre_run_gates": [
     {"id": "zero-gpu", "kind": "resource", "description": "TODO", "required": true, "artifact_id": "TODO", "resource": "gpu", "operator": "max", "value": 0}

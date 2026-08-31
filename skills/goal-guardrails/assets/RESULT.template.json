@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "experiment_id": "TODO",
   "valid": true,
   "evaluation_integrity": "PASS",
@@ -7,6 +7,16 @@
   "metric_delta": "TODO",
   "outcome": "TODO: positive | negative | zero_progress | inconclusive | invalid",
   "decision": "TODO: CONTINUE | REPLICATE | SWITCH | ROLLBACK | PAUSE_REQUIRED | COMPLETE",
+  "evaluation_summary": {
+    "expected_attempts": 1,
+    "completed_attempts": 1,
+    "result_rows": 1,
+    "evaluator_completion": "TODO: complete | missing | corrupt",
+    "artifact_completeness": "TODO: complete | incomplete",
+    "gate_determinacy": "TODO: determinate | indeterminate",
+    "threshold_result": "TODO: pass | fail | not_evaluated",
+    "guardrail_result": "TODO: pass | fail | not_evaluated"
+  },
   "artifact": "TODO",
   "artifact_results": [
     {"id": "TODO", "path": "TODO", "sha256": "TODO"}

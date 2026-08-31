@@ -4,7 +4,9 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.6.4 keeps the v0.6.3 fast path and adds three bounded recovery improvements: strict reviews are cryptographically bound to the current GOAL/proposal subject, an unconsumed lease can be released without disabling the gate, and an explicitly user-approved GOAL update can run as a recoverable compare-and-swap transaction while the gate stays enabled. Query-only `date`, `wc`, `cat`, `rg`, and recognized read pipelines remain available during waiting; write-capable interpreters and ambiguous Git pager, textconv, external-diff, and signature-helper paths stay fail-closed.
+Version 0.7.0 makes unattended continuation the primary invariant. A completed threshold or guardrail failure is a valid negative and automatically enters rollback/switch; evaluator or reversible execution failure consumes recovery budget without blocking the Goal. Closing one experiment chain no longer closes the Goal. Global waiting is allowed only with a machine-readable proof that no safe path or recovery budget remains. External notification failures have no business effect, and a natural SessionStart consumes an already durable terminal event even when delivery is pending or dead-lettered.
+
+The state transition and compatibility summary is in [docs/v0.7.0-state-machine.md](docs/v0.7.0-state-machine.md).
 
 The fast workflow introduced in 0.6.0 is:
 
@@ -92,6 +94,7 @@ python3 <plugin-root>/hooks/goal_guard.py submit-bind --policy submit-slurm --pr
 python3 <plugin-root>/hooks/goal_guard.py reconcile-bind --policy submit-slurm --project .
 python3 <plugin-root>/hooks/goal_guard.py abort --project .
 python3 <plugin-root>/hooks/goal_guard.py checkpoint optimization/RESULT.json --project .
+python3 <plugin-root>/hooks/goal_guard.py correct-checkpoint optimization/RESULT.json --supersedes sha256:<checkpoint-id> --project .
 ```
 
 In strict mode, freeze the completed proposal, run `subject`, and give that digest to the fresh reviewer. Admission rejects an attestation for any other GOAL/proposal/review-epoch contract. Every safe release advances a monotonic epoch, so every older subject remains invalid rather than becoming reusable after another release. If admission exposed a contract mistake before any lease-authorized action ran, use the proposal digest reported by `status` to remove authority safely:
@@ -117,7 +120,7 @@ python3 <plugin-root>/hooks/goal_guard.py wait --event-key job-122020 --event-pa
 python3 <plugin-root>/hooks/goal_guard.py wake --event-key job-122020 --event-path artifacts/job-terminal.json --project .
 ```
 
-Use `wait` only when a real bridge can invoke `wake`. Mutation stops until the registered event; fast profile permits read-only bounded polling, while strict also blocks repeated polling. Without a bridge, keep the process attached or use controller-managed monitoring so an unattended Goal does not enter a state that cannot wake itself.
+Use `wait` only when a real bridge can invoke `wake`. Mutation stops until the registered event. A healthy wait ends the current activation instead of spending model turns polling. Without a bridge, keep the process attached or use controller-managed monitoring so an unattended Goal does not enter a state that cannot wake itself.
 
 ### External monitor integration
 
@@ -140,7 +143,9 @@ python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --eve
 
 The monitor start argv must freeze `--event-binding <private-binding.json>` (and normally `--bridge-config <private-config.json> --require-auto-resume`). `wait-monitor` freezes the run and manifest SHA. The event bridge publishes `codex-monitor.event/v1` to its private outbox and wakes the thread; it never edits the project. `wake-monitor` accepts the event ID from the fixed wake message, or derives it from the frozen run for v0.6.0 `CONTROL.json` compatibility. It verifies the immutable semantic event, event binding/workspace, event identity digest, terminal digest, Job ID, run ID, watcher result, and scheduler owner/name/partition before creating a `goal-guardrails.external-monitor-receipt/v2` file under `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. A repeated delivery of the same event ID returns `duplicate` without changing state.
 
-`delivery.json` is deliberately not terminal evidence: while the wake turn is running it may still be pending or leased. The immutable outbox event is notification identity; the independently verified terminal remains scheduler authority. The protected project receipt therefore remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
+`delivery.json` is deliberately not terminal evidence: pending, leased, dead-letter, or notification corruption never becomes a business pause. The immutable outbox event is notification identity; the independently verified terminal remains scheduler authority. On any natural activation the controller reconciles that durable event directly and idempotently materializes the project receipt. The receipt remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
+
+Schema-v3 proposals freeze expected attempts, minimum result rows, evaluator artifacts, and bounded recovery paths. Schema-v3 results report evaluator completion, artifact completeness, gate determinacy, threshold result, and guardrail result. The controller mechanically enforces: unavailable/indeterminate evaluator → invalid experiment plus recovery; determinate threshold failure → valid negative plus switch/rollback; guardrail failure → valid negative plus rollback; all pass → positive. Checkpoints are append-only under `optimization/.goal-guardrails/checkpoints/`; a correction appends a superseding record instead of rewriting history.
 
 ## What the hook blocks
 
@@ -150,7 +155,7 @@ Fast profile blocks only:
 - overwriting frozen preflight/terminal evidence or inputs of an active one-shot remote submission;
 - direct execution of a frozen one-shot binding-capture command instead of `submit-bind`;
 - broadly destructive commands such as hard reset, force clean/push, infrastructure destroy, or deleting a filesystem root;
-- mutation while `WAITING_EXTERNAL_EVENT` (read-only inspection and polling remain available).
+- mutation while `WAITING_EXTERNAL_EVENT` (ordinary inspection remains available; the injected next action ends no-event activations instead of polling).
 
 It does **not** block routine project edits, tests, builds, training/evaluation commands, diagnostics, recovery, MCP writes, result correction, or work because no lease exists.
 
@@ -182,11 +187,17 @@ This is a behavioral direction guardrail, not a security sandbox. Fast profile i
 
 Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, and users can disable non-managed hooks. Fast mode deliberately avoids pretending it can authorize every local command: it focuses on direction, a small protected boundary, and unattended continuation.
 
-`WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. It makes repeated Goal activations terminate cheaply through injected context and denied polling, but it cannot pause or reconfigure Codex Goal scheduling itself. A project-artifact bridge updates the preregistered file and invokes `wake`; an external-monitor bridge delivers the immutable semantic event ID, after which the controller invokes `wake-monitor`, independently verifies the canonical terminal, and materializes the project receipt.
+`WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. The managed monitor owns durable scheduling and exact-thread delivery. Goal Guardrails makes no-event activations terminate cheaply and also performs fallback reconciliation: if the immutable semantic event already exists, SessionStart independently verifies the canonical terminal and resumes without relying on notification delivery.
 
 Remote Slurm submission deliberately does not accept runtime argv after admission. A transport policy freezes the local SSH executable and digest, host, user, port, dedicated known-hosts file and digest, dedicated identity path and digest, remote helper path and digest, remote `sbatch` path, work directory, receipt root, and submitted file digests. The controller ignores ambient SSH configuration, proxy commands, jump hosts, and agents. `status` reports the controller budget plan: each one-shot submission costs one mutation; doctor, reconciliation, waiting, waking, and receipt materialization cost zero. OpenSSH still invokes the remote command through the remote user's shell, so the helper path is restricted to a safe absolute token; a forced-command SSH key is recommended for a stronger administrative boundary.
 
 Strict mode retains the v0.5 lease state machine for high-assurance and external-monitor use. Fast mode is the recommended default when throughput and unattended execution matter more than command-level enforcement.
+
+## Upgrade from v0.6.4
+
+`CONTROL.json` stays schema 1 and is migrated additively on first status/hook/controller use. Existing schema-v2 active leases and results finish under their frozen v2 contract. New initialized proposals/results use schema 3. Legacy `last_checkpoint` entries remain readable but cannot be corrected because v0.6.4 did not preserve the lease and chain snapshot; new checkpoints receive an immutable receipt and can be superseded. `WAITING_EXTERNAL_EVENT` state, frozen Job IDs, consumed submit policies, lease remaining time, monitor receipts, and seen-event deduplication are preserved. No Job is requeued or resubmitted during migration.
+
+After installing 0.7.0, open a new Codex thread so the new hook/skill bundle is loaded, then run `status --project .`. Projects do not need to regenerate `GOAL.md` or deactivate/reactivate the gate.
 
 ## Validation
 

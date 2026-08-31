@@ -48,7 +48,7 @@ class InitProjectTests(unittest.TestCase):
         self.assertEqual(24, json.loads(gate)["default_max_mutations"])
         self.assertIn('"active_lease": null', control)
         self.assertIn('"state": "ACTIVE"', control)
-        self.assertIn('"schema_version": 2', pre_run)
+        self.assertIn('"schema_version": 3', pre_run)
         self.assertEqual(str(self.root), json.loads(gate)["project_root"])
 
     def test_rerun_is_idempotent(self) -> None:

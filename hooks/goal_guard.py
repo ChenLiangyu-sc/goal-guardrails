@@ -21,9 +21,11 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-HOOK_VERSION = "0.6.4"
-PROPOSAL_SCHEMA_VERSION = 2
-RESULT_SCHEMA_VERSION = 2
+HOOK_VERSION = "0.7.0"
+PROPOSAL_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 3
+SUPPORTED_PROPOSAL_SCHEMA_VERSIONS = {2, 3}
+SUPPORTED_RESULT_SCHEMA_VERSIONS = {2, 3}
 MAX_LEASE_MINUTES = 7 * 24 * 60
 CONTROLLER_PATH = Path(__file__).resolve()
 REMOTE_HELPER_PATH = CONTROLLER_PATH.with_name("remote_submit_helper.py")
@@ -40,6 +42,7 @@ PRE_RUN_RESULTS_REL = Path("optimization/PRE_RUN_RESULTS.json")
 CONTROLLER_STATE_REL = Path("optimization/.goal-guardrails")
 GOAL_UPDATE_REL = CONTROLLER_STATE_REL / "goal-update.json"
 RECEIPTS_REL = CONTROLLER_STATE_REL / "receipts"
+CHECKPOINTS_REL = CONTROLLER_STATE_REL / "checkpoints"
 EXPERIMENTS_REL = Path("optimization/EXPERIMENTS.md")
 BACKLOG_REL = Path("optimization/BACKLOG.md")
 ALWAYS_LEASE_PATHS = (STATE_REL, RESULT_REL, PRE_RUN_RESULTS_REL, EXPERIMENTS_REL, BACKLOG_REL)
@@ -47,6 +50,18 @@ FINALIZATION_PATHS = (STATE_REL, RESULT_REL, EXPERIMENTS_REL)
 PROTECTED_PATHS = (GOAL_REL, GATE_REL, CONTROL_REL, PROPOSAL_REL)
 DECISIONS = {"CONTINUE", "REPLICATE", "SWITCH", "ROLLBACK", "PAUSE_REQUIRED", "COMPLETE"}
 OUTCOMES = {"positive", "negative", "zero_progress", "inconclusive", "invalid"}
+EVALUATOR_STATES = {"complete", "missing", "corrupt"}
+COMPLETENESS_STATES = {"complete", "incomplete"}
+DETERMINACY_STATES = {"determinate", "indeterminate"}
+EVALUATION_RESULTS = {"pass", "fail", "not_evaluated"}
+RECOVERY_KINDS = {"recovery", "rollback", "switch"}
+HARD_BLOCK_REASONS = {
+    "objective_change_required",
+    "high_risk_external_action_required",
+    "external_input_unavailable",
+    "all_paths_exhausted",
+    "global_stopline_fired",
+}
 CHAIN_KINDS = {"optimization", "diagnostic", "verification"}
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 PATCH_DIRECTIVE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.MULTILINE)
@@ -191,6 +206,9 @@ def load_gate(project: Path) -> dict[str, Any]:
     if profile not in {"fast", "strict"}:
         raise GuardError("GATE.json profile must be fast or strict")
     gate["profile"] = profile
+    gate.setdefault("max_recovery_attempts", 3)
+    if isinstance(gate["max_recovery_attempts"], bool) or not isinstance(gate["max_recovery_attempts"], int) or not 0 <= gate["max_recovery_attempts"] <= 100:
+        raise GuardError("GATE.json max_recovery_attempts must be an integer from 0 to 100")
     return gate
 
 
@@ -209,6 +227,11 @@ def default_control() -> dict[str, Any]:
         "chains": {},
         "poll": None,
         "last_checkpoint": None,
+        "checkpoint_history": [],
+        "continuation": None,
+        "recovery": {"used": 0, "history": []},
+        "consumed_output_roots": [],
+        "recovery_path_usage": {},
         "review_epoch": 0,
         "runtime": {"state": "ACTIVE", "wait": None, "seen_events": []},
     }
@@ -229,10 +252,33 @@ def controller_metadata() -> dict[str, str]:
 
 def migrate_control(control: dict[str, Any]) -> bool:
     expected = controller_metadata()
-    if control.get("controller") == expected:
-        return False
-    control["controller"] = expected
-    return True
+    changed = False
+    if control.get("controller") != expected:
+        control["controller"] = expected
+        changed = True
+    defaults = {
+        "checkpoint_history": [],
+        "continuation": None,
+        "recovery": {"used": 0, "history": []},
+        "consumed_output_roots": [],
+        "recovery_path_usage": {},
+    }
+    for key, value in defaults.items():
+        if key not in control:
+            control[key] = value
+            changed = True
+    recovery = control.get("recovery")
+    if not isinstance(recovery, dict):
+        control["recovery"] = {"used": 0, "history": []}
+        changed = True
+    else:
+        if "used" not in recovery:
+            recovery["used"] = 0
+            changed = True
+        if "history" not in recovery:
+            recovery["history"] = []
+            changed = True
+    return changed
 
 
 def load_control(project: Path) -> dict[str, Any]:
@@ -1030,9 +1076,93 @@ def validate_external_monitors(
     return sorted(monitors, key=lambda item: item["id"])
 
 
+def validate_evaluation_contract(raw: Any, artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise GuardError("schema-v3 proposals require evaluation_contract")
+    expected_attempts = raw.get("expected_attempts")
+    minimum_result_rows = raw.get("minimum_result_rows")
+    if isinstance(expected_attempts, bool) or not isinstance(expected_attempts, int) or expected_attempts < 1:
+        raise GuardError("evaluation_contract.expected_attempts must be a positive integer")
+    if isinstance(minimum_result_rows, bool) or not isinstance(minimum_result_rows, int) or minimum_result_rows < 1:
+        raise GuardError("evaluation_contract.minimum_result_rows must be a positive integer")
+    artifact_ids = {item["id"] for item in artifacts}
+    evaluator_artifact_id = ensure_id(raw.get("evaluator_artifact_id"), "evaluation_contract.evaluator_artifact_id")
+    if evaluator_artifact_id not in artifact_ids:
+        raise GuardError("evaluation_contract.evaluator_artifact_id must name a checkpoint artifact")
+    required_raw = raw.get("required_artifact_ids", [evaluator_artifact_id])
+    if not isinstance(required_raw, list) or not required_raw:
+        raise GuardError("evaluation_contract.required_artifact_ids must be a non-empty list")
+    required_artifact_ids = sorted({ensure_id(value, "evaluation_contract.required_artifact_ids[]") for value in required_raw})
+    if not set(required_artifact_ids).issubset(artifact_ids):
+        raise GuardError("evaluation_contract.required_artifact_ids contains an unknown checkpoint artifact")
+    return {
+        "expected_attempts": expected_attempts,
+        "minimum_result_rows": minimum_result_rows,
+        "evaluator_artifact_id": evaluator_artifact_id,
+        "required_artifact_ids": required_artifact_ids,
+    }
+
+
+def validate_recovery_paths(project: Path, raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GuardError("recovery_paths must be a list")
+    paths: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GuardError(f"recovery_paths[{index}] must be an object")
+        path_id = ensure_id(item.get("id"), f"recovery_paths[{index}].id")
+        if path_id in seen:
+            raise GuardError(f"duplicate recovery path id: {path_id}")
+        seen.add(path_id)
+        kind = item.get("kind")
+        if kind not in RECOVERY_KINDS:
+            raise GuardError(f"recovery_paths[{index}].kind must be recovery, rollback, or switch")
+        description = ensure_text(item.get("description"), f"recovery_paths[{index}].description")
+        maximum = item.get("max_attempts", 1)
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 100:
+            raise GuardError(f"recovery_paths[{index}].max_attempts must be 1..100")
+        root = normalize_project_path(project, item.get("write_once_output_root"))
+        paths.append({
+            "id": path_id,
+            "kind": kind,
+            "description": description,
+            "max_attempts": maximum,
+            "write_once_output_root": root,
+        })
+    return sorted(paths, key=lambda item: item["id"])
+
+
+def project_paths_overlap(left: str, right: str) -> bool:
+    left_path = Path(left)
+    right_path = Path(right)
+    return left_path == right_path or left_path in right_path.parents or right_path in left_path.parents
+
+
+def fixed_outcome_mapping() -> dict[str, dict[str, Any]]:
+    """Controller-owned mapping; projects provide facts, not a self-serving verdict table."""
+    return {
+        "evaluator_unavailable": {"valid": False, "evaluation_integrity": "FAIL", "outcome": "invalid", "decisions": ["PAUSE_REQUIRED"]},
+        "threshold_failed": {"valid": True, "evaluation_integrity": "PASS", "outcome": "negative", "decisions": ["ROLLBACK", "SWITCH"]},
+        "guardrail_failed": {"valid": True, "evaluation_integrity": "PASS", "outcome": "negative", "decisions": ["ROLLBACK"]},
+        "all_passed": {"valid": True, "evaluation_integrity": "PASS", "outcome": "positive", "decisions": ["CONTINUE", "REPLICATE", "COMPLETE", "SWITCH"]},
+    }
+
+
 def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
-    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
-        raise GuardError(f"proposal schema_version must be {PROPOSAL_SCHEMA_VERSION}")
+    proposal_schema_version = proposal.get("schema_version")
+    if proposal_schema_version not in SUPPORTED_PROPOSAL_SCHEMA_VERSIONS:
+        raise GuardError(f"proposal schema_version must be one of {sorted(SUPPORTED_PROPOSAL_SCHEMA_VERSIONS)}")
+    current_continuation = control.get("continuation")
+    if (
+        proposal_schema_version != 3
+        and isinstance(current_continuation, dict)
+        and current_continuation.get("state") == "AVAILABLE"
+        and current_continuation.get("proposal_schema_version") == 3
+    ):
+        raise GuardError("an available schema-v3 continuation requires a schema-v3 bound successor")
     if isinstance(control.get("active_lease"), dict):
         raise GuardError("an experiment lease is still active or awaiting checkpoint")
     if gate_profile(gate) == "strict" and state_nonblank_lines(project) > int(gate["state_max_nonblank_lines"]):
@@ -1057,6 +1187,41 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         if any(mutation_allows(evidence["path"], operation, lease_mutations) for operation in ("add", "update", "delete", "move")):
             raise GuardError(f"existing evidence cannot also be mutable under the lease: {evidence['path']}")
     checkpoint_artifacts = validate_checkpoint_artifacts(project, proposal.get("checkpoint_artifacts"), lease_mutations)
+    evaluation_contract = (
+        validate_evaluation_contract(proposal.get("evaluation_contract"), checkpoint_artifacts)
+        if proposal_schema_version == 3 else None
+    )
+    recovery_paths = validate_recovery_paths(project, proposal.get("recovery_paths"))
+    write_once_output_root = None
+    if proposal_schema_version == 3:
+        raw_output_root = proposal.get("write_once_output_root")
+        if raw_output_root is None:
+            evaluator_id = evaluation_contract["evaluator_artifact_id"]
+            write_once_output_root = next(item["path"] for item in checkpoint_artifacts if item["id"] == evaluator_id)
+        else:
+            write_once_output_root = normalize_project_path(project, raw_output_root)
+        if any(project_paths_overlap(write_once_output_root, str(root)) for root in control.get("consumed_output_roots", [])):
+            raise GuardError("schema-v3 successor must use a fresh write_once_output_root")
+        if any(project_paths_overlap(str(item.get("write_once_output_root")), write_once_output_root) for item in recovery_paths):
+            raise GuardError("a successor recovery path must use a different write-once output root")
+        continuation = control.get("continuation")
+        if isinstance(continuation, dict) and continuation.get("state") == "AVAILABLE":
+            candidate_paths = [item for item in continuation.get("paths", []) if isinstance(item, dict)]
+            matching_paths = [
+                item for item in candidate_paths
+                if not isinstance(item.get("write_once_output_root"), str)
+                or write_once_output_root == item["write_once_output_root"]
+                or Path(item["write_once_output_root"]) in Path(write_once_output_root).parents
+            ]
+            if candidate_paths and not matching_paths:
+                raise GuardError("successor write_once_output_root is outside every frozen continuation path")
+            continuation_binding = {
+                "source_checkpoint_id": continuation.get("source_checkpoint_id"),
+                "path_id": matching_paths[0].get("id") if matching_paths else None,
+                "usage_key": matching_paths[0].get("usage_key") if matching_paths else None,
+            }
+        else:
+            continuation_binding = None
     pre_run_gates = validate_pre_run_gates(proposal.get("pre_run_gates"), {item["id"] for item in checkpoint_artifacts})
     runtime_bindings = validate_runtime_bindings(proposal.get("runtime_bindings"))
     bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates, runtime_bindings)
@@ -1157,11 +1322,16 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
         "causal_bottleneck": bottleneck,
         "hypothesis": hypothesis,
         "core_progress_expected": core_progress,
-        "proposal_schema_version": PROPOSAL_SCHEMA_VERSION,
+        "proposal_schema_version": proposal_schema_version,
         "lease_phase": lease_phase,
         "existing_evidence": existing_evidence,
         "lease_mutations": lease_mutations,
         "checkpoint_artifacts": checkpoint_artifacts,
+        "evaluation_contract": evaluation_contract,
+        "outcome_mapping": fixed_outcome_mapping() if proposal_schema_version == 3 else None,
+        "recovery_paths": recovery_paths,
+        "write_once_output_root": write_once_output_root,
+        "continuation_binding": continuation_binding if proposal_schema_version == 3 else None,
         "pre_run_gates": pre_run_gates,
         "pre_run_gate_results": None,
         "bash_policies": bash_policies,
@@ -1221,6 +1391,27 @@ def command_admit(args: argparse.Namespace) -> int:
             chain["final_discriminator_used"] = True
         if lease["work_class"] == "non_core":
             chain["non_core_cost_units"] = int(chain.get("non_core_cost_units", 0)) + lease["cost_units"]
+        continuation = control.get("continuation")
+        if isinstance(continuation, dict) and continuation.get("state") == "AVAILABLE":
+            binding = lease.get("continuation_binding")
+            if lease.get("proposal_schema_version") == 3:
+                if not isinstance(binding, dict) or binding.get("source_checkpoint_id") != continuation.get("source_checkpoint_id"):
+                    raise GuardError("schema-v3 successor is not bound to the current continuation checkpoint")
+                matching = next(
+                    (item for item in continuation.get("paths", []) if isinstance(item, dict) and item.get("id") == binding.get("path_id")),
+                    None,
+                )
+                if not isinstance(matching, dict):
+                    raise GuardError("schema-v3 successor continuation path is missing or stale")
+                usage_key = matching.get("usage_key")
+                if isinstance(usage_key, str):
+                    usage = control.setdefault("recovery_path_usage", {})
+                    usage[usage_key] = int(usage.get(usage_key, 0)) + 1
+            continuation["state"] = "CONSUMED"
+            continuation["consumed_by_experiment_id"] = lease["experiment_id"]
+            continuation["consumed_path_id"] = binding.get("path_id") if isinstance(binding, dict) else None
+            continuation["consumed_at"] = iso_time(utc_now())
+            control["continuation"] = continuation
         control["active_lease"] = lease
         control["poll"] = None
         save_control(project, control)
@@ -1307,7 +1498,8 @@ def command_gates(args: argparse.Namespace) -> int:
         if not isinstance(lease, dict) or current_lease(control) is None:
             raise GuardError("a live experiment lease is required")
         verify_frozen_lease(project, lease)
-        if payload.get("schema_version") != RESULT_SCHEMA_VERSION or payload.get("experiment_id") != lease["experiment_id"]:
+        expected_schema = lease.get("proposal_schema_version", 1)
+        if payload.get("schema_version") != expected_schema or payload.get("experiment_id") != lease["experiment_id"]:
             raise GuardError("pre-run result schema or experiment_id does not match active lease")
         artifacts = verify_artifact_results(project, lease, payload.get("artifact_results"), require_all=False)
         gates = verify_gate_results(lease, payload.get("pre_run_gate_results"), artifacts, allow_required_fail=True)
@@ -2088,43 +2280,35 @@ def verify_monitor_terminal(
     }
 
 
-def command_wake_monitor(args: argparse.Namespace) -> int:
-    project = explicit_project(args.project)
-    monitor_id = ensure_id(args.monitor, "monitor")
-    requested_event_id = getattr(args, "event_id", None)
-    if requested_event_id is not None:
-        requested_event_id = ensure_prefixed_sha256(requested_event_id, "requested event ID")
-    with state_lock(project):
-        gate = load_gate(project)
-        if not gate.get("enabled"):
-            raise GuardError("gate is not activated")
-        control = load_control(project)
-        seen_events = control["runtime"].get("seen_events", [])
-        if requested_event_id is not None and any(
-            isinstance(item, dict)
-            and item.get("event_key") == requested_event_id
-            and item.get("monitor_id") == monitor_id
-            for item in seen_events
-        ):
-            print("duplicate")
-            return 0
-        wait = control["runtime"].get("wait")
-        if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
-            raise GuardError("runtime is not waiting for an external event")
-        if wait.get("kind") != "external_monitor" or wait.get("monitor_id") != monitor_id:
-            raise GuardError("wake-monitor does not match the registered external monitor wait")
-        lease = control.get("active_lease")
-        if not isinstance(lease, dict):
-            raise GuardError("waiting runtime lost its active lease")
-        verify_frozen_lease(project, lease)
-        monitor = monitor_contract(lease, monitor_id)
-        evidence = verify_monitor_terminal(project, lease, monitor, wait, requested_event_id)
-        receipt_rel = RECEIPTS_REL / lease["lease_id"] / f"{monitor_id}.json"
-        receipt_path = project / receipt_rel
-        if receipt_path.exists() or receipt_path.is_symlink():
-            raise GuardError("controller monitor receipt already exists; refusing overwrite")
-        watcher_payload = evidence["watcher_payload"]
-        project_receipt = {
+def wake_monitor_locked(
+    project: Path,
+    control: dict[str, Any],
+    monitor_id: str,
+    requested_event_id: str | None,
+) -> tuple[dict[str, str] | None, bool]:
+    seen_events = control["runtime"].get("seen_events", [])
+    if requested_event_id is not None and any(
+        isinstance(item, dict)
+        and item.get("event_key") == requested_event_id
+        and item.get("monitor_id") == monitor_id
+        for item in seen_events
+    ):
+        return None, True
+    wait = control["runtime"].get("wait")
+    if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
+        raise GuardError("runtime is not waiting for an external event")
+    if wait.get("kind") != "external_monitor" or wait.get("monitor_id") != monitor_id:
+        raise GuardError("wake-monitor does not match the registered external monitor wait")
+    lease = control.get("active_lease")
+    if not isinstance(lease, dict):
+        raise GuardError("waiting runtime lost its active lease")
+    verify_frozen_lease(project, lease)
+    monitor = monitor_contract(lease, monitor_id)
+    evidence = verify_monitor_terminal(project, lease, monitor, wait, requested_event_id)
+    receipt_rel = RECEIPTS_REL / lease["lease_id"] / f"{monitor_id}.json"
+    receipt_path = project / receipt_rel
+    watcher_payload = evidence["watcher_payload"]
+    project_receipt = {
             "schema_version": "goal-guardrails.external-monitor-receipt/v2",
             "lease_id": lease["lease_id"],
             "experiment_id": lease["experiment_id"],
@@ -2157,40 +2341,70 @@ def command_wake_monitor(args: argparse.Namespace) -> int:
             "project_gate_evaluated": False,
             "business_verdict": "pending",
             "materialized_at": iso_time(utc_now()),
-        }
+    }
+    if receipt_path.is_symlink():
+        raise GuardError("controller monitor receipt path is an unsafe symbolic link")
+    if receipt_path.exists():
+        existing = load_json(receipt_path)
+        expected_stable = {key: value for key, value in project_receipt.items() if key != "materialized_at"}
+        existing_stable = {key: value for key, value in existing.items() if key != "materialized_at"}
+        if existing_stable != expected_stable:
+            raise GuardError("existing controller monitor receipt conflicts with the verified terminal")
+        project_receipt = existing
+    else:
         atomic_json(receipt_path, project_receipt)
-        receipt_sha256 = file_hash(receipt_path)
-        lease.setdefault("monitor_receipts", {})[monitor_id] = {
+    receipt_sha256 = file_hash(receipt_path)
+    receipt_ref = {
             "path": receipt_rel.as_posix(),
             "sha256": receipt_sha256,
             "source_terminal_sha256": evidence["terminal_sha256"],
             "source_semantic_event_id": evidence["event_id"],
             "source_semantic_event_sha256": evidence["event_sha256"],
-        }
-        lease["wake_event"] = {
+    }
+    lease.setdefault("monitor_receipts", {})[monitor_id] = receipt_ref
+    event_time = str(project_receipt.get("materialized_at") or iso_time(utc_now()))
+    lease["wake_event"] = {
             "event_key": evidence["event_id"],
             "monitor_id": monitor_id,
             "path": receipt_rel.as_posix(),
             "sha256": receipt_sha256,
-            "time": iso_time(utc_now()),
-        }
-        remaining = int(lease.pop("remaining_seconds", 0))
-        lease.pop("suspended_at", None)
-        lease["expires_at"] = iso_time(utc_now() + timedelta(seconds=max(1, remaining)))
-        seen = control["runtime"].get("seen_events", [])
-        seen.append({
-            "event_key": lease["wake_event"]["event_key"],
-            "monitor_id": monitor_id,
-            "path": receipt_rel.as_posix(),
-            "sha256": receipt_sha256,
-            "source_sha256": evidence["event_sha256"],
-            "time": iso_time(utc_now()),
-        })
-        control["active_lease"] = lease
-        control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": seen[-32:]}
-        control["poll"] = None
-        save_control(project, control)
-    print(json.dumps(lease["monitor_receipts"][monitor_id], ensure_ascii=False, indent=2))
+            "time": event_time,
+    }
+    remaining = int(lease.pop("remaining_seconds", 0))
+    lease.pop("suspended_at", None)
+    lease["expires_at"] = iso_time(utc_now() + timedelta(seconds=max(1, remaining)))
+    seen = control["runtime"].get("seen_events", [])
+    seen.append({
+        "event_key": lease["wake_event"]["event_key"],
+        "monitor_id": monitor_id,
+        "path": receipt_rel.as_posix(),
+        "sha256": receipt_sha256,
+        "source_sha256": evidence["event_sha256"],
+        "time": event_time,
+    })
+    control["active_lease"] = lease
+    control["runtime"] = {"state": "ACTIVE", "wait": None, "seen_events": seen[-32:]}
+    control["poll"] = None
+    save_control(project, control)
+    return receipt_ref, False
+
+
+def command_wake_monitor(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    monitor_id = ensure_id(args.monitor, "monitor")
+    requested_event_id = getattr(args, "event_id", None)
+    if requested_event_id is not None:
+        requested_event_id = ensure_prefixed_sha256(requested_event_id, "requested event ID")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        receipt, duplicate = wake_monitor_locked(project, control, monitor_id, requested_event_id)
+    if duplicate:
+        print("duplicate")
+    else:
+        print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2321,12 +2535,562 @@ def verify_external_monitor_results(project: Path, lease: dict[str, Any], raw: A
     return sorted(verified, key=lambda item: item["id"])
 
 
+def validate_evaluation_summary(
+    lease: dict[str, Any],
+    result: dict[str, Any],
+    artifact_results: list[dict[str, str]],
+) -> dict[str, Any]:
+    raw = result.get("evaluation_summary")
+    if not isinstance(raw, dict):
+        raise GuardError("schema-v3 results require evaluation_summary")
+    contract = lease.get("evaluation_contract")
+    if not isinstance(contract, dict):
+        raise GuardError("schema-v3 lease lost its evaluation_contract")
+    expected_attempts = raw.get("expected_attempts")
+    completed_attempts = raw.get("completed_attempts")
+    result_rows = raw.get("result_rows")
+    for name, value in (
+        ("expected_attempts", expected_attempts),
+        ("completed_attempts", completed_attempts),
+        ("result_rows", result_rows),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise GuardError(f"evaluation_summary.{name} must be a nonnegative integer")
+    if expected_attempts != contract["expected_attempts"]:
+        raise GuardError("evaluation_summary.expected_attempts drifted from the proposal")
+    evaluator = raw.get("evaluator_completion")
+    completeness = raw.get("artifact_completeness")
+    determinacy = raw.get("gate_determinacy")
+    threshold = raw.get("threshold_result")
+    guardrail = raw.get("guardrail_result")
+    if evaluator not in EVALUATOR_STATES:
+        raise GuardError(f"evaluation_summary.evaluator_completion must be one of {sorted(EVALUATOR_STATES)}")
+    if completeness not in COMPLETENESS_STATES:
+        raise GuardError(f"evaluation_summary.artifact_completeness must be one of {sorted(COMPLETENESS_STATES)}")
+    if determinacy not in DETERMINACY_STATES:
+        raise GuardError(f"evaluation_summary.gate_determinacy must be one of {sorted(DETERMINACY_STATES)}")
+    if threshold not in EVALUATION_RESULTS or guardrail not in EVALUATION_RESULTS:
+        raise GuardError("evaluation_summary threshold_result and guardrail_result must be pass, fail, or not_evaluated")
+    present_ids = {item["id"] for item in artifact_results}
+    artifacts_complete = set(contract["required_artifact_ids"]).issubset(present_ids)
+    mechanically_incomplete = (
+        evaluator != "complete"
+        or completed_attempts != expected_attempts
+        or result_rows < contract["minimum_result_rows"]
+        or completeness != "complete"
+        or not artifacts_complete
+        or determinacy != "determinate"
+    )
+    if mechanically_incomplete:
+        semantic_class = "evaluator_unavailable"
+    elif guardrail == "fail":
+        semantic_class = "guardrail_failed"
+    elif threshold == "fail":
+        semantic_class = "threshold_failed"
+    elif threshold == "pass" and guardrail == "pass":
+        semantic_class = "all_passed"
+    else:
+        semantic_class = "evaluator_unavailable"
+    expected = lease["outcome_mapping"][semantic_class]
+    if result.get("valid") is not expected["valid"] or result.get("evaluation_integrity") != expected["evaluation_integrity"]:
+        raise GuardError(f"evaluation facts require valid={expected['valid']} and evaluation_integrity={expected['evaluation_integrity']}")
+    if result.get("outcome") != expected["outcome"]:
+        if semantic_class == "threshold_failed" and result.get("outcome") == "invalid":
+            raise GuardError("a complete, determinate threshold failure is a valid negative; outcome=invalid is forbidden")
+        raise GuardError(f"evaluation facts require outcome={expected['outcome']}")
+    if result.get("decision") not in expected["decisions"]:
+        raise GuardError(f"evaluation facts require decision in {expected['decisions']}")
+    expected_core = semantic_class == "all_passed"
+    if result.get("core_progress") is not expected_core:
+        raise GuardError(f"evaluation facts require core_progress={expected_core}")
+    return {
+        "semantic_class": semantic_class,
+        "expected_attempts": expected_attempts,
+        "completed_attempts": completed_attempts,
+        "result_rows": result_rows,
+        "evaluator_completion": evaluator,
+        "artifact_completeness": completeness,
+        "gate_determinacy": determinacy,
+        "threshold_result": threshold,
+        "guardrail_result": guardrail,
+        "required_artifacts_present": artifacts_complete,
+    }
+
+
+def available_continuation_paths(
+    gate: dict[str, Any],
+    control: dict[str, Any],
+    lease: dict[str, Any],
+    *,
+    outcome: str,
+    decision: str,
+    semantic_class: str | None,
+) -> list[dict[str, Any]]:
+    allowed_kinds: set[str]
+    if semantic_class == "evaluator_unavailable":
+        allowed_kinds = {"recovery", "rollback", "switch"}
+    elif semantic_class == "guardrail_failed":
+        allowed_kinds = {"rollback"}
+    elif semantic_class == "threshold_failed" or outcome in {"negative", "zero_progress", "inconclusive"}:
+        allowed_kinds = {"rollback", "switch"}
+    else:
+        allowed_kinds = set()
+    recovery_state = control.get("recovery") if isinstance(control.get("recovery"), dict) else {"used": 0}
+    global_remaining = max(0, int(gate.get("max_recovery_attempts", 3)) - int(recovery_state.get("used", 0)))
+    path_usage = control.get("recovery_path_usage") if isinstance(control.get("recovery_path_usage"), dict) else {}
+    paths: list[dict[str, Any]] = []
+    for raw_path in lease.get("recovery_paths", []):
+        if not isinstance(raw_path, dict) or raw_path.get("kind") not in allowed_kinds:
+            continue
+        item = dict(raw_path)
+        usage_key = f"{lease.get('chain_id')}:{item.get('id')}"
+        used = int(path_usage.get(usage_key, 0))
+        if used >= int(item.get("max_attempts", 1)):
+            continue
+        if semantic_class == "evaluator_unavailable" and item.get("kind") == "recovery" and global_remaining <= 0:
+            continue
+        item["usage_key"] = usage_key
+        item["used"] = used
+        paths.append(item)
+    if lease.get("final_discriminator") and outcome != "positive" and isinstance(lease.get("next_paths"), dict):
+        paths.append({
+            "id": "final-other",
+            "kind": "switch",
+            "description": str(lease["next_paths"].get("other")),
+            "max_attempts": 1,
+            "write_once_output_root": None,
+            "usage_key": f"{lease.get('chain_id')}:final-other",
+        })
+    if decision in {"SWITCH", "ROLLBACK"} and not any(item.get("kind") == decision.lower() for item in paths):
+        paths.append({
+            "id": f"decision-{decision.lower()}",
+            "kind": decision.lower(),
+            "description": f"continue the declared {decision.lower()} decision on a successor attempt",
+            "max_attempts": 1,
+            "write_once_output_root": None,
+            "usage_key": f"{lease.get('chain_id')}:decision-{decision.lower()}",
+        })
+    remaining = global_remaining
+    if semantic_class == "evaluator_unavailable" and remaining > 0 and not any(item.get("kind") == "recovery" for item in paths):
+        paths.append({
+            "id": "recover-execution",
+            "kind": "recovery",
+            "description": "repair the reversible execution/evaluator failure and run a fresh successor attempt",
+            "max_attempts": remaining,
+            "write_once_output_root": None,
+            "usage_key": f"{lease.get('chain_id')}:recover-execution",
+        })
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for item in paths:
+        deduplicated[str(item["id"])] = item
+    return [deduplicated[key] for key in sorted(deduplicated)]
+
+
+def build_blocking_proof(
+    gate: dict[str, Any],
+    control: dict[str, Any],
+    *,
+    safe_paths: list[dict[str, Any]],
+    global_stopline_fired: bool = False,
+) -> dict[str, Any]:
+    recovery = control.get("recovery") if isinstance(control.get("recovery"), dict) else {"used": 0}
+    used = int(recovery.get("used", 0))
+    maximum = int(gate.get("max_recovery_attempts", 3))
+    exhausted = used >= maximum
+    open_chains = sorted(
+        chain_id for chain_id, chain in control.get("chains", {}).items()
+        if isinstance(chain, dict) and not chain.get("closed")
+    )
+    block_allowed = not safe_paths and not open_chains and (exhausted or global_stopline_fired)
+    hard_reason = None
+    if block_allowed:
+        hard_reason = "global_stopline_fired" if global_stopline_fired else "all_paths_exhausted"
+    proof = {
+        "schema_version": "goal-guardrails.blocking-proof/v1",
+        "block_allowed": block_allowed,
+        "hard_reason": hard_reason,
+        "safe_paths": safe_paths,
+        "open_chains": open_chains,
+        "recovery_budget": {"used": used, "maximum": maximum, "exhausted": exhausted},
+        "global_stopline_fired": global_stopline_fired,
+    }
+    proof["sha256"] = f"sha256:{canonical_hash(proof)}"
+    return proof
+
+
+def append_checkpoint_record(project: Path, payload: dict[str, Any]) -> tuple[str, str, str]:
+    body = dict(payload)
+    identity = {
+        "schema_version": body.get("schema_version"),
+        "kind": body.get("kind"),
+        "supersedes": body.get("supersedes"),
+        "experiment_id": body.get("experiment_id"),
+        "chain_id": body.get("chain_id"),
+        "lease_id": body.get("lease_id"),
+        "result_sha256": body.get("result_sha256"),
+    }
+    checkpoint_id = f"sha256:{canonical_hash(identity)}"
+    body["checkpoint_id"] = checkpoint_id
+    experiment_id = ensure_id(body.get("experiment_id"), "checkpoint experiment_id")
+    receipt_rel = CHECKPOINTS_REL / experiment_id / f"{checkpoint_id.removeprefix('sha256:')}.json"
+    receipt_path = project / receipt_rel
+    if receipt_path.exists() or receipt_path.is_symlink():
+        existing = load_json(receipt_path)
+        stable_existing = {key: value for key, value in existing.items() if key != "recorded_at"}
+        stable_body = {key: value for key, value in body.items() if key != "recorded_at"}
+        if stable_existing != stable_body:
+            raise GuardError("checkpoint receipt identity collision")
+    else:
+        atomic_json(receipt_path, body)
+    return checkpoint_id, receipt_rel.as_posix(), file_hash(receipt_path)
+
+
+def canonical_checkpoint_for_correction(
+    project: Path,
+    control: dict[str, Any],
+    supersedes: str,
+) -> dict[str, Any]:
+    if isinstance(control.get("active_lease"), dict):
+        raise GuardError("cannot correct a checkpoint while an experiment lease is active")
+    last = control.get("last_checkpoint")
+    if not isinstance(last, dict) or last.get("checkpoint_id") != supersedes:
+        raise GuardError("correct-checkpoint may supersede only the latest canonical checkpoint")
+    history = control.get("checkpoint_history")
+    if not isinstance(history, list) or not history or history[-1].get("checkpoint_id") != supersedes:
+        raise GuardError("checkpoint history does not identify the requested checkpoint as canonical latest")
+    continuation = control.get("continuation")
+    if not isinstance(continuation, dict) or continuation.get("source_checkpoint_id") != supersedes:
+        raise GuardError("latest checkpoint continuation state is missing or no longer canonical")
+    if continuation.get("state") == "CONSUMED" or continuation.get("consumed_by_experiment_id"):
+        raise GuardError("cannot correct a checkpoint after its continuation was consumed by a successor")
+    receipt_rel = normalize_project_path(project, last.get("checkpoint_path"))
+    if not receipt_rel.startswith(f"{CHECKPOINTS_REL.as_posix()}/"):
+        raise GuardError("latest checkpoint receipt path is outside the append-only checkpoint store")
+    receipt_path = project / receipt_rel
+    expected_sha256 = ensure_sha256(last.get("checkpoint_sha256"), "latest checkpoint receipt SHA-256")
+    if receipt_path.is_symlink() or not receipt_path.is_file() or file_hash(receipt_path) != expected_sha256:
+        raise GuardError("latest checkpoint receipt is missing or changed")
+    receipt = load_json(receipt_path)
+    if receipt.get("checkpoint_id") != supersedes:
+        raise GuardError("latest checkpoint receipt identity does not match CONTROL.json")
+    lease = receipt.get("lease_snapshot")
+    chain_before = receipt.get("chain_before")
+    chain_after = receipt.get("chain_after")
+    if not isinstance(lease, dict) or not isinstance(chain_before, dict) or not isinstance(chain_after, dict):
+        raise GuardError("latest checkpoint receipt lacks an immutable lease or chain snapshot")
+    current_chain = control.get("chains", {}).get(receipt.get("chain_id"))
+    if not isinstance(current_chain, dict) or canonical_hash(current_chain) != canonical_hash(chain_after):
+        raise GuardError("chain state changed after the checkpoint and can no longer be corrected safely")
+    return receipt
+
+
+def validate_corrected_result(
+    project: Path,
+    lease: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    proposal_schema = lease.get("proposal_schema_version")
+    structured = isinstance(proposal_schema, int) and proposal_schema >= 2
+    expected_result_schema = proposal_schema if structured else 1
+    if result.get("schema_version") != expected_result_schema or result.get("experiment_id") != lease.get("experiment_id"):
+        raise GuardError("corrected result schema or experiment_id does not match the frozen lease")
+    if type(result.get("valid")) is not bool or type(result.get("core_progress")) is not bool:
+        raise GuardError("corrected result valid and core_progress must be strict booleans")
+    decision = result.get("decision")
+    outcome = result.get("outcome")
+    if decision not in DECISIONS or outcome not in OUTCOMES:
+        raise GuardError("corrected result decision or outcome is invalid")
+    integrity = result.get("evaluation_integrity")
+    if integrity not in {"PASS", "FAIL"} or result["valid"] is not (integrity == "PASS"):
+        raise GuardError("corrected result valid must be true exactly when evaluation_integrity is PASS")
+    preflight_failed = bool(lease.get("preflight_failed"))
+    if preflight_failed and (
+        result["valid"] is not False
+        or integrity != "FAIL"
+        or result["core_progress"] is not False
+        or outcome != "invalid"
+        or decision != "PAUSE_REQUIRED"
+    ):
+        raise GuardError("a corrected failed-preflight result must remain invalid and PAUSE_REQUIRED")
+
+    artifact_results: list[dict[str, str]] = []
+    gate_results: list[dict[str, str]] = []
+    external_monitor_results: list[dict[str, str]] = []
+    semantic_summary: dict[str, Any] | None = None
+    if structured:
+        artifact_results = verify_artifact_results(
+            project,
+            lease,
+            result.get("artifact_results"),
+            require_all=not preflight_failed and proposal_schema < 3,
+        )
+        gate_results = verify_gate_results(
+            lease,
+            result.get("pre_run_gate_results"),
+            artifact_results,
+            allow_required_fail=preflight_failed,
+        )
+        if preflight_failed:
+            if result.get("external_monitor_results") not in (None, []):
+                raise GuardError("failed preflight cannot claim external monitor results")
+        else:
+            external_monitor_results = verify_external_monitor_results(
+                project, lease, result.get("external_monitor_results")
+            )
+        recorded_gates = lease.get("pre_run_gate_results")
+        if lease.get("pre_run_gates") and not isinstance(recorded_gates, dict):
+            raise GuardError("frozen required pre-run gates were never recorded")
+        if isinstance(recorded_gates, dict) and canonical_hash(gate_results) != canonical_hash(recorded_gates.get("gates")):
+            raise GuardError("corrected result pre-run gate evidence drifted from the frozen decision")
+        if isinstance(recorded_gates, dict):
+            current_artifacts = {item["id"]: item for item in artifact_results}
+            for recorded in recorded_gates.get("artifacts", []):
+                if current_artifacts.get(recorded["id"], {}).get("sha256") != recorded.get("sha256"):
+                    raise GuardError("corrected result pre-run gate artifact evidence changed")
+        wake_event = lease.get("wake_event")
+        if isinstance(wake_event, dict):
+            if wake_event.get("monitor_id"):
+                wake_receipt = next(
+                    (item for item in external_monitor_results if item["id"] == wake_event.get("monitor_id")), None
+                )
+                if not isinstance(wake_receipt, dict) or wake_receipt.get("path") != wake_event.get("path") or wake_receipt.get("sha256") != wake_event.get("sha256"):
+                    raise GuardError("corrected result external monitor receipt does not match the frozen wake event")
+            else:
+                wake_artifact = next(
+                    (item for item in artifact_results if item["id"] == wake_event.get("artifact_id")), None
+                )
+                if not isinstance(wake_artifact, dict) or wake_artifact.get("path") != wake_event.get("path") or wake_artifact.get("sha256") != wake_event.get("sha256"):
+                    raise GuardError("corrected result terminal artifact does not match the frozen wake event")
+        if proposal_schema == 3:
+            semantic_summary = validate_evaluation_summary(lease, result, artifact_results)
+
+    valid = result["valid"]
+    core_progress = result["core_progress"]
+    if not valid and outcome != "invalid":
+        raise GuardError("failed corrected evaluation integrity requires outcome invalid")
+    if valid and not core_progress and outcome == "positive":
+        raise GuardError("corrected positive outcome requires core_progress")
+    if valid and outcome == "invalid":
+        raise GuardError("a valid corrected evaluation cannot have outcome invalid")
+    if decision == "COMPLETE" and (not core_progress or outcome != "positive"):
+        raise GuardError("corrected COMPLETE requires positive core progress")
+    if lease.get("final_discriminator") and decision in {"CONTINUE", "REPLICATE"}:
+        raise GuardError("a corrected final discriminator must close or switch the diagnostic chain")
+    ensure_text(result.get("metric_delta"), "metric_delta")
+    primary_artifact = ensure_text(result.get("artifact"), "artifact")
+    if structured:
+        primary_artifact = normalize_project_path(project, primary_artifact)
+        if primary_artifact not in {item["path"] for item in artifact_results}:
+            raise GuardError("corrected primary artifact is not a verified preregistered checkpoint artifact")
+    return {
+        "artifact_results": artifact_results,
+        "pre_run_gate_results": gate_results,
+        "external_monitor_results": external_monitor_results,
+        "semantic_summary": semantic_summary,
+        "primary_artifact": primary_artifact,
+        "preflight_failed": preflight_failed,
+    }
+
+
+def restore_recovery_before_checkpoint(
+    control: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    recovery = json.loads(json.dumps(control.get("recovery", {"used": 0, "history": []})))
+    original_summary = receipt.get("semantic_summary")
+    original_invalid = (
+        isinstance(original_summary, dict) and original_summary.get("semantic_class") == "evaluator_unavailable"
+    ) or (
+        original_summary is None and receipt.get("raw_result", {}).get("outcome") == "invalid"
+    )
+    if not original_invalid:
+        return recovery
+    history = recovery.get("history") if isinstance(recovery.get("history"), list) else []
+    for index in range(len(history) - 1, -1, -1):
+        item = history[index]
+        if (
+            isinstance(item, dict)
+            and item.get("experiment_id") == receipt.get("experiment_id")
+            and item.get("chain_id") == receipt.get("chain_id")
+            and item.get("kind") == "evaluation_or_execution_recovery"
+        ):
+            del history[index]
+            recovery["used"] = max(0, int(recovery.get("used", 0)) - 1)
+            break
+    recovery["history"] = history
+    return recovery
+
+
+def corrected_chain_state(
+    gate: dict[str, Any],
+    lease: dict[str, Any],
+    result: dict[str, Any],
+    chain_before: dict[str, Any],
+) -> dict[str, Any]:
+    chain = json.loads(json.dumps(chain_before))
+    valid = result["valid"]
+    core_progress = result["core_progress"]
+    decision = result["decision"]
+    outcome = result["outcome"]
+    if valid and core_progress:
+        chain["no_progress_count"] = 0
+    elif valid:
+        chain["no_progress_count"] = int(chain.get("no_progress_count", 0)) + 1
+    if int(chain.get("no_progress_count", 0)) >= int(gate["max_consecutive_no_progress"]):
+        chain["stopline_fired"] = True
+        if decision in {"CONTINUE", "REPLICATE"}:
+            raise GuardError("corrected result fires the no-progress stop line and must switch, rollback, pause, or complete")
+    preflight_failed = bool(lease.get("preflight_failed"))
+    closes = False if preflight_failed else bool(lease.get("final_discriminator")) or decision in {"SWITCH", "ROLLBACK", "COMPLETE"}
+    if not preflight_failed and decision == "PAUSE_REQUIRED" and outcome != "invalid" and not chain.get("stopline_fired"):
+        closes = True
+    if chain.get("chain_kind") == "verification" and chain.get("stopline_fired"):
+        closes = True
+    if closes:
+        chain["closed"] = True
+        chain["close_outcome"] = outcome
+    else:
+        chain["closed"] = False
+        chain["close_outcome"] = None
+    return chain
+
+
+def command_correct_checkpoint(args: argparse.Namespace) -> int:
+    project = explicit_project(args.project)
+    result_path = Path(args.result).resolve()
+    if result_path != (project / RESULT_REL).resolve():
+        raise GuardError("correct-checkpoint must use optimization/RESULT.json from the guarded project")
+    result = load_json(result_path)
+    result_sha256 = file_hash(result_path)
+    supersedes = ensure_prefixed_sha256(args.supersedes, "superseded checkpoint ID")
+    with state_lock(project):
+        gate = load_gate(project)
+        if not gate.get("enabled"):
+            raise GuardError("gate is not activated")
+        control = load_control(project)
+        receipt = canonical_checkpoint_for_correction(project, control, supersedes)
+        if receipt.get("result_sha256") == result_sha256:
+            print("duplicate")
+            return 0
+        lease = receipt["lease_snapshot"]
+        verified = validate_corrected_result(project, lease, result)
+        for field in ("artifact_results", "pre_run_gate_results", "external_monitor_results"):
+            if canonical_hash(verified[field]) != canonical_hash(receipt.get(field, [])):
+                raise GuardError(f"correct-checkpoint cannot change frozen {field} evidence")
+        chain = corrected_chain_state(gate, lease, result, receipt["chain_before"])
+        control["chains"][lease["chain_id"]] = chain
+        control["recovery"] = restore_recovery_before_checkpoint(control, receipt)
+        semantic_summary = verified["semantic_summary"]
+        semantic_class = semantic_summary.get("semantic_class") if isinstance(semantic_summary, dict) else (
+            "evaluator_unavailable" if result["outcome"] == "invalid" else None
+        )
+        correction_time = iso_time(utc_now())
+        if semantic_class == "evaluator_unavailable":
+            recovery = control["recovery"]
+            recovery["used"] = int(recovery.get("used", 0)) + 1
+            recovery.setdefault("history", []).append({
+                "experiment_id": lease["experiment_id"],
+                "chain_id": lease["chain_id"],
+                "kind": "evaluation_or_execution_recovery",
+                "time": correction_time,
+                "corrects": supersedes,
+            })
+            recovery["history"] = recovery["history"][-100:]
+        safe_paths = available_continuation_paths(
+            gate,
+            control,
+            lease,
+            outcome=result["outcome"],
+            decision=result["decision"],
+            semantic_class=semantic_class,
+        )
+        if semantic_class == "evaluator_unavailable" and not safe_paths:
+            chain["closed"] = True
+            chain["close_outcome"] = "invalid"
+        blocking_proof = build_blocking_proof(
+            gate,
+            control,
+            safe_paths=safe_paths,
+            global_stopline_fired=bool(chain.get("stopline_fired") and not safe_paths),
+        )
+        record_payload = {
+            "schema_version": "goal-guardrails.checkpoint/v1",
+            "kind": "correction",
+            "supersedes": supersedes,
+            "superseded_checkpoint_sha256": ensure_sha256(
+                control["last_checkpoint"]["checkpoint_sha256"], "superseded checkpoint receipt SHA-256"
+            ),
+            "experiment_id": lease["experiment_id"],
+            "chain_id": lease["chain_id"],
+            "lease_id": lease["lease_id"],
+            "recorded_at": correction_time,
+            "result_sha256": result_sha256,
+            "raw_result": result,
+            "semantic_summary": semantic_summary,
+            "blocking_proof": blocking_proof,
+            "lease_snapshot": lease,
+            "chain_before": receipt["chain_before"],
+            "chain_after": chain,
+            "artifact_results": verified["artifact_results"],
+            "pre_run_gate_results": verified["pre_run_gate_results"],
+            "external_monitor_results": verified["external_monitor_results"],
+        }
+        checkpoint_id, checkpoint_path, checkpoint_sha256 = append_checkpoint_record(project, record_payload)
+        output_root = lease.get("write_once_output_root")
+        if isinstance(output_root, str) and output_root not in control.setdefault("consumed_output_roots", []):
+            control["consumed_output_roots"].append(output_root)
+        control["continuation"] = {
+            "source_checkpoint_id": checkpoint_id,
+            "source_experiment_id": lease["experiment_id"],
+            "proposal_schema_version": lease.get("proposal_schema_version"),
+            "paths": safe_paths,
+            "state": "AVAILABLE" if safe_paths else "NONE",
+        }
+        control["last_checkpoint"] = {
+            "experiment_id": lease["experiment_id"],
+            "chain_id": lease["chain_id"],
+            "decision": result["decision"],
+            "outcome": result["outcome"],
+            "valid": result["valid"],
+            "evaluation_integrity": result["evaluation_integrity"],
+            "core_progress": result["core_progress"],
+            "preflight_failed": verified["preflight_failed"],
+            "time": correction_time,
+            "artifact": verified["primary_artifact"],
+            "artifact_results": verified["artifact_results"],
+            "pre_run_gate_results": verified["pre_run_gate_results"],
+            "external_monitor_results": verified["external_monitor_results"],
+            "semantic_summary": semantic_summary,
+            "blocking_proof": blocking_proof,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_sha256": checkpoint_sha256,
+            "result_sha256": result_sha256,
+            "lease_id": lease["lease_id"],
+            "supersedes": supersedes,
+        }
+        history = control.setdefault("checkpoint_history", [])
+        history.append({
+            "checkpoint_id": checkpoint_id,
+            "path": checkpoint_path,
+            "sha256": checkpoint_sha256,
+            "experiment_id": lease["experiment_id"],
+            "supersedes": supersedes,
+        })
+        control["checkpoint_history"] = history[-256:]
+        control["poll"] = None
+        save_control(project, control)
+    print(json.dumps(control["last_checkpoint"], ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_checkpoint(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     result_path = Path(args.result).resolve()
     if result_path != (project / RESULT_REL).resolve():
         raise GuardError("checkpoint must use optimization/RESULT.json from the guarded project")
     result = load_json(result_path)
+    result_sha256 = file_hash(result_path)
     with state_lock(project):
         gate = load_gate(project)
         if not gate.get("enabled"):
@@ -2336,18 +3100,21 @@ def command_checkpoint(args: argparse.Namespace) -> int:
             raise GuardError("wake the registered external event before checkpoint")
         lease = control.get("active_lease")
         if not isinstance(lease, dict):
-            raise GuardError("no active lease to checkpoint")
+            last = control.get("last_checkpoint")
+            if isinstance(last, dict) and last.get("result_sha256") == result_sha256:
+                print("duplicate")
+                return 0
+            raise GuardError("no active lease to checkpoint; a changed result requires correct-checkpoint")
         verify_frozen_lease(project, lease)
-        structured = lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION
-        expected_result_schema = RESULT_SCHEMA_VERSION if structured else 1
+        proposal_schema = lease.get("proposal_schema_version")
+        structured = isinstance(proposal_schema, int) and proposal_schema >= 2
+        expected_result_schema = proposal_schema if structured else 1
         if result.get("schema_version") != expected_result_schema or result.get("experiment_id") != lease["experiment_id"]:
             raise GuardError("result schema or experiment_id does not match active lease")
         decision = result.get("decision")
         outcome = result.get("outcome")
         if decision not in DECISIONS or outcome not in OUTCOMES:
             raise GuardError("result decision or outcome is invalid")
-        valid = result.get("valid") is True and result.get("evaluation_integrity") == "PASS"
-        core_progress = result.get("core_progress") is True
         preflight_failed = bool(lease.get("preflight_failed"))
         if preflight_failed and (
             result.get("valid") is not False
@@ -2360,11 +3127,26 @@ def command_checkpoint(args: argparse.Namespace) -> int:
                 "failed required preflight requires valid=false, evaluation_integrity=FAIL, "
                 "core_progress=false, outcome=invalid, and decision=PAUSE_REQUIRED"
             )
+        if type(result.get("valid")) is not bool or type(result.get("core_progress")) is not bool:
+            raise GuardError("result valid and core_progress must be strict booleans")
+        integrity = result.get("evaluation_integrity")
+        if integrity not in {"PASS", "FAIL"}:
+            raise GuardError("evaluation_integrity must be PASS or FAIL")
+        if result["valid"] is not (integrity == "PASS"):
+            raise GuardError("valid must be true exactly when evaluation_integrity is PASS")
+        valid = result["valid"]
+        core_progress = result["core_progress"]
         artifact_results: list[dict[str, str]] = []
         gate_results: list[dict[str, str]] = []
         external_monitor_results: list[dict[str, str]] = []
+        semantic_summary: dict[str, Any] | None = None
         if structured:
-            artifact_results = verify_artifact_results(project, lease, result.get("artifact_results"), require_all=not preflight_failed)
+            artifact_results = verify_artifact_results(
+                project,
+                lease,
+                result.get("artifact_results"),
+                require_all=not preflight_failed and proposal_schema < 3,
+            )
             gate_results = verify_gate_results(
                 lease, result.get("pre_run_gate_results"), artifact_results, allow_required_fail=preflight_failed,
             )
@@ -2393,6 +3175,8 @@ def command_checkpoint(args: argparse.Namespace) -> int:
                     wake_artifact = next((item for item in artifact_results if item["id"] == wake_event.get("artifact_id")), None)
                     if not isinstance(wake_artifact, dict) or wake_artifact.get("path") != wake_event.get("path") or wake_artifact.get("sha256") != wake_event.get("sha256"):
                         raise GuardError("checkpoint terminal artifact does not match the frozen wake event")
+            if proposal_schema == 3:
+                semantic_summary = validate_evaluation_summary(lease, result, artifact_results)
         if not valid and outcome != "invalid":
             raise GuardError("failed evaluation integrity requires outcome invalid")
         if valid and not core_progress and outcome == "positive":
@@ -2410,6 +3194,7 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         if structured and primary_artifact not in {item["path"] for item in artifact_results}:
             raise GuardError("primary artifact is not a verified preregistered checkpoint artifact")
         chain = control["chains"][lease["chain_id"]]
+        chain_before = json.loads(json.dumps(chain))
         if valid and core_progress:
             chain["no_progress_count"] = 0
         elif valid:
@@ -2419,21 +3204,99 @@ def command_checkpoint(args: argparse.Namespace) -> int:
             if decision in {"CONTINUE", "REPLICATE"}:
                 raise GuardError("no-progress stop line fired; decision must switch, rollback, pause, or complete")
         closes = False if preflight_failed else bool(lease["final_discriminator"]) or decision in {"SWITCH", "ROLLBACK", "COMPLETE"}
-        if not preflight_failed and decision == "PAUSE_REQUIRED" and not chain.get("stopline_fired"):
+        if not preflight_failed and decision == "PAUSE_REQUIRED" and outcome != "invalid" and not chain.get("stopline_fired"):
             closes = True
         if chain.get("chain_kind") == "verification" and chain.get("stopline_fired"):
             closes = True
         if closes:
             chain["closed"] = True
             chain["close_outcome"] = outcome
+        semantic_class = semantic_summary.get("semantic_class") if isinstance(semantic_summary, dict) else (
+            "evaluator_unavailable" if outcome == "invalid" else None
+        )
+        if semantic_class == "evaluator_unavailable":
+            recovery = control.setdefault("recovery", {"used": 0, "history": []})
+            recovery["used"] = int(recovery.get("used", 0)) + 1
+            recovery.setdefault("history", []).append({
+                "experiment_id": lease["experiment_id"],
+                "chain_id": lease["chain_id"],
+                "kind": "evaluation_or_execution_recovery",
+                "time": iso_time(utc_now()),
+            })
+            recovery["history"] = recovery["history"][-100:]
+        safe_paths = available_continuation_paths(
+            gate,
+            control,
+            lease,
+            outcome=outcome,
+            decision=decision,
+            semantic_class=semantic_class,
+        )
+        if semantic_class == "evaluator_unavailable" and not safe_paths:
+            chain["closed"] = True
+            chain["close_outcome"] = "invalid"
+        blocking_proof = build_blocking_proof(
+            gate,
+            control,
+            safe_paths=safe_paths,
+            global_stopline_fired=bool(chain.get("stopline_fired") and not safe_paths),
+        )
+        checkpoint_time = iso_time(utc_now())
+        record_payload = {
+            "schema_version": "goal-guardrails.checkpoint/v1",
+            "kind": "original",
+            "supersedes": None,
+            "experiment_id": lease["experiment_id"],
+            "chain_id": lease["chain_id"],
+            "lease_id": lease["lease_id"],
+            "recorded_at": checkpoint_time,
+            "result_sha256": result_sha256,
+            "raw_result": result,
+            "semantic_summary": semantic_summary,
+            "blocking_proof": blocking_proof,
+            "lease_snapshot": lease,
+            "chain_before": chain_before,
+            "chain_after": chain,
+            "artifact_results": artifact_results,
+            "pre_run_gate_results": gate_results,
+            "external_monitor_results": external_monitor_results,
+        }
+        checkpoint_id, checkpoint_path, checkpoint_sha256 = append_checkpoint_record(project, record_payload)
+        output_root = lease.get("write_once_output_root")
+        if isinstance(output_root, str) and output_root not in control.setdefault("consumed_output_roots", []):
+            control["consumed_output_roots"].append(output_root)
+        control["continuation"] = {
+            "source_checkpoint_id": checkpoint_id,
+            "source_experiment_id": lease["experiment_id"],
+            "proposal_schema_version": lease.get("proposal_schema_version"),
+            "paths": safe_paths,
+            "state": "AVAILABLE" if safe_paths else "NONE",
+        }
         control["last_checkpoint"] = {
             "experiment_id": lease["experiment_id"], "chain_id": lease["chain_id"],
             "decision": decision, "outcome": outcome, "core_progress": core_progress,
+            "valid": valid, "evaluation_integrity": integrity,
             "preflight_failed": preflight_failed,
-            "time": iso_time(utc_now()), "artifact": primary_artifact,
+            "time": checkpoint_time, "artifact": primary_artifact,
             "artifact_results": artifact_results, "pre_run_gate_results": gate_results,
             "external_monitor_results": external_monitor_results,
+            "semantic_summary": semantic_summary,
+            "blocking_proof": blocking_proof,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_sha256": checkpoint_sha256,
+            "result_sha256": result_sha256,
+            "lease_id": lease["lease_id"],
         }
+        history = control.setdefault("checkpoint_history", [])
+        history.append({
+            "checkpoint_id": checkpoint_id,
+            "path": checkpoint_path,
+            "sha256": checkpoint_sha256,
+            "experiment_id": lease["experiment_id"],
+            "supersedes": None,
+        })
+        control["checkpoint_history"] = history[-256:]
         control["active_lease"] = None
         control["poll"] = None
         save_control(project, control)
@@ -2483,7 +3346,7 @@ def command_abort_preflight(args: argparse.Namespace) -> int:
         if not isinstance(primary, dict):
             raise GuardError("frozen required preflight FAIL lacks a verified primary artifact")
         result = {
-            "schema_version": RESULT_SCHEMA_VERSION,
+            "schema_version": lease.get("proposal_schema_version", 1),
             "experiment_id": lease["experiment_id"],
             "valid": False,
             "evaluation_integrity": "FAIL",
@@ -2496,6 +3359,18 @@ def command_abort_preflight(args: argparse.Namespace) -> int:
             "pre_run_gate_results": gates,
             "external_monitor_results": [],
         }
+        if lease.get("proposal_schema_version") == 3:
+            contract = lease.get("evaluation_contract", {})
+            result["evaluation_summary"] = {
+                "expected_attempts": contract.get("expected_attempts", 1),
+                "completed_attempts": 0,
+                "result_rows": 0,
+                "evaluator_completion": "missing",
+                "artifact_completeness": "incomplete",
+                "gate_determinacy": "indeterminate",
+                "threshold_result": "not_evaluated",
+                "guardrail_result": "not_evaluated",
+            }
         atomic_json(project / RESULT_REL, result)
     return command_checkpoint(argparse.Namespace(project=str(project), result=str(project / RESULT_REL)))
 
@@ -2563,6 +3438,26 @@ def command_release_lease(args: argparse.Namespace) -> int:
                 )
             if lease.get("final_discriminator"):
                 chain["final_discriminator_used"] = False
+        continuation = control.get("continuation")
+        binding = lease.get("continuation_binding")
+        if (
+            isinstance(continuation, dict)
+            and isinstance(binding, dict)
+            and continuation.get("state") == "CONSUMED"
+            and continuation.get("source_checkpoint_id") == binding.get("source_checkpoint_id")
+            and continuation.get("consumed_by_experiment_id") == lease.get("experiment_id")
+        ):
+            usage_key = binding.get("usage_key")
+            if isinstance(usage_key, str):
+                usage = control.setdefault("recovery_path_usage", {})
+                if int(usage.get(usage_key, 0)) > 0:
+                    usage[usage_key] = int(usage[usage_key]) - 1
+                    if usage[usage_key] == 0:
+                        usage.pop(usage_key)
+            continuation["state"] = "AVAILABLE"
+            for field in ("consumed_by_experiment_id", "consumed_path_id", "consumed_at"):
+                continuation.pop(field, None)
+            control["continuation"] = continuation
         previous_review_epoch = int(control.get("review_epoch", 0))
         control["review_epoch"] = previous_review_epoch + 1
         control["last_lease_release"] = {
@@ -2708,6 +3603,7 @@ def external_wait_delivery(control: dict[str, Any]) -> dict[str, Any] | None:
     publication_path = run_dir / "semantic_event.json"
     if not publication_path.exists():
         return {"state": "pending", "event_id": None}
+    event_id: str | None = None
     try:
         publication = load_owned_external_json(publication_path, root)
         event_id = ensure_prefixed_sha256(publication.get("event_id"), "external semantic event ID")
@@ -2731,7 +3627,7 @@ def external_wait_delivery(control: dict[str, Any]) -> dict[str, Any] | None:
             }
         return result
     except GuardError as error:
-        return {"state": "contract_error", "detail": str(error)}
+        return {"state": "contract_error", "detail": str(error), "event_id": event_id}
 
 
 def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> dict[str, str]:
@@ -2742,19 +3638,30 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
         wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
         command = "wake-monitor" if wait.get("kind") == "external_monitor" else "wake"
         delivery = external_wait_delivery(control)
-        if isinstance(delivery, dict) and delivery.get("state") in {"dead_letter", "contract_error"}:
-            event_id = delivery.get("event_id") or "unknown"
-            reason = delivery.get("last_error") or delivery.get("detail") or "transport failure"
+        reconciliation = runtime.get("external_reconciliation") if isinstance(runtime.get("external_reconciliation"), dict) else {}
+        if reconciliation.get("state") == "recoverable_transport_error" and (
+            not isinstance(delivery, dict) or reconciliation.get("event_id") == delivery.get("event_id")
+        ):
             return {
-                "kind": "PAUSE_REQUIRED",
-                "instruction": f"External monitor delivery {event_id} cannot wake the Goal: {reason}. Repair transport explicitly; do not wait forever or bypass the external monitor.",
+                "kind": "RECOVER_TRANSPORT",
+                "instruction": "The durable event exists but terminal verification needs a reversible transport repair. Continue autonomously within recovery budget; never resubmit the consumed Job.",
+            }
+        if isinstance(delivery, dict) and delivery.get("event_id"):
+            return {
+                "kind": "WAKE_MONITOR",
+                "instruction": f"Consume durable semantic event {delivery['event_id']} with {command}; notification delivery state has no business effect.",
+            }
+        if isinstance(delivery, dict) and delivery.get("state") == "contract_error":
+            return {
+                "kind": "RECOVER_TRANSPORT",
+                "instruction": "Repair or retry the reversible terminal/notification transport within the recovery budget; do not pause the business Goal and never resubmit the consumed Job.",
             }
         if gate_profile(gate) == "fast":
             return {
                 "kind": "WAIT",
                 "instruction": (
-                    f"Continue unattended with read-only bounded polling or process the registered {command} event; "
-                    "do not ask the user or mark the Goal blocked/complete merely because the event is pending."
+                    f"No durable {command} event exists yet. End this activation without model polling; "
+                    "the managed monitor will resume the exact thread; do not ask the user or mark the Goal blocked/complete."
                 ),
             }
         return {"kind": "WAIT", "instruction": f"End this activation without polling; resume only through the registered {command} event."}
@@ -2793,6 +3700,8 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
             return {"kind": "RECORD_GATES", "instruction": "Complete preparation and record PRE_RUN_RESULTS.json before workload execution."}
         return {"kind": "CONTINUE_LEASE", "instruction": "Continue the admitted experiment within its frozen paths and command policies."}
     last = control.get("last_checkpoint")
+    if isinstance(last, dict) and last.get("decision") == "COMPLETE" and last.get("outcome") == "positive" and last.get("core_progress") is True:
+        return {"kind": "COMPLETE", "instruction": "The declared metric and guardrails passed at a valid checkpoint; complete the Goal without inventing more work."}
     if isinstance(last, dict) and last.get("preflight_failed"):
         if gate_profile(gate) == "fast":
             return {
@@ -2800,8 +3709,21 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
                 "instruction": "Correct the failed preflight path and continue; fast profile does not require an external re-review.",
             }
         return {"kind": "FRESH_REVIEW", "instruction": "Prepare a corrected proposal on the same causal chain and obtain one fresh experiment review."}
+    continuation = control.get("continuation")
+    if isinstance(continuation, dict) and continuation.get("state") == "AVAILABLE" and continuation.get("paths"):
+        path = continuation["paths"][0]
+        kind = str(path.get("kind", "recovery")).upper()
+        return {
+            "kind": f"{kind}_NEXT",
+            "instruction": f"Continue unattended through safe path {path.get('id')}: {path.get('description')}. Use a fresh attempt and a new write-once output root; never resubmit a consumed Job.",
+        }
     if isinstance(last, dict) and last.get("decision") == "PAUSE_REQUIRED":
-        return {"kind": "AWAIT_DECISION", "instruction": "The last valid checkpoint explicitly requires a user decision; do not invent adjacent work."}
+        proof = last.get("blocking_proof") if isinstance(last.get("blocking_proof"), dict) else {}
+        if proof.get("block_allowed") is True and proof.get("hard_reason") in HARD_BLOCK_REASONS:
+            return {"kind": "AWAIT_DECISION", "instruction": f"Machine blocking proof permits a Goal pause: {proof.get('hard_reason')}."}
+        if gate_profile(gate) == "fast":
+            return {"kind": "RECOVER_FAST", "instruction": "The experiment paused, not the Goal. Repair the reversible failure or choose the next safe in-scope path without user approval."}
+        return {"kind": "ADMIT_RECOVERY", "instruction": "The experiment paused, not the Goal. Admit a bounded recovery/rollback/switch successor; do not mark the Goal blocked."}
     if gate_profile(gate) == "fast":
         return {
             "kind": "CONTINUE_FAST",
@@ -2851,6 +3773,8 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         "next_action": recommended_next_action(gate, control),
         "chains": {key: {field: value.get(field) for field in ("no_progress_count", "stopline_fired", "closed", "close_outcome")} for key, value in chains.items()},
         "last_checkpoint": control.get("last_checkpoint"),
+        "continuation": control.get("continuation"),
+        "blocking_proof": control.get("last_checkpoint", {}).get("blocking_proof") if isinstance(control.get("last_checkpoint"), dict) else None,
     }
     if not session_frontier_only:
         status["controller"] = control.get("controller", controller_metadata())
@@ -2864,6 +3788,8 @@ def compact_status(project: Path, gate: dict[str, Any], control: dict[str, Any],
         status["last_lease_release"] = control.get("last_lease_release")
         status["goal"] = control.get("goal")
         status["review_epoch"] = int(control.get("review_epoch", 0))
+    else:
+        status = {key: value for key, value in status.items() if value not in (None, {}, [])}
     return status
 
 
@@ -3405,13 +4331,18 @@ def hook_pre_tool_fast(project: Path, event: dict[str, Any], control: dict[str, 
         return None
     if waiting:
         if tool == "Bash":
-            if is_read_only_command(command):
+            if is_read_only_command(command) and not POLL_RE.search(command):
                 return None
+            if is_read_only_command(command) and POLL_RE.search(command):
+                return fast_deny(
+                    "the runtime is waiting and this command is status polling without a semantic event",
+                    "End this activation; the managed monitor will resume the exact thread when durable state changes.",
+                )
         if isinstance(tool, str) and tool.startswith("mcp__") and is_read_only_mcp(tool):
             return None
         return fast_deny(
             "the runtime is WAITING_EXTERNAL_EVENT and this call could mutate state before the registered event",
-            "Inspect or poll read-only evidence, process the registered wake event, or end this activation until it arrives.",
+            "Inspect non-polling read-only evidence, process the registered wake event, or end this activation until it arrives.",
         )
 
     if tool == "apply_patch":
@@ -3597,7 +4528,7 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
             targets = [path for path, _operation in patch_targets]
         except GuardError as exc:
             return deny(str(exc))
-        if lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION:
+        if isinstance(lease.get("proposal_schema_version"), int) and lease.get("proposal_schema_version") >= 2:
             blocked = [
                 f"{path.as_posix()}:{operation}"
                 for path, operation in patch_targets
@@ -3621,7 +4552,7 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
         if isinstance(wake_event, dict) and any(path.as_posix() == wake_event.get("path") for path in targets):
             return deny("terminal wake event evidence is frozen for the remainder of the lease")
     elif tool == "Bash":
-        if lease.get("proposal_schema_version") == PROPOSAL_SCHEMA_VERSION:
+        if isinstance(lease.get("proposal_schema_version"), int) and lease.get("proposal_schema_version") >= 2:
             policy = matching_bash_policy(project, cwd, command, lease)
             if policy is None:
                 return deny("Bash command, fixed arguments, or cwd is outside the structured lease policy")
@@ -3683,6 +4614,27 @@ def command_hook() -> int:
             name = event.get("hook_event_name")
             if name == "SessionStart":
                 persist_control_migration(project, control)
+                runtime = control.get("runtime", {})
+                wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
+                if runtime.get("state") == "WAITING_EXTERNAL_EVENT" and isinstance(wait, dict) and wait.get("kind") == "external_monitor":
+                    delivery = external_wait_delivery(control)
+                    event_id = delivery.get("event_id") if isinstance(delivery, dict) else None
+                    if isinstance(event_id, str):
+                        try:
+                            wake_monitor_locked(project, control, str(wait.get("monitor_id")), event_id)
+                        except (GuardError, OSError, UnicodeError, ValueError) as error:
+                            observation = {
+                                "schema_version": "goal-guardrails.external-reconciliation/v1",
+                                "state": "recoverable_transport_error",
+                                "event_id": event_id,
+                                "safe_message": str(error),
+                                "business_effect": "none",
+                            }
+                            observation["sha256"] = f"sha256:{canonical_hash(observation)}"
+                            if runtime.get("external_reconciliation", {}).get("sha256") != observation["sha256"]:
+                                runtime["external_reconciliation"] = observation
+                                control["runtime"] = runtime
+                                save_control(project, control)
             output: dict[str, Any] | None = None
             if name == "SessionStart":
                 status = compact_status(project, gate, control, session_frontier_only=True)
@@ -3701,7 +4653,8 @@ def command_hook() -> int:
                         + ". This runtime profile supersedes older project-managed text that says every mutation needs a review-attested lease. "
                         + " Continue routine in-scope local editing, tests, builds, evaluation, diagnostics, recovery, and semantic evidence recording without a lease, external review, or user approval. Controller checkpoint is only for an optional active lease. "
                         + "A tool denial skips only that high-impact action: do not stop the Goal or ask the user merely because of it; record it in BACKLOG.md and continue the next safe action. "
-                        + "Request user input only when progress truly requires changing the objective/metric, budget or material scope, executing an irreversible external action, or overriding a fired stop line."
+                        + "Experiment failure and chain closure are not Goal blocking. Never mark the persistent Goal blocked unless next_action is AWAIT_DECISION and blocking_proof.block_allowed=true. "
+                        + "Request user input only when progress truly requires changing the objective/metric, budget or material scope, executing an irreversible external action, unavailable external input, or overriding a fired global stop line."
                         + suffix
                     )
                 else:
@@ -3715,6 +4668,7 @@ def command_hook() -> int:
                         "Goal Guardrails enforcement is active in strict profile. Current gate status: "
                         + json.dumps(status, ensure_ascii=False, separators=(",", ":"))
                         + ". A single denied tool call is a recoverable control transition, not permission to mark the Goal complete or blocked; follow next_action. "
+                        + "Experiment failure and chain closure are not Goal blocking. Never mark the persistent Goal blocked unless next_action is AWAIT_DECISION and blocking_proof.block_allowed=true. "
                         + "Do not self-attest proposals; obtain one fresh subagent or user review at the experiment boundary. The controller validates attestation shape, not reviewer identity."
                         + suffix
                     )
@@ -3755,6 +4709,10 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("result")
     checkpoint.add_argument("--project")
+    correct_checkpoint = sub.add_parser("correct-checkpoint", aliases=["supersede-checkpoint"])
+    correct_checkpoint.add_argument("result")
+    correct_checkpoint.add_argument("--supersedes", required=True)
+    correct_checkpoint.add_argument("--project")
     abort = sub.add_parser("abort", aliases=["abort-preflight"])
     abort.add_argument("--project")
     gates = sub.add_parser("gates")
@@ -3842,6 +4800,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_update_goal(args)
         if args.command == "checkpoint":
             return command_checkpoint(args)
+        if args.command in {"correct-checkpoint", "supersede-checkpoint"}:
+            return command_correct_checkpoint(args)
         if args.command in {"abort", "abort-preflight"}:
             return command_abort_preflight(args)
         if args.command == "activate":

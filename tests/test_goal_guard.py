@@ -322,6 +322,59 @@ class GoalGuardTests(unittest.TestCase):
             "pre_run_gate_results": [],
         }
 
+    def semantic_proposal(
+        self,
+        experiment: str = "E001",
+        chain: str = "C-main",
+        *,
+        final: bool = False,
+        recovery_paths: list[dict] | None = None,
+    ) -> dict:
+        proposal = self.proposal(experiment=experiment, chain=chain, final=final)
+        proposal["schema_version"] = 3
+        proposal["evaluation_contract"] = {
+            "expected_attempts": 2,
+            "minimum_result_rows": 2,
+            "evaluator_artifact_id": "primary-result",
+            "required_artifact_ids": ["primary-result"],
+        }
+        proposal["recovery_paths"] = recovery_paths or []
+        return proposal
+
+    def semantic_result(
+        self,
+        experiment: str,
+        *,
+        semantic_class: str,
+        decision: str | None = None,
+    ) -> dict:
+        mapping = {
+            "all_passed": (True, "positive", "COMPLETE", "pass", "pass", "complete", "complete", "determinate", 2, 2),
+            "threshold_failed": (False, "negative", "SWITCH", "fail", "pass", "complete", "complete", "determinate", 2, 2),
+            "guardrail_failed": (False, "negative", "ROLLBACK", "pass", "fail", "complete", "complete", "determinate", 2, 2),
+            "evaluator_unavailable": (False, "invalid", "PAUSE_REQUIRED", "not_evaluated", "not_evaluated", "missing", "incomplete", "indeterminate", 0, 0),
+        }
+        core, outcome, default_decision, threshold, guardrail, evaluator, completeness, determinacy, attempts, rows = mapping[semantic_class]
+        result = self.result(
+            experiment,
+            core_progress=core,
+            outcome=outcome,
+            decision=decision or default_decision,
+            valid=semantic_class != "evaluator_unavailable",
+        )
+        result["schema_version"] = 3
+        result["evaluation_summary"] = {
+            "expected_attempts": 2,
+            "completed_attempts": attempts,
+            "result_rows": rows,
+            "evaluator_completion": evaluator,
+            "artifact_completeness": completeness,
+            "gate_determinacy": determinacy,
+            "threshold_result": threshold,
+            "guardrail_result": guardrail,
+        }
+        return result
+
     def admit(self, proposal: dict) -> int:
         review = proposal.get("review")
         if isinstance(review, dict) and review.get("decision") == "ALLOW":
@@ -342,6 +395,12 @@ class GoalGuardTests(unittest.TestCase):
         args = argparse.Namespace(project=str(self.project), result=str(path))
         with contextlib.redirect_stdout(io.StringIO()):
             return goal_guard.command_checkpoint(args)
+
+    def correct_checkpoint(self, result: dict, supersedes: str) -> int:
+        path = self.write_json("RESULT.json", result)
+        args = argparse.Namespace(project=str(self.project), result=str(path), supersedes=supersedes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return goal_guard.command_correct_checkpoint(args)
 
     def record_gates(self, payload: dict) -> int:
         path = self.write_json("PRE_RUN_RESULTS.json", payload)
@@ -911,7 +970,7 @@ class GoalGuardTests(unittest.TestCase):
         control = goal_guard.load_control(self.project)
         pending = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)
         self.assertEqual("pending", pending["runtime"]["delivery"]["state"])
-        self.assertEqual("WAIT", pending["next_action"]["kind"])
+        self.assertEqual("WAKE_MONITOR", pending["next_action"]["kind"])
 
         delivery.update({
             "state": "dead_letter",
@@ -921,7 +980,7 @@ class GoalGuardTests(unittest.TestCase):
         delivery_path.write_text(json.dumps(delivery) + "\n", encoding="utf-8")
         paused = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), control)
         self.assertEqual("dead_letter", paused["runtime"]["delivery"]["state"])
-        self.assertEqual("PAUSE_REQUIRED", paused["next_action"]["kind"])
+        self.assertEqual("WAKE_MONITOR", paused["next_action"]["kind"])
         self.assertIn(event_id, paused["next_action"]["instruction"])
         self.assertEqual("WAITING_EXTERNAL_EVENT", goal_guard.load_control(self.project)["runtime"]["state"])
 
@@ -1378,7 +1437,7 @@ class GoalGuardTests(unittest.TestCase):
         self.assertEqual("deny", overwrite["hookSpecificOutput"]["permissionDecision"])
         self.assertIsNone(self.pre("Bash", "cat train.sbatch"))
 
-    def test_fast_waiting_allows_polling_but_not_mutation_and_session_says_unattended(self) -> None:
+    def test_fast_waiting_ends_polling_but_allows_inspection_and_session_says_unattended(self) -> None:
         gate = goal_guard.load_gate(self.project)
         gate["profile"] = "fast"
         self.write_json("GATE.json", gate)
@@ -1386,8 +1445,8 @@ class GoalGuardTests(unittest.TestCase):
         control["runtime"] = {"state": "WAITING_EXTERNAL_EVENT", "wait": {"kind": "artifact"}, "seen_events": []}
         self.write_json("CONTROL.json", control)
 
-        self.assertIsNone(self.pre("Bash", "tail -f artifacts/job.log"))
-        self.assertIsNone(self.pre("Bash", "squeue -j 12345 | tail -n 1"))
+        self.assertEqual("deny", self.pre("Bash", "tail -f artifacts/job.log")["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", self.pre("Bash", "squeue -j 12345 | tail -n 1")["hookSpecificOutput"]["permissionDecision"])
         self.assertIsNone(self.pre("Bash", "wc -l optimization/GOAL.md"))
         self.assertIsNone(self.pre("Bash", "cat optimization/GOAL.md | rg 'Primary metric'"))
         self.assertIsNone(self.pre("Bash", "date -u +%Y-%m-%dT%H:%M:%SZ"))
@@ -1410,7 +1469,7 @@ class GoalGuardTests(unittest.TestCase):
         status = goal_guard.compact_status(self.project, goal_guard.load_gate(self.project), goal_guard.load_control(self.project))
         self.assertEqual("WAIT", status["next_action"]["kind"])
         self.assertIn("do not ask the user", status["next_action"]["instruction"])
-        self.assertNotIn("End this activation", status["next_action"]["instruction"])
+        self.assertIn("End this activation", status["next_action"]["instruction"])
         mutation = self.pre("apply_patch", "*** Begin Patch\n*** Add File: src/while-waiting.py\n+x = 1\n*** End Patch")
         self.assertEqual("deny", mutation["hookSpecificOutput"]["permissionDecision"])
         session = self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "resume"})
@@ -1866,6 +1925,211 @@ class GoalGuardTests(unittest.TestCase):
         self.admit(self.proposal(experiment="E001"))
         with self.assertRaisesRegex(goal_guard.GuardError, "COMPLETE requires"):
             self.checkpoint(self.result("E001", decision="COMPLETE"))
+
+    def test_schema_v3_complete_threshold_failure_is_valid_negative_not_invalid(self) -> None:
+        self.admit(self.semantic_proposal())
+        invalid = self.semantic_result("E001", semantic_class="threshold_failed")
+        invalid["valid"] = False
+        invalid["evaluation_integrity"] = "FAIL"
+        invalid["outcome"] = "invalid"
+        invalid["decision"] = "PAUSE_REQUIRED"
+        with self.assertRaisesRegex(goal_guard.GuardError, "valid negative|require valid=True"):
+            self.checkpoint(invalid)
+
+        accepted = self.semantic_result("E001", semantic_class="threshold_failed")
+        self.checkpoint(accepted)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("threshold_failed", control["last_checkpoint"]["semantic_summary"]["semantic_class"])
+        self.assertEqual("negative", control["last_checkpoint"]["outcome"])
+        self.assertEqual("SWITCH_NEXT", goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"])
+        receipt = self.project / control["last_checkpoint"]["checkpoint_path"]
+        self.assertTrue(receipt.is_file())
+
+    def test_schema_v3_evaluator_failure_recovers_without_global_pause(self) -> None:
+        self.admit(self.semantic_proposal())
+        self.checkpoint(self.semantic_result("E001", semantic_class="evaluator_unavailable"))
+        control = goal_guard.load_control(self.project)
+        proof = control["last_checkpoint"]["blocking_proof"]
+        self.assertFalse(proof["block_allowed"])
+        self.assertEqual(1, proof["recovery_budget"]["used"])
+        self.assertEqual("RECOVERY_NEXT", goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"])
+
+    def test_global_pause_requires_recovery_budget_exhaustion(self) -> None:
+        for index in range(1, 4):
+            experiment = f"E{index:03d}"
+            self.admit(self.semantic_proposal(experiment=experiment))
+            self.checkpoint(self.semantic_result(experiment, semantic_class="evaluator_unavailable"))
+            control = goal_guard.load_control(self.project)
+            if index < 3:
+                self.assertFalse(control["last_checkpoint"]["blocking_proof"]["block_allowed"])
+                self.assertEqual("RECOVERY_NEXT", goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"])
+        proof = control["last_checkpoint"]["blocking_proof"]
+        self.assertTrue(proof["block_allowed"])
+        self.assertEqual("all_paths_exhausted", proof["hard_reason"])
+        self.assertEqual("AWAIT_DECISION", goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"])
+
+    def test_schema_v3_negative_final_closes_only_chain_and_switches(self) -> None:
+        self.admit(self.semantic_proposal(final=True))
+        self.checkpoint(self.semantic_result("E001", semantic_class="threshold_failed"))
+        control = goal_guard.load_control(self.project)
+        self.assertTrue(control["chains"]["C-main"]["closed"])
+        self.assertFalse(control["last_checkpoint"]["blocking_proof"]["block_allowed"])
+        self.assertEqual("SWITCH_NEXT", goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"])
+
+    def test_checkpoint_is_idempotent_for_identical_result(self) -> None:
+        self.admit(self.semantic_proposal())
+        result = self.semantic_result("E001", semantic_class="threshold_failed")
+        self.checkpoint(result)
+        before = goal_guard.load_control(self.project)
+        self.checkpoint(result)
+        after = goal_guard.load_control(self.project)
+        self.assertEqual(before["last_checkpoint"]["checkpoint_id"], after["last_checkpoint"]["checkpoint_id"])
+        self.assertEqual(len(before["checkpoint_history"]), len(after["checkpoint_history"]))
+
+    def test_checkpoint_rolls_forward_after_receipt_written_before_control_save(self) -> None:
+        self.admit(self.semantic_proposal())
+        result = self.semantic_result("E001", semantic_class="threshold_failed")
+        path = self.write_json("RESULT.json", result)
+        args = argparse.Namespace(project=str(self.project), result=str(path))
+        with mock.patch.object(goal_guard, "save_control", side_effect=OSError("fault after receipt")):
+            with self.assertRaisesRegex(OSError, "fault after receipt"):
+                goal_guard.command_checkpoint(args)
+        self.assertEqual(1, len(list((self.project / "optimization/.goal-guardrails/checkpoints/E001").glob("*.json"))))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, goal_guard.command_checkpoint(args))
+        control = goal_guard.load_control(self.project)
+        self.assertIsNone(control["active_lease"])
+        self.assertEqual(1, len(control["checkpoint_history"]))
+        self.assertEqual(1, len(list((self.project / "optimization/.goal-guardrails/checkpoints/E001").glob("*.json"))))
+
+    def test_correct_checkpoint_appends_and_restores_recovery_semantics(self) -> None:
+        self.admit(self.semantic_proposal())
+        self.checkpoint(self.semantic_result("E001", semantic_class="evaluator_unavailable"))
+        before = goal_guard.load_control(self.project)
+        original_id = before["last_checkpoint"]["checkpoint_id"]
+        original_path = self.project / before["last_checkpoint"]["checkpoint_path"]
+        original_bytes = original_path.read_bytes()
+        original_sha = goal_guard.file_hash(original_path)
+        self.assertEqual(1, before["recovery"]["used"])
+
+        self.correct_checkpoint(
+            self.semantic_result("E001", semantic_class="threshold_failed"),
+            original_id,
+        )
+        after = goal_guard.load_control(self.project)
+        corrected = self.project / after["last_checkpoint"]["checkpoint_path"]
+        corrected_record = json.loads(corrected.read_text(encoding="utf-8"))
+        self.assertEqual(original_bytes, original_path.read_bytes())
+        self.assertEqual(original_sha, goal_guard.file_hash(original_path))
+        self.assertEqual("correction", corrected_record["kind"])
+        self.assertEqual(original_id, corrected_record["supersedes"])
+        self.assertNotEqual(original_id, after["last_checkpoint"]["checkpoint_id"])
+        self.assertEqual("negative", after["last_checkpoint"]["outcome"])
+        self.assertEqual("threshold_failed", after["last_checkpoint"]["semantic_summary"]["semantic_class"])
+        self.assertEqual(0, after["recovery"]["used"])
+        self.assertEqual("AVAILABLE", after["continuation"]["state"])
+        self.assertEqual(2, len(after["checkpoint_history"]))
+
+    def test_correct_checkpoint_rejects_nonlatest_but_safe_release_restores_continuation(self) -> None:
+        self.admit(self.semantic_proposal())
+        self.checkpoint(self.semantic_result("E001", semantic_class="evaluator_unavailable"))
+        original_id = goal_guard.load_control(self.project)["last_checkpoint"]["checkpoint_id"]
+        self.correct_checkpoint(self.semantic_result("E001", semantic_class="threshold_failed"), original_id)
+        corrected_id = goal_guard.load_control(self.project)["last_checkpoint"]["checkpoint_id"]
+        with self.assertRaisesRegex(goal_guard.GuardError, "latest canonical"):
+            self.correct_checkpoint(self.semantic_result("E001", semantic_class="guardrail_failed"), original_id)
+
+        successor = self.semantic_proposal(experiment="E002", chain="C-next")
+        successor["causal_bottleneck"] = "a distinct successor bottleneck"
+        self.admit(successor)
+        active = goal_guard.load_control(self.project)["active_lease"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            goal_guard.command_release_lease(argparse.Namespace(
+                project=str(self.project),
+                expected_proposal_sha256=active["proposal_sha256"],
+                reason="exercise consumed-continuation correction guard",
+            ))
+        restored = goal_guard.load_control(self.project)
+        self.assertEqual("AVAILABLE", restored["continuation"]["state"])
+        self.assertEqual({}, restored["recovery_path_usage"])
+        self.correct_checkpoint(self.semantic_result("E001", semantic_class="guardrail_failed"), corrected_id)
+        self.assertEqual("guardrail_failed", goal_guard.load_control(self.project)["last_checkpoint"]["semantic_summary"]["semantic_class"])
+
+    def test_correct_checkpoint_revalidates_strict_booleans_and_semantics(self) -> None:
+        self.admit(self.semantic_proposal())
+        self.checkpoint(self.semantic_result("E001", semantic_class="evaluator_unavailable"))
+        checkpoint_id = goal_guard.load_control(self.project)["last_checkpoint"]["checkpoint_id"]
+        corrected = self.semantic_result("E001", semantic_class="threshold_failed")
+        corrected["valid"] = 1
+        with self.assertRaisesRegex(goal_guard.GuardError, "strict booleans"):
+            self.correct_checkpoint(corrected, checkpoint_id)
+        corrected = self.semantic_result("E001", semantic_class="threshold_failed")
+        corrected["outcome"] = "invalid"
+        with self.assertRaisesRegex(goal_guard.GuardError, "valid negative"):
+            self.correct_checkpoint(corrected, checkpoint_id)
+
+    def test_correct_checkpoint_cli_contract(self) -> None:
+        args = goal_guard.build_parser().parse_args([
+            "correct-checkpoint",
+            "optimization/RESULT.json",
+            "--supersedes",
+            "sha256:" + "a" * 64,
+            "--project",
+            ".",
+        ])
+        self.assertEqual("correct-checkpoint", args.command)
+        self.assertEqual("sha256:" + "a" * 64, args.supersedes)
+
+    def test_session_start_consumes_pending_terminal_and_duplicate_is_noop(self) -> None:
+        self.admit(self.external_monitor_proposal())
+        self.submit_binding()
+        terminal, event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        event.unlink()
+        self.wait_monitor()
+        _terminal, durable_event = self.write_external_monitor_terminal()
+        event_id = "sha256:" + durable_event.parent.name
+        durable_event.with_name("delivery.json").write_text(json.dumps({
+            "schema": "codex-monitor.delivery/v1",
+            "event_id": event_id,
+            "state": "dead_letter",
+            "attempts": 5,
+            "last_error": {"code": "wake_failed", "safe_message": "notification unavailable"},
+        }) + "\n", encoding="utf-8")
+
+        self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "natural"})
+        first = goal_guard.load_control(self.project)
+        self.assertEqual("ACTIVE", first["runtime"]["state"])
+        receipt = first["active_lease"]["monitor_receipts"]["scheduler"]
+        receipt_sha = receipt["sha256"]
+        seen_count = len(first["runtime"]["seen_events"])
+
+        self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "duplicate"})
+        second = goal_guard.load_control(self.project)
+        self.assertEqual(receipt_sha, second["active_lease"]["monitor_receipts"]["scheduler"]["sha256"])
+        self.assertEqual(seen_count, len(second["runtime"]["seen_events"]))
+
+    def test_session_start_rolls_forward_existing_monitor_receipt_after_control_fault(self) -> None:
+        self.admit(self.external_monitor_proposal())
+        self.submit_binding()
+        terminal, event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        event.unlink()
+        self.wait_monitor()
+        _terminal, event = self.write_external_monitor_terminal()
+        event_id = "sha256:" + event.parent.name
+        with mock.patch.object(goal_guard, "save_control", side_effect=OSError("fault after monitor receipt")):
+            with self.assertRaisesRegex(OSError, "fault after monitor receipt"):
+                self.wake_monitor(event_id)
+        receipts = list((self.project / "optimization/.goal-guardrails/receipts").glob("*/*.json"))
+        self.assertEqual(1, len(receipts))
+        receipt_sha = goal_guard.file_hash(receipts[0])
+
+        self.hook({"hook_event_name": "SessionStart", "cwd": str(self.project), "source": "natural-recovery"})
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("ACTIVE", control["runtime"]["state"])
+        self.assertEqual(receipt_sha, control["active_lease"]["monitor_receipts"]["scheduler"]["sha256"])
+        self.assertEqual(1, len(control["runtime"]["seen_events"]))
 
     def test_non_core_allowance_is_bounded(self) -> None:
         self.admit(self.proposal(experiment="N001", work_class="non_core"))
