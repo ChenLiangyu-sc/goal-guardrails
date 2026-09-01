@@ -3,12 +3,12 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume|compact",
+        "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/goal_guard.py\" hook",
-            "timeout": 10,
+            "timeout": 45,
             "statusMessage": "Restoring optimization gate",
             "additionalContextLimit": 1200
           }

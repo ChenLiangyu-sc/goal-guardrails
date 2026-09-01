@@ -1,6 +1,6 @@
 {
   "name": "goal-guardrails",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Keep unattended long-running optimization aligned with fast-by-default Codex lifecycle guardrails.",
   "author": {
     "name": "Chen Liangyu",

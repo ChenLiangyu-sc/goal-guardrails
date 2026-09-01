@@ -13,7 +13,7 @@ class PackagingTests(unittest.TestCase):
     def test_manifest_points_to_canonical_skill_and_default_hook_exists(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
         self.assertEqual("goal-guardrails", manifest["name"])
-        self.assertEqual("0.7.0", manifest["version"])
+        self.assertEqual("0.8.0", manifest["version"])
         self.assertEqual("./skills/", manifest["skills"])
         self.assertTrue((ROOT / "skills/goal-guardrails/SKILL.md").is_file())
         self.assertTrue((ROOT / "hooks/hooks.json").is_file())
@@ -31,6 +31,9 @@ class PackagingTests(unittest.TestCase):
         payload = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))
         hooks = payload["hooks"]
         self.assertEqual({"SessionStart", "PreToolUse", "PostToolUse"}, set(hooks))
+        session_group = hooks["SessionStart"][0]
+        self.assertEqual("startup|resume|clear|compact", session_group["matcher"])
+        self.assertGreater(session_group["hooks"][0]["timeout"], 30)
         handlers = [handler for groups in hooks.values() for group in groups for handler in group["hooks"]]
         self.assertTrue(handlers)
         for handler in handlers:

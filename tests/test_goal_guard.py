@@ -115,13 +115,15 @@ class GoalGuardTests(unittest.TestCase):
             },
         }
 
-    def external_monitor_proposal(self) -> dict:
+    def external_monitor_proposal(self, *, contract_version: int = 1) -> dict:
         proposal = self.proposal()
         submit = self.project / "sbatch"
         submit.write_text("#!/usr/bin/env python3\nprint('12345;cluster')\n", encoding="utf-8")
         submit.chmod(0o700)
-        monitor = self.project / "monitor_fake.py"
+        monitor = self.project / ("supervise_slurm_job.py" if contract_version == 2 else "monitor_fake.py")
         monitor.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        if contract_version == 2:
+            (self.project / "app_server_bridge.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
         proposal["lease_phase"] = "workload"
         proposal["runtime_bindings"] = [{
             "id": "slurm-job", "kind": "slurm_job_id", "source_policy_id": "submit-slurm", "required": True,
@@ -136,7 +138,7 @@ class GoalGuardTests(unittest.TestCase):
             {
                 "id": "start-monitor", "phase": "workload", "executable": sys.executable,
                 "argv": [
-                    {"literal": "monitor_fake.py"}, {"literal": "start"}, {"binding": "slurm-job"},
+                    {"literal": monitor.name}, {"literal": "start"}, {"binding": "slurm-job"},
                     {"literal": "--host"}, {"literal": "fakehost"},
                     {"literal": "--state-dir"}, {"literal": str(self.monitor_state)},
                     {"literal": "--expected-owner"}, {"literal": "alice"},
@@ -156,13 +158,26 @@ class GoalGuardTests(unittest.TestCase):
             },
         ]
         proposal["external_monitors"] = [{
-            "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": 1,
+            "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": contract_version,
             "binding_id": "slurm-job", "start_policy_id": "start-monitor",
             "state_root": str(self.monitor_state), "host": "fakehost", "expected_owner": "alice",
             "expected_job_name": "H25", "expected_partition": "gpu", "required": True,
         }]
         proposal["review"]["checks"]["external_monitor_contract_bounded"] = True
         return proposal
+
+    def scheduler_gate_record(self) -> dict:
+        return {
+            "schema_version": "goal-guardrails.scheduler-gate/v1",
+            "state": "ARMED",
+            "binding_id": "gg-" + "a" * 48,
+            "thread_id": "thr_test_1",
+            "goal_id": "goal_test_1",
+            "receipt_path": str(self.monitor_state / ".continuation-gates/test.json"),
+            "receipt_sha256": "b" * 64,
+            "armed_at": "2026-09-01T00:00:00Z",
+            "model_turn_created": False,
+        }
 
     def remote_submission_proposal(self) -> dict:
         proposal = self.proposal()
@@ -935,6 +950,279 @@ class GoalGuardTests(unittest.TestCase):
         receipt = control["active_lease"]["monitor_receipts"]["scheduler"]
         self.assertTrue(receipt["source_semantic_event_id"].startswith("sha256:"))
         self.assertEqual(0, self.wake_monitor(receipt["source_semantic_event_id"]))
+
+    def test_scheduler_gated_wait_arms_before_waiting_and_suspends_lease(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        record = self.scheduler_gate_record()
+        with mock.patch.object(goal_guard, "scheduler_gate_command", return_value=record) as arm:
+            self.wait_monitor()
+        arm.assert_called_once()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("WAITING_EXTERNAL_EVENT", control["runtime"]["state"])
+        self.assertEqual(2, control["runtime"]["wait"]["contract_version"])
+        self.assertEqual(record, control["runtime"]["wait"]["scheduler_gate"])
+        self.assertEqual(record, control["active_lease"]["scheduler_gate"])
+        self.assertIn("remaining_seconds", control["active_lease"])
+        self.assertIn("suspended_at", control["active_lease"])
+
+    def test_scheduler_gate_adapter_verifies_monitor_receipt_and_exact_argv(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        control = goal_guard.load_control(self.project)
+        lease = control["active_lease"]
+        monitor = goal_guard.monitor_contract(lease, "scheduler")
+        run = goal_guard.verify_monitor_run(lease, monitor)
+        binding_id = goal_guard.scheduler_gate_binding_id(lease, monitor, run)
+        event_binding = {
+            "schema": "codex-monitor.event-binding/v1",
+            "codex_home_id": "sha256:" + "3" * 64,
+            "app_server_instance": "workstation-1",
+            "thread_id": "thr_test_1",
+            "workspace": str(self.project.resolve()),
+        }
+        event_binding_path = self.monitor_state / "event-binding.json"
+        event_binding_path.write_text(json.dumps(event_binding) + "\n", encoding="utf-8")
+        event_binding_path.chmod(0o600)
+        executable = Path(sys.executable).resolve()
+        bridge_config = {
+            "schema": "codex-monitor.bridge-config/v1",
+            "enabled": True,
+            "instance_id": "workstation-1",
+            "codex_home": str(self.monitor_state / "codex-home"),
+            "codex_home_id": "sha256:" + "3" * 64,
+            "workspace": str(self.project.resolve()),
+            "transport": {"type": "stdio", "command": [str(executable), "app-server"]},
+            "request_timeout_seconds": 10,
+            "poll_seconds": 1,
+            "lease_seconds": 30,
+            "max_attempts": 3,
+            "backoff_initial_seconds": 1,
+            "backoff_max_seconds": 10,
+            "turn_completion_timeout_seconds": 30,
+        }
+        bridge_config_path = self.monitor_state / "bridge.json"
+        bridge_config_path.write_text(json.dumps(bridge_config) + "\n", encoding="utf-8")
+        bridge_config_path.chmod(0o600)
+        receipt_path = self.monitor_state / ".continuation-gates/test.json"
+        receipt_path.parent.mkdir(parents=True)
+        receipt = {
+            "schema": "codex-monitor.continuation-gate-receipt/v1",
+            "binding_id": binding_id,
+            "binding_digest": goal_guard.monitor_canonical_digest(event_binding),
+            "config_digest": goal_guard.monitor_canonical_digest(bridge_config),
+            "instance_id": "workstation-1",
+            "codex_home_id": "sha256:" + "3" * 64,
+            "workspace_id": "sha256:" + hashlib.sha256(str(self.project.resolve()).encode()).hexdigest(),
+            "thread_id": "thr_test_1",
+            "executable": str(executable),
+            "executable_sha256": "sha256:" + goal_guard.file_hash(executable),
+            "codex_version": "0.151.0",
+            "goal_id": "goal_test_1",
+            "state": "armed",
+            "armed_at": "2026-09-01T00:00:00Z",
+            "cleared_at": None,
+        }
+        receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+        response = {
+            "schema_version": "codex-monitor.bridge.continuation-gate/v1",
+            "state": "ok",
+            "action": "arm",
+            "binding_id": binding_id,
+            "thread_id": "thr_test_1",
+            "goal_id": "goal_test_1",
+            "goal_status": "active",
+            "deferred": True,
+            "receipt_state": "armed",
+            "receipt": str(receipt_path),
+            "model_turn_created": False,
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response), stderr="")
+        with mock.patch.object(goal_guard.subprocess, "run", return_value=completed) as run_command:
+            record = goal_guard.scheduler_gate_command(self.project, lease, monitor, run)
+        argv = run_command.call_args.args[0]
+        self.assertEqual(sys.executable, argv[0])
+        self.assertTrue(argv[1].endswith("/app_server_bridge.py"))
+        self.assertEqual(["continuation-gate", "arm"], argv[2:4])
+        self.assertIn(binding_id, argv)
+        self.assertEqual("ARMED", record["state"])
+        self.assertEqual(goal_guard.file_hash(receipt_path), record["receipt_sha256"])
+
+        event_binding["thread_id"] = "thr_different_goal"
+        event_binding_path.write_text(json.dumps(event_binding) + "\n", encoding="utf-8")
+        event_binding_path.chmod(0o600)
+        with mock.patch.object(goal_guard.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(goal_guard.GuardError, "not armed and read back"):
+                goal_guard.scheduler_gate_command(self.project, lease, monitor, run)
+
+        event_binding["thread_id"] = "thr_test_1"
+        event_binding_path.write_text(json.dumps(event_binding) + "\n", encoding="utf-8")
+        event_binding_path.chmod(0o600)
+        bridge_config["workspace"] = str(self.monitor_state.resolve())
+        bridge_config_path.write_text(json.dumps(bridge_config) + "\n", encoding="utf-8")
+        bridge_config_path.chmod(0o600)
+        with mock.patch.object(goal_guard.subprocess, "run") as no_call:
+            with self.assertRaisesRegex(goal_guard.GuardError, "different Goal workspace"):
+                goal_guard.scheduler_gate_command(self.project, lease, monitor, run)
+        no_call.assert_not_called()
+
+    def test_scheduler_gate_failure_stays_arming_and_retry_does_not_resubmit(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        with mock.patch.object(
+            goal_guard,
+            "scheduler_gate_command",
+            side_effect=goal_guard.GuardError("scheduler continuation gate was not armed"),
+        ):
+            with self.assertRaisesRegex(goal_guard.GuardError, "not armed"):
+                self.wait_monitor()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("ARMING_EXTERNAL_WAIT", control["runtime"]["state"])
+        self.assertGreater(control["active_lease"]["remaining_seconds"], 0)
+        self.assertIn("suspended_at", control["active_lease"])
+        self.assertEqual("SUCCEEDED", control["active_lease"]["policy_runs"]["submit-slurm"]["state"])
+        self.assertEqual("BOUND", control["active_lease"]["binding_values"]["slurm-job"]["state"])
+        action = goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)
+        self.assertEqual("RETRY_WAIT_MONITOR", action["kind"])
+        self.assertIn("Never resubmit", action["instruction"])
+
+        with mock.patch.object(goal_guard, "scheduler_gate_command", return_value=self.scheduler_gate_record()):
+            self.wait_monitor()
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("WAITING_EXTERNAL_EVENT", control["runtime"]["state"])
+        with self.assertRaisesRegex(goal_guard.GuardError, "waiting for an external event|already consumed"):
+            self.submit_binding()
+
+    def test_no_event_session_rearms_gate_and_ends_before_model_request(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        terminal.with_name("semantic_event.json").unlink()
+        record = self.scheduler_gate_record()
+        with mock.patch.object(goal_guard, "scheduler_gate_command", return_value=record):
+            self.wait_monitor()
+            output = self.hook({
+                "hook_event_name": "SessionStart",
+                "cwd": str(self.project),
+                "source": "resume",
+            })
+        self.assertIs(output["continue"], False)
+        self.assertIn("continuation gate remains armed", output["stopReason"])
+        self.assertIn("before a model request", output["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual("WAITING_EXTERNAL_EVENT", goal_guard.load_control(self.project)["runtime"]["state"])
+
+    def test_arming_no_event_session_arms_once_then_stops_before_model(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        terminal.with_name("semantic_event.json").unlink()
+        with mock.patch.object(
+            goal_guard,
+            "scheduler_gate_command",
+            side_effect=goal_guard.GuardError("temporary continuation transport failure"),
+        ):
+            with self.assertRaises(goal_guard.GuardError):
+                self.wait_monitor()
+        with mock.patch.object(
+            goal_guard,
+            "scheduler_gate_command",
+            return_value=self.scheduler_gate_record(),
+        ) as arm:
+            output = self.hook({
+                "hook_event_name": "SessionStart",
+                "cwd": str(self.project),
+                "source": "resume",
+            })
+        arm.assert_called_once()
+        self.assertIs(output["continue"], False)
+        self.assertEqual("WAITING_EXTERNAL_EVENT", goal_guard.load_control(self.project)["runtime"]["state"])
+
+    def test_terminal_session_wakes_without_rearming_or_stopping_turn(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        with mock.patch.object(goal_guard, "scheduler_gate_command", return_value=self.scheduler_gate_record()):
+            self.wait_monitor()
+        self.write_external_monitor_terminal()
+        with mock.patch.object(goal_guard, "scheduler_gate_command") as arm:
+            output = self.hook({
+                "hook_event_name": "SessionStart",
+                "cwd": str(self.project),
+                "source": "resume",
+            })
+        arm.assert_not_called()
+        self.assertNotIn("continue", output)
+        self.assertEqual("ACTIVE", goal_guard.load_control(self.project)["runtime"]["state"])
+
+    def test_terminal_event_recovers_arming_state_without_scheduler_gate(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        with mock.patch.object(
+            goal_guard,
+            "scheduler_gate_command",
+            side_effect=goal_guard.GuardError("temporary continuation transport failure"),
+        ):
+            with self.assertRaises(goal_guard.GuardError):
+                self.wait_monitor()
+        self.assertEqual("ARMING_EXTERNAL_WAIT", goal_guard.load_control(self.project)["runtime"]["state"])
+        self.write_external_monitor_terminal()
+        with mock.patch.object(goal_guard, "scheduler_gate_command") as arm:
+            output = self.hook({
+                "hook_event_name": "SessionStart",
+                "cwd": str(self.project),
+                "source": "resume",
+            })
+        arm.assert_not_called()
+        self.assertNotIn("continue", output)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("ACTIVE", control["runtime"]["state"])
+        self.assertIn("scheduler", control["active_lease"]["monitor_receipts"])
+
+    def test_terminal_verification_failure_keeps_goal_running_for_transport_recovery(self) -> None:
+        self.admit(self.external_monitor_proposal(contract_version=2))
+        self.submit_binding()
+        terminal, semantic_event = self.write_external_monitor_terminal()
+        terminal.unlink()
+        semantic_event.unlink()
+        with mock.patch.object(goal_guard, "scheduler_gate_command", return_value=self.scheduler_gate_record()):
+            self.wait_monitor()
+        self.write_external_monitor_terminal(terminal_verified=False)
+        with mock.patch.object(goal_guard, "scheduler_gate_command") as arm:
+            output = self.hook({
+                "hook_event_name": "SessionStart",
+                "cwd": str(self.project),
+                "source": "resume",
+            })
+        arm.assert_not_called()
+        self.assertNotIn("continue", output)
+        control = goal_guard.load_control(self.project)
+        self.assertEqual("WAITING_EXTERNAL_EVENT", control["runtime"]["state"])
+        self.assertEqual(
+            "recoverable_transport_error",
+            control["runtime"]["external_reconciliation"]["state"],
+        )
+        self.assertEqual(
+            "RECOVER_TRANSPORT",
+            goal_guard.recommended_next_action(goal_guard.load_gate(self.project), control)["kind"],
+        )
 
     def test_required_external_monitor_rejects_project_artifact_wait(self) -> None:
         self.admit(self.external_monitor_proposal())

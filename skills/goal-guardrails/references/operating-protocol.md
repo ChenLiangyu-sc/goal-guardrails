@@ -148,7 +148,7 @@ The relevant proposal fields have this shape; keep the executable paths and lite
   ],
   "external_monitors": [
     {
-      "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": 1,
+      "id": "scheduler", "provider": "codex-hpc-monitor", "contract_version": 2,
       "binding_id": "slurm-job", "start_policy_id": "start-monitor",
       "state_root": "/home/USER/.cache/codex-hpc-monitor", "host": "hpc142",
       "expected_owner": "USER", "expected_job_name": "JOB", "expected_partition": "PARTITION",
@@ -160,7 +160,7 @@ The relevant proposal fields have this shape; keep the executable paths and lite
 
 Invoke `submit-bind --policy <id>` once. For a local policy the controller executes the frozen argv without a shell. For `ssh-helper-v1`, run `doctor --policy <id>` first; the local controller sends a versioned JSON request to the pinned helper. It parses the single `sbatch --parsable` result, freezes the Job ID, and closes the capture policy. An exit failure, timeout, malformed output, or uncertain result consumes the attempt. A definitive failure requires a fresh proposal (and fresh review only in strict profile); an uncertain remote result uses `reconcile-bind --policy <id>` against the same nonce and must never be resubmitted. Only controller-frozen values may fill binding tokens.
 
-After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. It resolves the provider's canonical run and freezes its manifest SHA before suspending the lease. The bridge publishes a versioned semantic event to its private outbox and delivers only a fixed notification. It must not write the project or decide the business outcome.
+After the deterministic monitor starts, invoke `wait-monitor --monitor <id>`. Contract v2 resolves the provider's canonical run, freezes its manifest SHA, persists `ARMING_EXTERNAL_WAIT`, and invokes the monitor bridge's no-turn continuation gate. The controller suspends the lease and commits `WAITING_EXTERNAL_EVENT` only after the same active Goal reads back `deferred=true` and the project-external receipt is verified. If arm is interrupted or fails, repeat the same `wait-monitor`; do not resubmit the workload. Existing contract-v1 leases retain legacy behavior. The bridge publishes a versioned semantic event to its private outbox and delivers only a fixed notification. It must not write the project or decide the business outcome.
 
 On notification, invoke `wake-monitor --monitor <id> --event-id <sha256:...from-wake...>`. The event ID argument is optional only for compatibility with an already-waiting v0.6.0 controller. If notification fails but the semantic event is durable, the next natural SessionStart performs the same verification and wake automatically. Pending, dead-letter, or corrupt delivery metadata never becomes a business pause. Repeated delivery is idempotent. Include the project receipt and SHA in `RESULT.json.external_monitor_results`; scheduler success is still not the business verdict.
 

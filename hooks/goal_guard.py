@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-HOOK_VERSION = "0.7.0"
+HOOK_VERSION = "0.8.0"
 PROPOSAL_SCHEMA_VERSION = 3
 RESULT_SCHEMA_VERSION = 3
 SUPPORTED_PROPOSAL_SCHEMA_VERSIONS = {2, 3}
@@ -299,7 +299,7 @@ def load_control(project: Path) -> dict[str, Any]:
     runtime.setdefault("state", "ACTIVE")
     runtime.setdefault("wait", None)
     runtime.setdefault("seen_events", [])
-    if runtime["state"] not in {"ACTIVE", "WAITING_EXTERNAL_EVENT"} or not isinstance(runtime["seen_events"], list):
+    if runtime["state"] not in {"ACTIVE", "ARMING_EXTERNAL_WAIT", "WAITING_EXTERNAL_EVENT"} or not isinstance(runtime["seen_events"], list):
         raise GuardError("CONTROL.json runtime state is invalid")
     migrated = migrate_control(control)
     recovery_persisted_control = recover_goal_update(project, control)
@@ -310,6 +310,13 @@ def load_control(project: Path) -> dict[str, Any]:
 
 def save_control(project: Path, control: dict[str, Any]) -> None:
     atomic_json(project / CONTROL_REL, control)
+
+
+def external_wait_in_progress(control: dict[str, Any]) -> bool:
+    return control.get("runtime", {}).get("state") in {
+        "ARMING_EXTERNAL_WAIT",
+        "WAITING_EXTERNAL_EVENT",
+    }
 
 
 def persist_control_migration(project: Path, control: dict[str, Any]) -> bool:
@@ -470,6 +477,27 @@ def load_owned_external_json(path: Path, state_root: Path) -> dict[str, Any]:
     if info.st_mode & 0o022:
         raise GuardError(f"external monitor artifact must not be group/world writable: {path}")
     return load_json(path)
+
+
+def load_private_external_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, OSError) as error:
+        raise GuardError(f"{label} is missing or unreadable: {path}") from error
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise GuardError(f"{label} must be a regular non-symlink file: {path}")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise GuardError(f"{label} has an unexpected owner: {path}")
+    if info.st_mode & 0o077:
+        raise GuardError(f"{label} must not be group/world accessible: {path}")
+    if info.st_size > 64 * 1024:
+        raise GuardError(f"{label} is unexpectedly large: {path}")
+    return load_json(path)
+
+
+def monitor_canonical_digest(value: Any) -> str:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def normalize_relative(project: Path, raw: str) -> str:
@@ -972,6 +1000,7 @@ def validate_bash_policies(
 
 
 def validate_external_monitors(
+    project: Path,
     raw: Any,
     bindings: list[dict[str, Any]],
     policies: list[dict[str, Any]],
@@ -991,8 +1020,9 @@ def validate_external_monitors(
         if monitor_id in seen:
             raise GuardError(f"duplicate external monitor id: {monitor_id}")
         seen.add(monitor_id)
-        if item.get("provider") != "codex-hpc-monitor" or item.get("contract_version") != 1:
-            raise GuardError("external monitors currently support codex-hpc-monitor contract_version 1")
+        contract_version = item.get("contract_version")
+        if item.get("provider") != "codex-hpc-monitor" or contract_version not in {1, 2}:
+            raise GuardError("external monitors currently support codex-hpc-monitor contract_version 1 or 2")
         binding_id = ensure_id(item.get("binding_id"), f"external_monitors[{index}].binding_id")
         binding = binding_map.get(binding_id)
         if binding is None or binding.get("kind") != "slurm_job_id":
@@ -1046,10 +1076,30 @@ def validate_external_monitors(
         ensure_safe_token(service_names[0], "external monitor bridge service name", maximum=128)
         if not any(token.get("literal") == "--require-auto-resume" for token in template):
             raise GuardError("external monitor start policy must freeze --require-auto-resume")
+        if contract_version == 2:
+            script_tokens = [token.get("literal") for token in template if isinstance(token.get("literal"), str)]
+            if not script_tokens:
+                raise GuardError("contract_version 2 monitor policy must freeze supervise_slurm_job.py")
+            policy_cwd = project if start_policy.get("cwd") == "." else project / str(start_policy.get("cwd"))
+            monitor_script = Path(script_tokens[0])
+            if not monitor_script.is_absolute():
+                monitor_script = policy_cwd / monitor_script
+            monitor_script = Path(os.path.abspath(os.fspath(monitor_script)))
+            bridge_script = monitor_script.with_name("app_server_bridge.py")
+            if (
+                monitor_script.name != "supervise_slurm_job.py"
+                or not monitor_script.is_file()
+                or monitor_script.is_symlink()
+                or not bridge_script.is_file()
+                or bridge_script.is_symlink()
+            ):
+                raise GuardError(
+                    "contract_version 2 requires regular supervise_slurm_job.py and app_server_bridge.py sibling files"
+                )
         monitors.append({
             "id": monitor_id,
             "provider": "codex-hpc-monitor",
-            "contract_version": 1,
+            "contract_version": contract_version,
             "binding_id": binding_id,
             "start_policy_id": start_policy_id,
             "state_root": state_root,
@@ -1225,7 +1275,7 @@ def validate_proposal(project: Path, gate: dict[str, Any], control: dict[str, An
     pre_run_gates = validate_pre_run_gates(proposal.get("pre_run_gates"), {item["id"] for item in checkpoint_artifacts})
     runtime_bindings = validate_runtime_bindings(proposal.get("runtime_bindings"))
     bash_policies = validate_bash_policies(project, proposal.get("bash_policies"), lease_mutations, pre_run_gates, runtime_bindings)
-    external_monitors = validate_external_monitors(proposal.get("external_monitors"), runtime_bindings, bash_policies)
+    external_monitors = validate_external_monitors(project, proposal.get("external_monitors"), runtime_bindings, bash_policies)
     review_epoch = int(control.get("review_epoch", 0))
     if review_epoch < 0:
         raise GuardError("CONTROL.json review_epoch is invalid")
@@ -1492,7 +1542,7 @@ def command_gates(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
-        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+        if external_wait_in_progress(control):
             raise GuardError("cannot record pre-run gates while waiting for an external event")
         lease = control.get("active_lease")
         if not isinstance(lease, dict) or current_lease(control) is None:
@@ -2106,6 +2156,260 @@ def verify_monitor_run(lease: dict[str, Any], monitor: dict[str, Any]) -> dict[s
     }
 
 
+def monitor_policy(lease: dict[str, Any], monitor: dict[str, Any]) -> dict[str, Any]:
+    policy = next(
+        (item for item in lease.get("bash_policies", []) if item.get("id") == monitor.get("start_policy_id")),
+        None,
+    )
+    if not isinstance(policy, dict):
+        raise GuardError("external monitor lost its frozen start policy")
+    return policy
+
+
+def scheduler_gate_binding_id(lease: dict[str, Any], monitor: dict[str, Any], run: dict[str, Any]) -> str:
+    return "gg-" + canonical_hash({
+        "schema": "goal-guardrails.scheduler-gate-binding/v1",
+        "lease_id": lease.get("lease_id"),
+        "monitor_id": monitor.get("id"),
+        "job_id": run.get("job_id"),
+        "run_id": run.get("run_id"),
+    })[:48]
+
+
+def scheduler_gate_command(
+    project: Path,
+    lease: dict[str, Any],
+    monitor: dict[str, Any],
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    """Arm and read back the Codex idle-continuation marker without creating a model turn."""
+    policy = monitor_policy(lease, monitor)
+    monitor_argv = render_policy_argv(policy, lease)
+    if len(monitor_argv) < 2:
+        raise GuardError("external monitor start policy cannot locate its provider script")
+    policy_cwd = project if policy.get("cwd") == "." else project / str(policy.get("cwd"))
+    monitor_script = Path(monitor_argv[1])
+    if not monitor_script.is_absolute():
+        monitor_script = policy_cwd / monitor_script
+    monitor_script = Path(os.path.abspath(os.fspath(monitor_script)))
+    bridge_script = monitor_script.with_name("app_server_bridge.py")
+    if monitor_script.name != "supervise_slurm_job.py" or not bridge_script.is_file() or bridge_script.is_symlink():
+        raise GuardError("contract_version 2 requires app_server_bridge.py beside supervise_slurm_job.py")
+    required_options = {
+        "--state-dir": monitor.get("state_root"),
+        "--bridge-config": argv_option(monitor_argv, "--bridge-config"),
+        "--event-binding": argv_option(monitor_argv, "--event-binding"),
+    }
+    if required_options["--state-dir"] != argv_option(monitor_argv, "--state-dir"):
+        raise GuardError("external monitor start policy state directory drifted before scheduler-gate arm")
+    for option in ("--bridge-config", "--event-binding"):
+        value = required_options[option]
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise GuardError(f"external monitor start policy lost its frozen {option} path")
+    binding_path = Path(str(required_options["--event-binding"]))
+    config_path = Path(str(required_options["--bridge-config"]))
+    event_binding = load_private_external_json(binding_path, "external monitor event binding")
+    bridge_config = load_private_external_json(config_path, "external monitor bridge config")
+    expected_binding_fields = {"schema", "codex_home_id", "app_server_instance", "thread_id", "workspace"}
+    expected_config_fields = {
+        "schema", "enabled", "instance_id", "codex_home", "codex_home_id", "workspace", "transport",
+        "request_timeout_seconds", "poll_seconds", "lease_seconds", "max_attempts", "backoff_initial_seconds",
+        "backoff_max_seconds", "turn_completion_timeout_seconds",
+    }
+    transport = bridge_config.get("transport")
+    transport_command = transport.get("command") if isinstance(transport, dict) else None
+    if (
+        set(event_binding) != expected_binding_fields
+        or event_binding.get("schema") != "codex-monitor.event-binding/v1"
+        or not isinstance(event_binding.get("thread_id"), str)
+        or THREAD_ID_RE.fullmatch(event_binding["thread_id"]) is None
+        or set(bridge_config) != expected_config_fields
+        or bridge_config.get("schema") != "codex-monitor.bridge-config/v1"
+        or bridge_config.get("enabled") is not True
+        or not isinstance(transport, dict)
+        or set(transport) != {"type", "command"}
+        or transport.get("type") != "stdio"
+        or not isinstance(transport_command, list)
+        or len(transport_command) < 2
+        or not all(isinstance(token, str) and token for token in transport_command)
+        or not Path(transport_command[0]).is_absolute()
+        or transport_command[1] != "app-server"
+    ):
+        raise GuardError("external monitor event binding or bridge config has an invalid scheduler-gate contract")
+    try:
+        project_real = project.resolve(strict=True)
+        binding_workspace = Path(str(event_binding["workspace"])).resolve(strict=True)
+        config_workspace = Path(str(bridge_config["workspace"])).resolve(strict=True)
+        configured_executable = Path(transport_command[0]).resolve(strict=True)
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise GuardError("external monitor scheduler-gate identity cannot be resolved") from error
+    if (
+        binding_workspace != project_real
+        or config_workspace != project_real
+        or event_binding.get("workspace") != bridge_config.get("workspace")
+        or event_binding.get("codex_home_id") != bridge_config.get("codex_home_id")
+        or event_binding.get("app_server_instance") != bridge_config.get("instance_id")
+    ):
+        raise GuardError("external monitor event binding and bridge config identify a different Goal workspace")
+    expected_binding_digest = monitor_canonical_digest(event_binding)
+    expected_config_digest = monitor_canonical_digest(bridge_config)
+    expected_executable_sha256 = "sha256:" + file_hash(configured_executable)
+    expected_workspace_id = "sha256:" + hashlib.sha256(str(bridge_config["workspace"]).encode()).hexdigest()
+    binding_id = scheduler_gate_binding_id(lease, monitor, run)
+    command = [
+        monitor_argv[0],
+        os.fspath(bridge_script),
+        "continuation-gate",
+        "arm",
+        "--state-dir",
+        str(required_options["--state-dir"]),
+        "--bridge-config",
+        str(required_options["--bridge-config"]),
+        "--event-binding",
+        str(required_options["--event-binding"]),
+        "--binding-id",
+        binding_id,
+        "--timeout-seconds",
+        "10",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=policy_cwd,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError("scheduler continuation gate could not be reached; retry wait-monitor without resubmitting the workload") from error
+    try:
+        response = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise GuardError("scheduler continuation gate returned an unreadable response") from error
+    if (
+        completed.returncode != 0
+        or not isinstance(response, dict)
+        or response.get("schema_version") != "codex-monitor.bridge.continuation-gate/v1"
+        or response.get("state") != "ok"
+        or response.get("action") != "arm"
+        or response.get("binding_id") != binding_id
+        or response.get("goal_status") != "active"
+        or response.get("deferred") is not True
+        or response.get("receipt_state") != "armed"
+        or response.get("model_turn_created") is not False
+        or not isinstance(response.get("thread_id"), str)
+        or THREAD_ID_RE.fullmatch(response["thread_id"]) is None
+        or response.get("thread_id") != event_binding["thread_id"]
+        or not isinstance(response.get("goal_id"), str)
+        or not response["goal_id"]
+    ):
+        reason = response.get("reason") if isinstance(response, dict) else None
+        suffix = f" ({reason})" if isinstance(reason, str) and reason else ""
+        raise GuardError(
+            "scheduler continuation gate was not armed and read back"
+            + suffix
+            + "; retry wait-monitor without resubmitting the workload"
+        )
+    receipt_path = Path(str(response.get("receipt", "")))
+    state_root = Path(str(monitor["state_root"]))
+    receipt = load_owned_external_json(receipt_path, state_root)
+    expected_receipt_fields = {
+        "schema", "binding_id", "binding_digest", "config_digest", "instance_id", "codex_home_id",
+        "workspace_id", "thread_id", "executable", "executable_sha256", "codex_version", "goal_id",
+        "state", "armed_at", "cleared_at",
+    }
+    if (
+        set(receipt) != expected_receipt_fields
+        or receipt.get("schema") != "codex-monitor.continuation-gate-receipt/v1"
+        or receipt.get("binding_id") != binding_id
+        or receipt.get("binding_digest") != expected_binding_digest
+        or receipt.get("config_digest") != expected_config_digest
+        or receipt.get("instance_id") != bridge_config["instance_id"]
+        or receipt.get("codex_home_id") != bridge_config["codex_home_id"]
+        or receipt.get("workspace_id") != expected_workspace_id
+        or receipt.get("thread_id") != response["thread_id"]
+        or receipt.get("goal_id") != response["goal_id"]
+        or receipt.get("executable") != os.fspath(configured_executable)
+        or receipt.get("executable_sha256") != expected_executable_sha256
+        or receipt.get("codex_version") != "0.151.0"
+        or receipt.get("state") != "armed"
+        or receipt.get("cleared_at") is not None
+    ):
+        raise GuardError("scheduler continuation gate receipt does not match its read-back")
+    try:
+        parse_time(str(receipt.get("armed_at")))
+    except (TypeError, ValueError) as error:
+        raise GuardError("scheduler continuation gate receipt has an invalid timestamp") from error
+    return {
+        "schema_version": "goal-guardrails.scheduler-gate/v1",
+        "state": "ARMED",
+        "binding_id": binding_id,
+        "thread_id": response["thread_id"],
+        "goal_id": response["goal_id"],
+        "receipt_path": os.fspath(receipt_path),
+        "receipt_sha256": file_hash(receipt_path),
+        "armed_at": receipt["armed_at"],
+        "model_turn_created": False,
+    }
+
+
+def finalize_scheduler_wait_locked(project: Path, control: dict[str, Any]) -> dict[str, Any]:
+    """Roll an idempotent ARMING state forward only after the scheduler gate is verified."""
+    runtime = control.get("runtime", {})
+    wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
+    if runtime.get("state") != "ARMING_EXTERNAL_WAIT" or not isinstance(wait, dict):
+        raise GuardError("runtime is not arming an external wait")
+    lease = control.get("active_lease")
+    if not isinstance(lease, dict) or current_lease(control) is None:
+        raise GuardError("external wait arming lost its live experiment lease")
+    verify_frozen_lease(project, lease)
+    monitor = monitor_contract(lease, str(wait.get("monitor_id")))
+    if monitor.get("contract_version") != 2:
+        raise GuardError("only external-monitor contract_version 2 has a scheduler gate")
+    run = verify_monitor_run(lease, monitor)
+    for key in ("job_id", "run_id", "manifest_sha256"):
+        if wait.get(key) != run.get(key):
+            raise GuardError(f"external monitor {key} drifted while arming its scheduler gate")
+    scheduler_gate = scheduler_gate_command(project, lease, monitor, run)
+    remaining = int(lease.get("remaining_seconds", 0))
+    if remaining <= 0:
+        remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
+    lease["scheduler_gate"] = scheduler_gate
+    lease["suspended_at"] = lease.get("suspended_at") or iso_time(utc_now())
+    lease["remaining_seconds"] = remaining
+    wait["scheduler_gate"] = scheduler_gate
+    wait["entered_at"] = iso_time(utc_now())
+    runtime["state"] = "WAITING_EXTERNAL_EVENT"
+    runtime["wait"] = wait
+    control["active_lease"] = lease
+    control["runtime"] = runtime
+    control["poll"] = None
+    save_control(project, control)
+    return wait
+
+
+def rearm_scheduler_wait_locked(project: Path, control: dict[str, Any]) -> dict[str, Any]:
+    """Restore the deferral cleared by an explicit no-event SessionStart."""
+    runtime = control.get("runtime", {})
+    wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
+    lease = control.get("active_lease")
+    if runtime.get("state") != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict) or not isinstance(lease, dict):
+        raise GuardError("runtime is not waiting on a scheduler-gated external monitor")
+    monitor = monitor_contract(lease, str(wait.get("monitor_id")))
+    if monitor.get("contract_version") != 2:
+        raise GuardError("external monitor does not use the scheduler-gated contract")
+    run = verify_monitor_run(lease, monitor)
+    scheduler_gate = scheduler_gate_command(project, lease, monitor, run)
+    lease["scheduler_gate"] = scheduler_gate
+    wait["scheduler_gate"] = scheduler_gate
+    runtime["wait"] = wait
+    control["active_lease"] = lease
+    control["runtime"] = runtime
+    save_control(project, control)
+    return scheduler_gate
+
+
 def command_wait_monitor(args: argparse.Namespace) -> int:
     project = explicit_project(args.project)
     monitor_id = ensure_id(args.monitor, "monitor")
@@ -2114,8 +2418,20 @@ def command_wait_monitor(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
-        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+        runtime_state = control["runtime"]["state"]
+        if runtime_state == "WAITING_EXTERNAL_EVENT":
             raise GuardError("runtime is already waiting for an external event")
+        if runtime_state == "ARMING_EXTERNAL_WAIT":
+            wait = control["runtime"].get("wait")
+            lease = current_lease(control)
+            if not isinstance(wait, dict) or wait.get("monitor_id") != monitor_id or lease is None:
+                raise GuardError("a different external wait is already being armed")
+            monitor = monitor_contract(lease, monitor_id)
+            if monitor.get("contract_version") != 2:
+                raise GuardError("legacy external-monitor waits cannot enter ARMING_EXTERNAL_WAIT")
+            output = finalize_scheduler_wait_locked(project, control)
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 0
         lease = current_lease(control)
         if lease is None:
             raise GuardError("a live experiment lease is required before waiting")
@@ -2126,24 +2442,39 @@ def command_wait_monitor(args: argparse.Namespace) -> int:
         run = verify_monitor_run(lease, monitor)
         terminal_path = run["run_dir"] / "terminal.json"
         baseline = file_hash(terminal_path) if terminal_path.is_file() and not terminal_path.is_symlink() else None
-        remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
-        lease["suspended_at"] = iso_time(utc_now())
-        lease["remaining_seconds"] = remaining
-        control["active_lease"] = lease
-        control["runtime"]["state"] = "WAITING_EXTERNAL_EVENT"
-        control["runtime"]["wait"] = {
+        wait = {
             "kind": "external_monitor",
             "monitor_id": monitor_id,
             "provider": monitor["provider"],
+            "contract_version": monitor["contract_version"],
             "job_id": run["job_id"],
             "run_id": run["run_id"],
             "manifest_sha256": run["manifest_sha256"],
             "baseline_terminal_sha256": baseline,
-            "entered_at": iso_time(utc_now()),
+            "arming_started_at": iso_time(utc_now()),
         }
-        control["poll"] = None
-        save_control(project, control)
-    print(json.dumps(control["runtime"]["wait"], ensure_ascii=False, indent=2))
+        control["active_lease"] = lease
+        if monitor.get("contract_version") == 2:
+            remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
+            lease["suspended_at"] = iso_time(utc_now())
+            lease["remaining_seconds"] = remaining
+            control["active_lease"] = lease
+            control["runtime"]["state"] = "ARMING_EXTERNAL_WAIT"
+            control["runtime"]["wait"] = wait
+            control["poll"] = None
+            save_control(project, control)
+            wait = finalize_scheduler_wait_locked(project, control)
+        else:
+            remaining = max(1, int((parse_time(lease["expires_at"]) - utc_now()).total_seconds()))
+            lease["suspended_at"] = iso_time(utc_now())
+            lease["remaining_seconds"] = remaining
+            wait["entered_at"] = iso_time(utc_now())
+            control["active_lease"] = lease
+            control["runtime"]["state"] = "WAITING_EXTERNAL_EVENT"
+            control["runtime"]["wait"] = wait
+            control["poll"] = None
+            save_control(project, control)
+    print(json.dumps(wait, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2295,7 +2626,8 @@ def wake_monitor_locked(
     ):
         return None, True
     wait = control["runtime"].get("wait")
-    if control["runtime"]["state"] != "WAITING_EXTERNAL_EVENT" or not isinstance(wait, dict):
+    runtime_state = control["runtime"]["state"]
+    if runtime_state not in {"ARMING_EXTERNAL_WAIT", "WAITING_EXTERNAL_EVENT"} or not isinstance(wait, dict):
         raise GuardError("runtime is not waiting for an external event")
     if wait.get("kind") != "external_monitor" or wait.get("monitor_id") != monitor_id:
         raise GuardError("wake-monitor does not match the registered external monitor wait")
@@ -2304,6 +2636,8 @@ def wake_monitor_locked(
         raise GuardError("waiting runtime lost its active lease")
     verify_frozen_lease(project, lease)
     monitor = monitor_contract(lease, monitor_id)
+    if runtime_state == "ARMING_EXTERNAL_WAIT" and monitor.get("contract_version") != 2:
+        raise GuardError("only a contract-version-2 monitor may consume a terminal event while arming")
     evidence = verify_monitor_terminal(project, lease, monitor, wait, requested_event_id)
     receipt_rel = RECEIPTS_REL / lease["lease_id"] / f"{monitor_id}.json"
     receipt_path = project / receipt_rel
@@ -2415,7 +2749,7 @@ def command_wait(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
-        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+        if external_wait_in_progress(control):
             raise GuardError("runtime is already waiting for an external event")
         lease = current_lease(control)
         if lease is None:
@@ -3096,7 +3430,7 @@ def command_checkpoint(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
-        if control["runtime"]["state"] == "WAITING_EXTERNAL_EVENT":
+        if external_wait_in_progress(control):
             raise GuardError("wake the registered external event before checkpoint")
         lease = control.get("active_lease")
         if not isinstance(lease, dict):
@@ -3312,7 +3646,7 @@ def command_abort_preflight(args: argparse.Namespace) -> int:
         if not gate.get("enabled"):
             raise GuardError("gate is not activated")
         control = load_control(project)
-        if control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT":
+        if external_wait_in_progress(control):
             raise GuardError("cannot abort preflight while waiting for an external event")
         lease = control.get("active_lease")
         if not isinstance(lease, dict):
@@ -3634,6 +3968,16 @@ def recommended_next_action(gate: dict[str, Any], control: dict[str, Any]) -> di
     if not gate.get("enabled"):
         return {"kind": "ACTIVATE", "instruction": "Obtain explicit user approval and activate the project gate."}
     runtime = control.get("runtime", {})
+    if runtime.get("state") == "ARMING_EXTERNAL_WAIT":
+        wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
+        monitor_id = wait.get("monitor_id") or "<id>"
+        return {
+            "kind": "RETRY_WAIT_MONITOR",
+            "instruction": (
+                f"Re-run goal_guard.py wait-monitor --monitor {monitor_id} --project . to reconcile the same "
+                "scheduler gate. Never resubmit the consumed workload or create a new monitor run."
+            ),
+        }
     if runtime.get("state") == "WAITING_EXTERNAL_EVENT":
         wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else {}
         command = "wake-monitor" if wait.get("kind") == "external_monitor" else "wake"
@@ -3827,8 +4171,19 @@ def fast_deny(reason: str, recovery: str) -> dict[str, Any]:
     }
 
 
-def hook_context(text: str) -> dict[str, Any]:
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+def hook_context(
+    text: str,
+    *,
+    continue_turn: bool = True,
+    stop_reason: str | None = None,
+) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}
+    }
+    if not continue_turn:
+        output["continue"] = False
+        output["stopReason"] = stop_reason or "Waiting for the registered external event."
+    return output
 
 
 def relative_tool_path(project: Path, cwd: Path, raw: str) -> Path:
@@ -4296,8 +4651,8 @@ def is_read_only_command(command: str) -> bool:
 
 
 def lease_error(project: Path, gate: dict[str, Any], control: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    if control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT":
-        return None, "runtime is WAITING_EXTERNAL_EVENT; do not mutate or poll until a deduplicated wake event arrives"
+    if external_wait_in_progress(control):
+        return None, "runtime is arming or waiting for an external event; do not mutate or poll until the scheduler gate or wake event is reconciled"
     raw = control.get("active_lease")
     lease = current_lease(control)
     if lease is None:
@@ -4325,7 +4680,7 @@ def hook_pre_tool_fast(project: Path, event: dict[str, Any], control: dict[str, 
     else:
         command = str(tool_input.get("command", ""))
     cwd = Path(str(event.get("cwd", project)))
-    waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+    waiting = external_wait_in_progress(control)
 
     if tool == "Bash" and is_controller_command(command):
         return None
@@ -4461,7 +4816,7 @@ def hook_pre_tool(project: Path, event: dict[str, Any], gate: dict[str, Any], co
     else:
         command = str(tool_input.get("command", ""))
     cwd = Path(str(event.get("cwd", project)))
-    waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+    waiting = external_wait_in_progress(control)
     if waiting:
         if tool == "Bash" and is_controller_command(command):
             return None
@@ -4615,14 +4970,21 @@ def command_hook() -> int:
             if name == "SessionStart":
                 persist_control_migration(project, control)
                 runtime = control.get("runtime", {})
+                terminal_recovery_pending = False
+                armed_this_session = False
                 wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
-                if runtime.get("state") == "WAITING_EXTERNAL_EVENT" and isinstance(wait, dict) and wait.get("kind") == "external_monitor":
+                if (
+                    runtime.get("state") in {"ARMING_EXTERNAL_WAIT", "WAITING_EXTERNAL_EVENT"}
+                    and isinstance(wait, dict)
+                    and wait.get("kind") == "external_monitor"
+                ):
                     delivery = external_wait_delivery(control)
                     event_id = delivery.get("event_id") if isinstance(delivery, dict) else None
                     if isinstance(event_id, str):
                         try:
                             wake_monitor_locked(project, control, str(wait.get("monitor_id")), event_id)
                         except (GuardError, OSError, UnicodeError, ValueError) as error:
+                            terminal_recovery_pending = True
                             observation = {
                                 "schema_version": "goal-guardrails.external-reconciliation/v1",
                                 "state": "recoverable_transport_error",
@@ -4635,16 +4997,48 @@ def command_hook() -> int:
                                 runtime["external_reconciliation"] = observation
                                 control["runtime"] = runtime
                                 save_control(project, control)
+                    runtime = control.get("runtime", {})
+                    wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
+                    if runtime.get("state") == "ARMING_EXTERNAL_WAIT" and not terminal_recovery_pending:
+                        finalize_scheduler_wait_locked(project, control)
+                        armed_this_session = True
+                        runtime = control.get("runtime", {})
+                        wait = runtime.get("wait") if isinstance(runtime.get("wait"), dict) else None
+                    if (
+                        runtime.get("state") == "WAITING_EXTERNAL_EVENT"
+                        and isinstance(wait, dict)
+                        and wait.get("contract_version") == 2
+                        and not terminal_recovery_pending
+                        and not armed_this_session
+                    ):
+                        rearm_scheduler_wait_locked(project, control)
             output: dict[str, Any] | None = None
             if name == "SessionStart":
                 status = compact_status(project, gate, control, session_frontier_only=True)
-                waiting = control.get("runtime", {}).get("state") == "WAITING_EXTERNAL_EVENT"
+                waiting = external_wait_in_progress(control)
+                session_runtime = control.get("runtime", {})
+                wait = session_runtime.get("wait")
+                reconciliation = (
+                    session_runtime.get("external_reconciliation")
+                    if isinstance(session_runtime.get("external_reconciliation"), dict)
+                    else {}
+                )
+                scheduler_gated_wait = (
+                    session_runtime.get("state") == "WAITING_EXTERNAL_EVENT"
+                    and isinstance(wait, dict)
+                    and wait.get("contract_version") == 2
+                    and isinstance(wait.get("scheduler_gate"), dict)
+                    and wait["scheduler_gate"].get("state") == "ARMED"
+                    and reconciliation.get("state") != "recoverable_transport_error"
+                )
                 transport_paused = status.get("next_action", {}).get("kind") == "PAUSE_REQUIRED"
                 if gate_profile(gate) == "fast":
                     if transport_paused:
                         suffix = " External-event delivery cannot wake this Goal; report PAUSE_REQUIRED/transport failure and do not remain in WAIT."
+                    elif scheduler_gated_wait:
+                        suffix = " Runtime is scheduler-gated in WAITING_EXTERNAL_EVENT; this no-event activation is ending before a model request."
                     elif waiting:
-                        suffix = " Runtime is WAITING_EXTERNAL_EVENT: read-only inspection and polling are allowed, but mutation must wait for the registered wake event."
+                        suffix = " Runtime is WAITING_EXTERNAL_EVENT: read-only inspection is allowed, but mutation must wait for the registered wake event."
                     else:
                         suffix = ""
                     output = hook_context(
@@ -4655,11 +5049,15 @@ def command_hook() -> int:
                         + "A tool denial skips only that high-impact action: do not stop the Goal or ask the user merely because of it; record it in BACKLOG.md and continue the next safe action. "
                         + "Experiment failure and chain closure are not Goal blocking. Never mark the persistent Goal blocked unless next_action is AWAIT_DECISION and blocking_proof.block_allowed=true. "
                         + "Request user input only when progress truly requires changing the objective/metric, budget or material scope, executing an irreversible external action, unavailable external input, or overriding a fired global stop line."
-                        + suffix
+                        + suffix,
+                        continue_turn=not scheduler_gated_wait,
+                        stop_reason="No registered terminal event is available; the exact-thread continuation gate remains armed.",
                     )
                 else:
                     if transport_paused:
                         suffix = " External-event delivery cannot wake this Goal; report PAUSE_REQUIRED/transport failure instead of waiting."
+                    elif scheduler_gated_wait:
+                        suffix = " Runtime is scheduler-gated in WAITING_EXTERNAL_EVENT; this no-event activation is ending before a model request."
                     elif waiting:
                         suffix = " Runtime is WAITING_EXTERNAL_EVENT: do not poll or start adjacent work; end this activation unless a registered wake event arrived."
                     else:
@@ -4670,7 +5068,9 @@ def command_hook() -> int:
                         + ". A single denied tool call is a recoverable control transition, not permission to mark the Goal complete or blocked; follow next_action. "
                         + "Experiment failure and chain closure are not Goal blocking. Never mark the persistent Goal blocked unless next_action is AWAIT_DECISION and blocking_proof.block_allowed=true. "
                         + "Do not self-attest proposals; obtain one fresh subagent or user review at the experiment boundary. The controller validates attestation shape, not reviewer identity."
-                        + suffix
+                        + suffix,
+                        continue_turn=not scheduler_gated_wait,
+                        stop_reason="No registered terminal event is available; the exact-thread continuation gate remains armed.",
                     )
             elif name == "PreToolUse":
                 output = hook_pre_tool(project, event, gate, control)

@@ -4,9 +4,9 @@ Goal Guardrails keeps long-running, metric-driven optimization from drifting int
 
 It applies beyond model training: prompt quality, performance, latency, cost, reliability, search, recommendation, conversion, data pipelines, and other optimization with a measurable objective and evaluator.
 
-Version 0.7.0 makes unattended continuation the primary invariant. A completed threshold or guardrail failure is a valid negative and automatically enters rollback/switch; evaluator or reversible execution failure consumes recovery budget without blocking the Goal. Closing one experiment chain no longer closes the Goal. Global waiting is allowed only with a machine-readable proof that no safe path or recovery budget remains. External notification failures have no business effect, and a natural SessionStart consumes an already durable terminal event even when delivery is pending or dead-lettered.
+Version 0.8.0 adds a real scheduler wait gate for unattended Codex CLI Goals. With external-monitor contract v2 and the companion patched Codex 0.151 runtime, `wait-monitor` first persists and reads back an exact-thread Goal continuation deferral; only then does it enter `WAITING_EXTERNAL_EVENT`. While no terminal event exists, the Goal runtime creates no idle model turn. A terminal bridge wake starts the exact thread, the runtime clears the marker, and the controller consumes the durable event idempotently.
 
-The state transition and compatibility summary is in [docs/v0.7.0-state-machine.md](docs/v0.7.0-state-machine.md).
+The outcome/continuation state machine remains documented in [docs/v0.7.0-state-machine.md](docs/v0.7.0-state-machine.md). The new wait-gate architecture and migration are in [docs/v0.8.0-scheduler-wait-gate.md](docs/v0.8.0-scheduler-wait-gate.md).
 
 The fast workflow introduced in 0.6.0 is:
 
@@ -141,7 +141,9 @@ python3 <plugin-root>/hooks/goal_guard.py wait-monitor --monitor scheduler --pro
 python3 <plugin-root>/hooks/goal_guard.py wake-monitor --monitor scheduler --event-id sha256:<event-id> --project .
 ```
 
-The monitor start argv must freeze `--event-binding <private-binding.json>` (and normally `--bridge-config <private-config.json> --require-auto-resume`). `wait-monitor` freezes the run and manifest SHA. The event bridge publishes `codex-monitor.event/v1` to its private outbox and wakes the thread; it never edits the project. `wake-monitor` accepts the event ID from the fixed wake message, or derives it from the frozen run for v0.6.0 `CONTROL.json` compatibility. It verifies the immutable semantic event, event binding/workspace, event identity digest, terminal digest, Job ID, run ID, watcher result, and scheduler owner/name/partition before creating a `goal-guardrails.external-monitor-receipt/v2` file under `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. A repeated delivery of the same event ID returns `duplicate` without changing state.
+The monitor start argv must freeze `--event-binding <private-binding.json> --bridge-config <private-config.json> --bridge-service-name <service> --require-auto-resume`. For a new unattended Goal, declare external-monitor `contract_version: 2`. `wait-monitor` freezes the run and manifest SHA, writes `ARMING_EXTERNAL_WAIT`, invokes the monitor bridge's no-turn `continuation-gate arm`, and verifies its private receipt before suspending the lease and committing `WAITING_EXTERNAL_EVENT`. A failed or interrupted arm is retried with the same Job/run/binding; it never resubmits the consumed workload. The legacy v1 contract keeps the 0.7.0 behavior for already-admitted or already-waiting jobs.
+
+The event bridge publishes `codex-monitor.event/v1` to its private outbox and wakes the exact thread; it never edits the project. `wake-monitor` accepts the event ID from the fixed wake message, or derives it from the frozen run for legacy `CONTROL.json` compatibility. It verifies the immutable semantic event, event binding/workspace, event identity digest, terminal digest, Job ID, run ID, watcher result, and scheduler owner/name/partition before creating a `goal-guardrails.external-monitor-receipt/v2` file under `optimization/.goal-guardrails/receipts/<lease>/<monitor>.json`. A repeated delivery of the same event ID returns `duplicate` without changing state.
 
 `delivery.json` is deliberately not terminal evidence: pending, leased, dead-letter, or notification corruption never becomes a business pause. The immutable outbox event is notification identity; the independently verified terminal remains scheduler authority. On any natural activation the controller reconciles that durable event directly and idempotently materializes the project receipt. The receipt remains scheduler-only evidence with `business_verdict=pending`; checkpoint still requires the project's business evaluator.
 
@@ -187,17 +189,21 @@ This is a behavioral direction guardrail, not a security sandbox. Fast profile i
 
 Shell effects cannot be inferred perfectly, hosted tools may not traverse local lifecycle hooks, and users can disable non-managed hooks. Fast mode deliberately avoids pretending it can authorize every local command: it focuses on direction, a small protected boundary, and unattended continuation.
 
-`WAITING_EXTERNAL_EVENT` is a plugin state, not a platform scheduler API. The managed monitor owns durable scheduling and exact-thread delivery. Goal Guardrails makes no-event activations terminate cheaply and also performs fallback reconciliation: if the immutable semantic event already exists, SessionStart independently verifies the canonical terminal and resumes without relying on notification delivery.
+External-monitor v2 couples `WAITING_EXTERNAL_EVENT` to an experimental exact-thread scheduler primitive in the companion patched Codex 0.151 CLI. The managed monitor still owns durable scheduling and terminal delivery; the Codex marker only suppresses idle Goal continuation. If a no-event explicit SessionStart occurs, the hook re-arms and reads back the marker, then returns `continue:false` so no provider request is made. If the immutable semantic event already exists, SessionStart verifies the canonical terminal and resumes instead. Legacy v1 waits remain behavioral and do not claim zero idle turns.
 
 Remote Slurm submission deliberately does not accept runtime argv after admission. A transport policy freezes the local SSH executable and digest, host, user, port, dedicated known-hosts file and digest, dedicated identity path and digest, remote helper path and digest, remote `sbatch` path, work directory, receipt root, and submitted file digests. The controller ignores ambient SSH configuration, proxy commands, jump hosts, and agents. `status` reports the controller budget plan: each one-shot submission costs one mutation; doctor, reconciliation, waiting, waking, and receipt materialization cost zero. OpenSSH still invokes the remote command through the remote user's shell, so the helper path is restricted to a safe absolute token; a forced-command SSH key is recommended for a stronger administrative boundary.
 
 Strict mode retains the v0.5 lease state machine for high-assurance and external-monitor use. Fast mode is the recommended default when throughput and unattended execution matter more than command-level enforcement.
 
-## Upgrade from v0.6.4
+## Upgrade to v0.8.0
 
 `CONTROL.json` stays schema 1 and is migrated additively on first status/hook/controller use. Existing schema-v2 active leases and results finish under their frozen v2 contract. New initialized proposals/results use schema 3. Legacy `last_checkpoint` entries remain readable but cannot be corrected because v0.6.4 did not preserve the lease and chain snapshot; new checkpoints receive an immutable receipt and can be superseded. `WAITING_EXTERNAL_EVENT` state, frozen Job IDs, consumed submit policies, lease remaining time, monitor receipts, and seen-event deduplication are preserved. No Job is requeued or resubmitted during migration.
 
-After installing 0.7.0, open a new Codex thread so the new hook/skill bundle is loaded, then run `status --project .`. Projects do not need to regenerate `GOAL.md` or deactivate/reactivate the gate.
+`CONTROL.json` remains schema 1. Existing contract-v1 active leases and `WAITING_EXTERNAL_EVENT` records continue unchanged and must not be re-admitted, requeued, or resubmitted. They wake through the existing durable event path. New proposals opt into contract v2 only after the patched Codex 0.151 App Server sidecar is installed, the monitor bridge config pins that absolute executable and SHA, and its lifecycle receipt is regenerated. The user's normal Codex CLI may remain stock 0.151; both processes must share the same frozen `CODEX_HOME`.
+
+If v2 arming is interrupted, `CONTROL.json.runtime.state` remains `ARMING_EXTERNAL_WAIT`. Re-run the same `wait-monitor --monitor <id>` command; it reconciles the same frozen Job/run and idempotent continuation receipt, then rolls forward. Do not call `submit-bind` again. No `GOAL.md`, quality gate, budget, or workload mutation is performed by migration.
+
+After installing 0.8.0, open a new Codex thread so the new hook/skill bundle is loaded, then run `status --project .`. Projects do not need to regenerate `GOAL.md` or deactivate/reactivate the gate.
 
 ## Validation
 
